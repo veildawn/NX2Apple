@@ -1,36 +1,38 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: veildawn <40253459+veildawn@users.noreply.github.com>
-Date: Sun, 1 Nov 2026 05:00:30 +0800
-Subject: [PATCH] WIP: LDN relay client (ldnr) snapshot
+Date: Sun, 1 Nov 2026 07:32:04 +0800
+Subject: [PATCH] LDN relay client: nn::ldn over an LDN relay server (opt-in,
+ DM_LDNR=1)
 
 Upstream-Status: pending
-Reason: LDN relay client; awaiting review and Mac build check
+Reason: LDN online multiplayer over a relay server; opt-in, disabled behaviour unchanged
 Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
 
 ---
- dm/host/hle_ldnr.c              | 399 +++++++++++++
- dm/host/ldnr/ldnr.c             | 490 ++++++++++++++++
- dm/host/ldnr/ldnr.h             |  98 ++++
- dm/host/ldnr/ldnr_client.c      | 243 ++++++++
- dm/host/ldnr/ldnr_hook.h        |   4 +
- dm/host/ldnr/ldnr_internal.h    | 122 ++++
- dm/host/ldnr/ldnr_native.c      | 622 +++++++++++++++++++++
- dm/host/ldnr/ldnr_native.h      | 202 +++++++
- dm/host/ldnr/ldnr_protocol.c    | 466 ++++++++++++++++
- dm/host/ldnr/ldnr_protocol.h    |  96 ++++
- dm/host/ldnr/ldnr_tcp.c         | 174 ++++++
- dm/host/ldnr/ldnr_transport.h   |  17 +
- dm/host/ldnr/ldnr_vnet.c        | 748 +++++++++++++++++++++++++
- dm/host/ldnr/tests/Makefile     |  42 ++
- dm/host/ldnr/tests/shim/hle.h   |  23 +
- dm/host/ldnr/tests/t_ldnr_e2e.c | 181 ++++++
- dm/host/ldnr/tests/t_native.c   | 322 +++++++++++
- dm/host/ldnr/tests/t_protocol.c | 794 ++++++++++++++++++++++++++
- dm/host/ldnr/tests/t_state.c    | 622 +++++++++++++++++++++
- dm/host/ldnr/tests/t_vnet.c     | 960 ++++++++++++++++++++++++++++++++
- dm/host/loader.c                |   3 +
- docs/LDN-RELAY.md               |  79 +++
- 22 files changed, 6707 insertions(+)
+ dm/host/hle_ldnr.c              |  745 ++++++++++++++++++++
+ dm/host/ldnr/ldnr.c             |  660 ++++++++++++++++++
+ dm/host/ldnr/ldnr.h             |  110 +++
+ dm/host/ldnr/ldnr_client.c      |  341 +++++++++
+ dm/host/ldnr/ldnr_hook.h        |    4 +
+ dm/host/ldnr/ldnr_internal.h    |  139 ++++
+ dm/host/ldnr/ldnr_native.c      |  622 +++++++++++++++++
+ dm/host/ldnr/ldnr_native.h      |  203 ++++++
+ dm/host/ldnr/ldnr_protocol.c    |  516 ++++++++++++++
+ dm/host/ldnr/ldnr_protocol.h    |  114 +++
+ dm/host/ldnr/ldnr_tcp.c         |  210 ++++++
+ dm/host/ldnr/ldnr_transport.h   |   17 +
+ dm/host/ldnr/ldnr_vnet.c        |  861 +++++++++++++++++++++++
+ dm/host/ldnr/tests/.gitignore   |    1 +
+ dm/host/ldnr/tests/Makefile     |   50 ++
+ dm/host/ldnr/tests/shim/hle.h   |   23 +
+ dm/host/ldnr/tests/t_ldnr_e2e.c |  186 +++++
+ dm/host/ldnr/tests/t_native.c   |  340 +++++++++
+ dm/host/ldnr/tests/t_protocol.c |  898 ++++++++++++++++++++++++
+ dm/host/ldnr/tests/t_state.c    |  754 ++++++++++++++++++++
+ dm/host/ldnr/tests/t_vnet.c     | 1163 +++++++++++++++++++++++++++++++
+ dm/host/loader.c                |   16 +-
+ docs/LDN-RELAY.md               |   79 +++
+ 23 files changed, 8048 insertions(+), 4 deletions(-)
  create mode 100644 dm/host/hle_ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.h
@@ -44,6 +46,7 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
  create mode 100644 dm/host/ldnr/ldnr_tcp.c
  create mode 100644 dm/host/ldnr/ldnr_transport.h
  create mode 100644 dm/host/ldnr/ldnr_vnet.c
+ create mode 100644 dm/host/ldnr/tests/.gitignore
  create mode 100644 dm/host/ldnr/tests/Makefile
  create mode 100644 dm/host/ldnr/tests/shim/hle.h
  create mode 100644 dm/host/ldnr/tests/t_ldnr_e2e.c
@@ -55,10 +58,10 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
 
 diff --git a/dm/host/hle_ldnr.c b/dm/host/hle_ldnr.c
 new file mode 100644
-index 0000000..fd3f748
+index 0000000..d92c89f
 --- /dev/null
 +++ b/dm/host/hle_ldnr.c
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,745 @@
 +// Optional nn::ldn / nn::socket takeover for relay play. The separate swldnr
 +// section keeps force_init's upstream duplicate check and accounting unchanged.
 +#ifdef LDNR_GLUE_SYNTAX_TEST
@@ -78,37 +81,77 @@ index 0000000..fd3f748
 +    __attribute__((used, section("__DATA,swldnr"))) static const hle_ent ldnr_ent_##cname = {mangled, (void *)cname}; \
 +    static ret cname(__VA_ARGS__)
 +
-+static pthread_mutex_t g_ldnr_mutex = PTHREAD_MUTEX_INITIALIZER;
-+static ldnr *g_ldnr;
-+static void *g_ldnr_event;
++// The relay core outlives a single guest call, and Finalize may run while
++// another call is still inside the core. Every call therefore holds a
++// reference: Finalize marks the core closing, waits for the references to
++// drain and only then destroys it.
++typedef struct {
++    pthread_mutex_t mutex;
++    pthread_cond_t drained;
++    ldnr *core;
++    int active;                 // guest calls inside the core
++    int closing;                // Finalize is running
++    void *event;                // guest event bound to the state change
++    uint64_t binding;           // identity of the current event binding
++} ldnr_glue;
++
++static ldnr_glue g_glue = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
++                            NULL, 0, 0, NULL, 0};
 +
 +static void lr_log(void *ctx, const char *text) { (void)ctx; LOG("ldnr: %s", text); }
++
++// The state change callback runs on a core thread: the bound event is read
++// under the lock, so a Finalize that cleared it cannot be signalled.
 +static void lr_state(void *ctx) {
 +    (void)ctx;
-+    if (g_ldnr_event) hle_signal_bound_system_event(g_ldnr_event);
++    pthread_mutex_lock(&g_glue.mutex);
++    void *event = g_glue.event;
++    pthread_mutex_unlock(&g_glue.mutex);
++    if (event) hle_signal_bound_system_event(event);
 +}
 +static void lr_wait(void *ctx, int entering) { (void)ctx; dm_thread_native_wait(entering); }
 +
-+static ldnr *lr_ensure(void) {
-+    pthread_mutex_lock(&g_ldnr_mutex);
-+    if (!g_ldnr) {
-+        ldnr_config config;
-+        memset(&config, 0, sizeof config);
-+        config.server = getenv("DM_LDNR_SERVER");
-+        config.room_password = getenv("DM_LDNR_ROOM_PASSWORD");
-+        config.player_name = getenv("DM_LDNR_NAME");
-+        const char *verbose = getenv("DM_LDNR_LOG");
-+        config.log = verbose && atoi(verbose);
-+        config.callback_ctx = NULL;
-+        config.state_changed = lr_state;
-+        config.native_wait = lr_wait;
-+        config.log_message = lr_log;
-+        int result = ldnr_create(&config, &g_ldnr);
-+        if (result) LOG("[RED] LDNR initialization failed: %s", ldnr_last_error(g_ldnr));
++static ldnr *lr_core_create(void) {
++    ldnr_config config;
++    memset(&config, 0, sizeof config);
++    config.server = getenv("DM_LDNR_SERVER");
++    config.room_password = getenv("DM_LDNR_ROOM_PASSWORD");
++    config.player_name = getenv("DM_LDNR_NAME");
++    const char *verbose = getenv("DM_LDNR_LOG");
++    config.log = verbose && atoi(verbose);
++    config.callback_ctx = NULL;
++    config.state_changed = lr_state;
++    config.native_wait = lr_wait;
++    config.log_message = lr_log;
++    ldnr *core = NULL;
++    if (ldnr_create(&config, &core)) {
++        LOG("[RED] LDNR initialization failed: %s", ldnr_last_error(core));
++        return NULL;
 +    }
-+    ldnr *l = g_ldnr;
-+    pthread_mutex_unlock(&g_ldnr_mutex);
-+    return l;
++    return core;
++}
++
++// Takes a reference to the core. The reference keeps the core alive until
++// the matching lr_release().
++static ldnr *lr_acquire(void) {
++    pthread_mutex_lock(&g_glue.mutex);
++    if (g_glue.closing) { pthread_mutex_unlock(&g_glue.mutex); return NULL; }
++    if (!g_glue.core) {
++        ldnr *created = lr_core_create();
++        if (!created) { pthread_mutex_unlock(&g_glue.mutex); return NULL; }
++        g_glue.core = created;
++    }
++    ldnr *core = g_glue.core;
++    g_glue.active++;
++    pthread_mutex_unlock(&g_glue.mutex);
++    return core;
++}
++
++static void lr_release(void) {
++    pthread_mutex_lock(&g_glue.mutex);
++    if (g_glue.active > 0) g_glue.active--;
++    pthread_cond_broadcast(&g_glue.drained);
++    pthread_mutex_unlock(&g_glue.mutex);
 +}
 +
 +void *ldnr_hook_lookup(const char *name) {
@@ -156,35 +199,145 @@ index 0000000..fd3f748
 +}
 +
 +// ---------- nn::ldn ----------
++// The relay reports its failures as distinct classes. They are mapped to
++// distinct results here: a game that only checks for success is not
++// affected, and a game that inspects the code can tell a rejection from a
++// missing network, a full room or a security mismatch. The values use the
++// Horizon result layout (module in bits 9-15, description in bits 0-8).
++#define LDNR_RES_REJECTED  0xA201u   // the host rejected this client
++#define LDNR_RES_NOT_FOUND 0xA202u   // no network matched
++#define LDNR_RES_FULL      0xA203u   // the room is full
++#define LDNR_RES_SECURITY  0xA204u   // passphrase or session mismatch
++#define LDNR_RES_STATE     0xA205u   // the operation does not fit the state
++#define LDNR_RES_ARGUMENT  0xA206u   // invalid argument
++#define LDNR_RES_TIMEOUT   0xA207u   // the relay did not answer in time
++#define LDNR_RES_NETWORK   0xA208u   // the relay connection failed
++
++// The relay error codes are the socket errors of the core plus the relay's
++// own reasons.
++static Result lr_result(int error) {
++    switch (error) {
++    case 0: return RES_OK;
++    case LDNR_ECONNREFUSED: return LDNR_RES_REJECTED;
++    case LDNR_EADDRINUSE: return LDNR_RES_FULL;
++    case LDNR_EHOSTUNREACH: return LDNR_RES_NOT_FOUND;
++    case LDNR_ETIMEDOUT: return LDNR_RES_TIMEOUT;
++    case LDNR_EINVAL: return LDNR_RES_ARGUMENT;
++    case LDNR_ENOTCONN: case LDNR_EISCONN: case LDNR_EALREADY:
++    case LDNR_EPIPE: case LDNR_ESHUTDOWN: return LDNR_RES_STATE;
++    case LDNR_EAGAIN: case LDNR_EINPROGRESS: return LDNR_RES_STATE;
++    case LDNR_ENETDOWN: case LDNR_ECONNRESET: return LDNR_RES_NETWORK;
++    default: return RES_FAIL;
++    }
++}
++
++// nn::ldn::LdnState has its own numbering: the core states are translated.
++static int lr_state_value(int state) {
++    switch (state) {
++    case LDNR_STATE_NONE: return 0;            // LdnState_None
++    case LDNR_STATE_INITIALIZED: return 1;     // LdnState_Initialized
++    case LDNR_STATE_AP_OPEN: return 2;         // LdnState_AccessPoint
++    case LDNR_STATE_STATION_OPEN: return 4;    // LdnState_Station
++    case LDNR_STATE_AP_CREATED: return 3;      // LdnState_AccessPointCreated
++    case LDNR_STATE_STATION_CONNECTED: return 5; // LdnState_StationConnected
++    default: return 6;                         // LdnState_Error
++    }
++}
++
 +LDNR_HLE("_ZN2nn3ldn10InitializeEv", Result, lr_ldn_initialize, void) {
-+    ldnr *l = lr_ensure();
-+    return l && !ldnr_initialize(l) ? RES_OK : RES_FAIL;
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_initialize(l) ? RES_FAIL : RES_OK;
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn8FinalizeEv", void, lr_ldn_finalize, void) {
-+    pthread_mutex_lock(&g_ldnr_mutex);
-+    ldnr *l = g_ldnr;
-+    g_ldnr = NULL;
-+    g_ldnr_event = NULL;
-+    pthread_mutex_unlock(&g_ldnr_mutex);
-+    if (l) ldnr_destroy(l);
++    // The core is taken away from the callers first: a call that starts now
++    // fails instead of using a core that is about to disappear. The calls
++    // that are still inside the core keep it alive until they return.
++    pthread_mutex_lock(&g_glue.mutex);
++    g_glue.closing = 1;
++    ldnr *core = g_glue.core;
++    g_glue.core = NULL;
++    g_glue.event = NULL;
++    g_glue.binding++;
++    while (g_glue.active > 0) pthread_cond_wait(&g_glue.drained, &g_glue.mutex);
++    pthread_mutex_unlock(&g_glue.mutex);
++    if (core) ldnr_destroy(core);
++    pthread_mutex_lock(&g_glue.mutex);
++    g_glue.closing = 0;
++    pthread_mutex_unlock(&g_glue.mutex);
 +}
-+LDNR_HLE("_ZN2nn3ldn8GetStateEv", int, lr_ldn_state, void) { return ldnr_get_state(g_ldnr); }
++LDNR_HLE("_ZN2nn3ldn8GetStateEv", int, lr_ldn_state, void) {
++    ldnr *l = lr_acquire();
++    if (!l) return 0;
++    int state = lr_state_value(ldnr_get_state(l));
++    lr_release();
++    return state;
++}
 +LDNR_HLE("_ZN2nn3ldn22AttachStateChangeEventEPNS_2os15SystemEventTypeE", void, lr_ldn_attach, void *event) {
 +    hle_bind_system_event(event, 0);
-+    g_ldnr_event = event;
++    pthread_mutex_lock(&g_glue.mutex);
++    g_glue.event = event;
++    g_glue.binding++;
++    pthread_mutex_unlock(&g_glue.mutex);
 +}
-+LDNR_HLE("_ZN2nn3ldn11OpenStationEv", Result, lr_ldn_open_station, void) { return g_ldnr && !ldnr_open_station(g_ldnr) ? RES_OK : RES_FAIL; }
-+LDNR_HLE("_ZN2nn3ldn12CloseStationEv", Result, lr_ldn_close_station, void) { return g_ldnr && !ldnr_close_station(g_ldnr) ? RES_OK : RES_FAIL; }
-+LDNR_HLE("_ZN2nn3ldn15OpenAccessPointEv", Result, lr_ldn_open_ap, void) { return g_ldnr && !ldnr_open_access_point(g_ldnr) ? RES_OK : RES_FAIL; }
-+LDNR_HLE("_ZN2nn3ldn16CloseAccessPointEv", Result, lr_ldn_close_ap, void) { return g_ldnr && !ldnr_close_access_point(g_ldnr) ? RES_OK : RES_FAIL; }
-+LDNR_HLE("_ZN2nn3ldn10DisconnectEv", Result, lr_ldn_disconnect, void) { return g_ldnr && !ldnr_disconnect(g_ldnr) ? RES_OK : RES_FAIL; }
-+LDNR_HLE("_ZN2nn3ldn14DestroyNetworkEv", Result, lr_ldn_destroy, void) { return g_ldnr && !ldnr_destroy_network(g_ldnr) ? RES_OK : RES_FAIL; }
++LDNR_HLE("_ZN2nn3ldn18GetStateChangeEventEPNS_2os15SystemEventTypeE", void, lr_ldn_get_event, void *event) {
++    hle_bind_system_event(event, 0);
++    pthread_mutex_lock(&g_glue.mutex);
++    g_glue.event = event;
++    g_glue.binding++;
++    pthread_mutex_unlock(&g_glue.mutex);
++}
++LDNR_HLE("_ZN2nn3ldn11OpenStationEv", Result, lr_ldn_open_station, void) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_open_station(l) ? RES_FAIL : RES_OK;
++    lr_release();
++    return result;
++}
++LDNR_HLE("_ZN2nn3ldn12CloseStationEv", Result, lr_ldn_close_station, void) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_close_station(l) ? RES_FAIL : RES_OK;
++    lr_release();
++    return result;
++}
++LDNR_HLE("_ZN2nn3ldn15OpenAccessPointEv", Result, lr_ldn_open_ap, void) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_open_access_point(l) ? RES_FAIL : RES_OK;
++    lr_release();
++    return result;
++}
++LDNR_HLE("_ZN2nn3ldn16CloseAccessPointEv", Result, lr_ldn_close_ap, void) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_close_access_point(l) ? RES_FAIL : RES_OK;
++    lr_release();
++    return result;
++}
++LDNR_HLE("_ZN2nn3ldn10DisconnectEv", Result, lr_ldn_disconnect, void) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_disconnect(l) ? RES_FAIL : RES_OK;
++    lr_release();
++    return result;
++}
++LDNR_HLE("_ZN2nn3ldn14DestroyNetworkEv", Result, lr_ldn_destroy, void) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_destroy_network(l) ? RES_FAIL : RES_OK;
++    lr_release();
++    return result;
++}
 +
 +static Result lr_scan(ldnr *l, void *output, int *count, int maximum, const void *filter_bytes, int channel, int private_scan) {
 +    if (count) *count = 0;
 +    if (!l || !count || maximum < 0) return RES_FAIL;
 +    ldnr_scan_filter filter;
 +    if (filter_bytes && ldnr_native_scan_filter_decode(&filter, filter_bytes, sizeof filter) != LDNR_NATIVE_OK) return RES_FAIL;
++    // The results are large: they are allocated outside the guest stack.
 +    ldnr_network_info *networks = maximum ? calloc((size_t)maximum, sizeof *networks) : NULL;
 +    if (maximum && !networks) return RES_FAIL;
 +    int result = ldnr_scan(l, networks, count, maximum, filter_bytes ? &filter : NULL, channel, private_scan);
@@ -195,13 +348,21 @@ index 0000000..fd3f748
 +        }
 +    free(networks);
 +    if (result && count) *count = 0;
-+    return result ? RES_FAIL : RES_OK;
++    return result ? lr_result(ldnr_last_errno()) : RES_OK;
 +}
 +LDNR_HLE("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", Result, lr_ldn_scan, void *out, int *n, int max, const void *filter, int channel) {
-+    return lr_scan(g_ldnr, out, n, max, filter, channel, 0);
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = lr_scan(l, out, n, max, filter, channel, 0);
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", Result, lr_ldn_scan_private, void *out, int *n, int max, const void *filter, int channel) {
-+    return lr_scan(g_ldnr, out, n, max, filter, channel, 1);
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = lr_scan(l, out, n, max, filter, channel, 1);
++    lr_release();
++    return result;
 +}
 +
 +static Result lr_create(ldnr *l, const void *config_bytes, const void *security_bytes,
@@ -221,84 +382,187 @@ index 0000000..fd3f748
 +    for (int i = 0; i < address_count; i++)
 +        if (ldnr_native_address_entry_decode(&addresses[i], (const uint8_t *)address_bytes + (size_t)i * sizeof *addresses, sizeof *addresses) != LDNR_NATIVE_OK)
 +            return RES_FAIL;
-+    return ldnr_create_network(l, &config, &security, user_bytes ? &user : NULL,
-+                               parameter_bytes ? &parameter : NULL, addresses, address_count) ? RES_FAIL : RES_OK;
++    int result = ldnr_create_network(l, &config, &security, user_bytes ? &user : NULL,
++                                     parameter_bytes ? &parameter : NULL, addresses, address_count);
++    return result ? lr_result(ldnr_last_errno()) : RES_OK;
 +}
 +LDNR_HLE("_ZN2nn3ldn13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE", Result, lr_ldn_create,
 +         const void *config, const void *security, const void *user) {
-+    return lr_create(g_ldnr, config, security, user, NULL, 0, NULL);
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = lr_create(l, config, security, user, NULL, 0, NULL);
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE", Result, lr_ldn_create_private,
 +         const void *config, const void *security, const void *parameter, const void *user, int count, const void *addresses) {
-+    return lr_create(g_ldnr, config, security, user, parameter, count, addresses);
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = lr_create(l, config, security, user, parameter, count, addresses);
++    lr_release();
++    return result;
 +}
 +
 +static Result lr_connect(ldnr *l, const void *info_bytes, const void *config_bytes,
 +                         const void *security_bytes, const void *user_bytes,
-+                         const void *parameter_bytes, int option) {
++                         const void *parameter_bytes, int option, int version) {
 +    if (!l) return RES_FAIL;
-+    ldnr_network_info info;
++    // The network information is large: it is allocated outside the guest stack.
++    ldnr_network_info *info = NULL;
 +    ldnr_network_config config;
 +    ldnr_security_config security;
 +    ldnr_user_config user;
 +    ldnr_security_parameter parameter;
-+    if ((info_bytes && ldnr_native_network_info_decode(&info, info_bytes, sizeof info) != LDNR_NATIVE_OK) ||
-+        (config_bytes && ldnr_native_network_config_decode(&config, config_bytes, sizeof config) != LDNR_NATIVE_OK) ||
++    if (info_bytes) {
++        info = calloc(1, sizeof *info);
++        if (!info) return RES_FAIL;
++        if (ldnr_native_network_info_decode(info, info_bytes, sizeof *info) != LDNR_NATIVE_OK) {
++            free(info);
++            return RES_FAIL;
++        }
++    }
++    int result = 0;
++    if ((config_bytes && ldnr_native_network_config_decode(&config, config_bytes, sizeof config) != LDNR_NATIVE_OK) ||
 +        ldnr_native_security_config_decode(&security, security_bytes, sizeof security) != LDNR_NATIVE_OK ||
 +        (user_bytes && ldnr_native_user_config_decode(&user, user_bytes, sizeof user) != LDNR_NATIVE_OK) ||
 +        (parameter_bytes && ldnr_native_security_parameter_decode(&parameter, parameter_bytes, sizeof parameter) != LDNR_NATIVE_OK))
-+        return RES_FAIL;
-+    return ldnr_connect_network(l, info_bytes ? &info : NULL, config_bytes ? &config : NULL,
-+                                &security, user_bytes ? &user : NULL,
-+                                parameter_bytes ? &parameter : NULL, option) ? RES_FAIL : RES_OK;
++        result = LDNR_EINVAL;
++    if (!result)
++        result = ldnr_connect_network(l, info, config_bytes ? &config : NULL, &security,
++                                      user_bytes ? &user : NULL,
++                                      parameter_bytes ? &parameter : NULL, option, version);
++    free(info);
++    return result ? lr_result(ldnr_last_errno()) : RES_OK;
 +}
 +LDNR_HLE("_ZN2nn3ldn7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE", Result, lr_ldn_connect,
-+         const void *info, const void *security, const void *user, int timeout, int option) {
-+    (void)timeout;
-+    return lr_connect(g_ldnr, info, NULL, security, user, NULL, option);
++         const void *info, const void *security, const void *user, int version, int option) {
++    // The integer argument is the local communication version.
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = lr_connect(l, info, NULL, security, user, NULL, option, version);
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE", Result, lr_ldn_connect_private,
-+         const void *config, const void *security, const void *parameter, const void *user, int timeout, int option) {
-+    (void)timeout;
-+    return lr_connect(g_ldnr, NULL, config, security, user, parameter, option);
++         const void *config, const void *security, const void *parameter, const void *user, int version, int option) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = lr_connect(l, NULL, config, security, user, parameter, option, version);
++    lr_release();
++    return result;
 +}
 +
 +LDNR_HLE("_ZN2nn3ldn14GetNetworkInfoEPNS0_11NetworkInfoE", Result, lr_ldn_info, void *output) {
-+    ldnr_network_info info;
-+    return g_ldnr && !ldnr_get_network_info(g_ldnr, &info) &&
-+        ldnr_native_network_info_encode(&info, output, sizeof info) == LDNR_NATIVE_OK ? RES_OK : RES_FAIL;
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    // The network information is large: it is allocated outside the guest stack.
++    ldnr_network_info *info = calloc(1, sizeof *info);
++    Result result = RES_FAIL;
++    if (info && !ldnr_get_network_info(l, info) &&
++        ldnr_native_network_info_encode(info, output, sizeof *info) == LDNR_NATIVE_OK)
++        result = RES_OK;
++    free(info);
++    lr_release();
++    return result;
++}
++LDNR_HLE("_ZN2nn3ldn24GetNetworkInfoAndHistoryEPNS0_11NetworkInfoEPNS_16NodeLatestUpdateEi", Result, lr_ldn_info_history,
++         void *output, void *nodes, int count) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = RES_FAIL;
++    // The node array has eight entries of eight bytes each.
++    ldnr_network_info *info = calloc(1, sizeof *info);
++    ldnr_node_latest_update update;
++    if (info && !ldnr_get_network_info(l, info) && ldnr_get_network_info_latest_update(l, &update) >= 0) {
++        if (nodes && count > 0) {
++            // Every node carries the same update state: the core tracks the
++            // changes of the node set, not of the single nodes.
++            ldnr_node_latest_update entry = update;
++            for (int i = 0; i < count; i++)
++                memcpy((uint8_t *)nodes + (size_t)i * sizeof entry, &entry, sizeof entry);
++        }
++        if (ldnr_native_network_info_encode(info, output, sizeof *info) == LDNR_NATIVE_OK)
++            result = RES_OK;
++    }
++    free(info);
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE", Result, lr_ldn_ip, uint32_t *address, uint32_t *mask) {
-+    return g_ldnr && !ldnr_get_ipv4_address(g_ldnr, address, mask) ? RES_OK : RES_FAIL;
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_get_ipv4_address(l, address, mask) ? lr_result(ldnr_last_errno()) : RES_OK;
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn20GetSecurityParameterEPNS0_17SecurityParameterE", Result, lr_ldn_security, void *output) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
 +    ldnr_security_parameter parameter;
-+    return g_ldnr && !ldnr_get_security_parameter(g_ldnr, &parameter) &&
-+        ldnr_native_security_parameter_encode(&parameter, output, sizeof parameter) == LDNR_NATIVE_OK ? RES_OK : RES_FAIL;
++    Result result = RES_FAIL;
++    if (!ldnr_get_security_parameter(l, &parameter) &&
++        ldnr_native_security_parameter_encode(&parameter, output, sizeof parameter) == LDNR_NATIVE_OK)
++        result = RES_OK;
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn16SetAdvertiseDataEPKvm", Result, lr_ldn_advertise, const void *data, uint64_t size) {
-+    return g_ldnr && size <= 0x180 && !ldnr_set_advertise_data(g_ldnr, data, (size_t)size) ? RES_OK : RES_FAIL;
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = (size <= 0x180 && !ldnr_set_advertise_data(l, data, (size_t)size)) ? RES_OK : RES_FAIL;
++    lr_release();
++    return result;
 +}
-+LDNR_HLE("_ZN2nn3ldn19GetDisconnectReasonEv", int, lr_ldn_reason, void) { return ldnr_get_disconnect_reason(g_ldnr); }
++LDNR_HLE("_ZN2nn3ldn19GetDisconnectReasonEv", int, lr_ldn_reason, void) {
++    ldnr *l = lr_acquire();
++    if (!l) return 0;
++    int reason = ldnr_get_disconnect_reason(l);
++    lr_release();
++    return reason;
++}
 +LDNR_HLE("_ZN2nn3ldn20AddAcceptFilterEntryENS0_10MacAddressE", Result, lr_ldn_filter, uint64_t mac) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
 +    uint8_t bytes[6];
 +    memcpy(bytes, &mac, sizeof bytes);
-+    return g_ldnr && !ldnr_add_accept_filter_entry(g_ldnr, bytes) ? RES_OK : RES_FAIL;
++    Result result = ldnr_add_accept_filter_entry(l, bytes) ? lr_result(ldnr_last_errno()) : RES_OK;
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn22SetStationAcceptPolicyENS0_12AcceptPolicyE", Result, lr_ldn_policy, int policy) {
-+    return g_ldnr && !ldnr_set_station_accept_policy(g_ldnr, policy) ? RES_OK : RES_FAIL;
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_set_station_accept_policy(l, policy) ? lr_result(ldnr_last_errno()) : RES_OK;
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn6RejectENS0_11Ipv4AddressE", Result, lr_ldn_reject, uint32_t address) {
-+    return g_ldnr && !ldnr_reject(g_ldnr, address) ? RES_OK : RES_FAIL;
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    Result result = ldnr_reject(l, address) ? lr_result(ldnr_last_errno()) : RES_OK;
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn3ldn16GetNetworkConfigEPNS0_13NetworkConfigE", Result, lr_ldn_config, void *output) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
 +    ldnr_network_config config;
-+    return g_ldnr && !ldnr_get_network_config(g_ldnr, &config) &&
-+        ldnr_native_network_config_encode(&config, output, sizeof config) == LDNR_NATIVE_OK ? RES_OK : RES_FAIL;
++    Result result = RES_FAIL;
++    if (!ldnr_get_network_config(l, &config) &&
++        ldnr_native_network_config_encode(&config, output, sizeof config) == LDNR_NATIVE_OK)
++        result = RES_OK;
++    lr_release();
++    return result;
 +}
 +
++
 +// ---------- nn::socket ----------
-+static Result lr_socket_initialize(void) { return lr_ensure() ? RES_OK : RES_FAIL; }
++static Result lr_socket_initialize(void) {
++    ldnr *l = lr_acquire();
++    if (!l) return RES_FAIL;
++    lr_release();
++    return RES_OK;
++}
 +LDNR_HLE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", Result, lr_socket_init, const void *config) { (void)config; return lr_socket_initialize(); }
 +LDNR_HLE("_ZN2nn6socket10InitializeEPvmmi", Result, lr_socket_init4, void *memory, uint64_t size, uint64_t allocation, int concurrency) {
 +    (void)memory; (void)size; (void)allocation; (void)concurrency;
@@ -310,47 +574,86 @@ index 0000000..fd3f748
 +LDNR_HLE("nnsocketGetLastErrno", int, lr_ns_errno, void) { return ldnr_last_errno(); }
 +LDNR_HLE("nnsocketSetLastErrno", void, lr_ns_set_errno, int error) { ldnr_set_errno(error); }
 +
-+static int lr_socket_new(int family, int type, int protocol) { return g_ldnr ? ldnr_socket(g_ldnr, family, type, protocol) : ldnr_fail(LDNR_ENETDOWN); }
++static int lr_socket_new(int family, int type, int protocol) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_socket(l, family, type, protocol);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE", int, lr_socket, int family, int type, int protocol) { return lr_socket_new(family, type, protocol); }
 +LDNR_HLE("_ZN2nn6socket6SocketEiii", int, lr_socket4, int family, int type, int protocol) { return lr_socket_new(family, type, protocol); }
 +LDNR_HLE("nnsocketSocket", int, lr_ns_socket, int family, int type, int protocol) { return lr_socket_new(family, type, protocol); }
 +static int lr_bind(int fd, const void *address, unsigned size) {
 +    ldnr_sockaddr parsed;
-+    return g_ldnr && lr_guest_address(&parsed, address, size) ? ldnr_bind(g_ldnr, fd, &parsed) : ldnr_fail(LDNR_EINVAL);
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = lr_guest_address(&parsed, address, size) ? ldnr_bind(l, fd, &parsed) : ldnr_fail(LDNR_EINVAL);
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn6socket4BindEiPKNS0_8SockAddrEj", int, lr_bind_new, int fd, const void *address, unsigned size) { return lr_bind(fd, address, size); }
 +LDNR_HLE("_ZN2nn6socket4BindEiPK8sockaddrj", int, lr_bind_old, int fd, const void *address, unsigned size) { return lr_bind(fd, address, size); }
 +LDNR_HLE("nnsocketBind", int, lr_ns_bind, int fd, const void *address, unsigned size) { return lr_bind(fd, address, size); }
 +static int lr_connect_socket(int fd, const void *address, unsigned size) {
 +    ldnr_sockaddr parsed;
-+    return g_ldnr && lr_guest_address(&parsed, address, size) ? ldnr_connect_socket(g_ldnr, fd, &parsed, -2) : ldnr_fail(LDNR_EINVAL);
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = lr_guest_address(&parsed, address, size) ? ldnr_connect_socket(l, fd, &parsed, -2) : ldnr_fail(LDNR_EINVAL);
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn6socket7ConnectEiPKNS0_8SockAddrEj", int, lr_connect_new, int fd, const void *address, unsigned size) { return lr_connect_socket(fd, address, size); }
 +LDNR_HLE("_ZN2nn6socket7ConnectEiPK8sockaddrj", int, lr_connect_old, int fd, const void *address, unsigned size) { return lr_connect_socket(fd, address, size); }
 +LDNR_HLE("nnsocketConnect", int, lr_ns_connect, int fd, const void *address, unsigned size) { return lr_connect_socket(fd, address, size); }
-+static int lr_listen(int fd, int backlog) { return g_ldnr ? ldnr_listen(g_ldnr, fd, backlog) : ldnr_fail(LDNR_ENETDOWN); }
++static int lr_listen(int fd, int backlog) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_listen(l, fd, backlog);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket6ListenEii", int, lr_listen_cpp, int fd, int backlog) { return lr_listen(fd, backlog); }
 +LDNR_HLE("nnsocketListen", int, lr_listen_c, int fd, int backlog) { return lr_listen(fd, backlog); }
 +static int lr_accept(int fd, void *address, unsigned *size) {
 +    ldnr_sockaddr peer;
-+    int result = g_ldnr ? ldnr_accept(g_ldnr, fd, &peer, -2) : ldnr_fail(LDNR_ENETDOWN);
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_accept(l, fd, &peer, -2);
++    lr_release();
 +    if (result >= 0 && address) lr_put_address(address, size, &peer);
 +    return result;
 +}
 +LDNR_HLE("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", int, lr_accept_new, int fd, void *address, unsigned *size) { return lr_accept(fd, address, size); }
 +LDNR_HLE("_ZN2nn6socket6AcceptEiP8sockaddrPj", int, lr_accept_old, int fd, void *address, unsigned *size) { return lr_accept(fd, address, size); }
 +LDNR_HLE("nnsocketAccept", int, lr_accept_c, int fd, void *address, unsigned *size) { return lr_accept(fd, address, size); }
-+static int lr_close(int fd) { return g_ldnr ? ldnr_close_socket(g_ldnr, fd) : ldnr_fail(LDNR_ENETDOWN); }
++static int lr_close(int fd) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_close_socket(l, fd);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket5CloseEi", int, lr_close_cpp, int fd) { return lr_close(fd); }
 +LDNR_HLE("nnsocketClose", int, lr_close_c, int fd) { return lr_close(fd); }
-+static int lr_shutdown(int fd, int how) { return g_ldnr ? ldnr_shutdown(g_ldnr, fd, how) : ldnr_fail(LDNR_ENETDOWN); }
++static int lr_shutdown(int fd, int how) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_shutdown(l, fd, how);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket8ShutdownEii", int, lr_shutdown_cpp, int fd, int how) { return lr_shutdown(fd, how); }
 +LDNR_HLE("nnsocketShutdown", int, lr_shutdown_c, int fd, int how) { return lr_shutdown(fd, how); }
 +
 +static long lr_sendto(int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
 +    ldnr_sockaddr parsed;
-+    if (!g_ldnr || !lr_guest_address(&parsed, address, address_size)) return ldnr_fail(LDNR_EINVAL);
-+    return ldnr_sendto(g_ldnr, fd, data, size, flags, &parsed);
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    long result = lr_guest_address(&parsed, address, address_size) ?
++        ldnr_sendto(l, fd, data, size, flags, &parsed) : ldnr_fail(LDNR_EINVAL);
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", long, lr_sendto_old, int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
 +    return lr_sendto(fd, data, size, flags, address, address_size);
@@ -363,7 +666,10 @@ index 0000000..fd3f748
 +}
 +static long lr_recvfrom(int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
 +    ldnr_sockaddr source;
-+    long result = g_ldnr ? ldnr_recvfrom(g_ldnr, fd, data, size, flags, &source, -2) : ldnr_fail(LDNR_ENETDOWN);
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    long result = ldnr_recvfrom(l, fd, data, size, flags, &source, -2);
++    lr_release();
 +    if (result >= 0 && address) lr_put_address(address, address_size, &source);
 +    return result;
 +}
@@ -376,18 +682,33 @@ index 0000000..fd3f748
 +LDNR_HLE("nnsocketRecvFrom", long, lr_recvfrom_c, int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
 +    return lr_recvfrom(fd, data, size, flags, address, address_size);
 +}
-+static long lr_send(int fd, const void *data, unsigned long size, int flags) { return g_ldnr ? ldnr_send(g_ldnr, fd, data, size, flags) : ldnr_fail(LDNR_ENETDOWN); }
++static long lr_send(int fd, const void *data, unsigned long size, int flags) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    long result = ldnr_send(l, fd, data, size, flags);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket4SendEiPKvmi", long, lr_send_old, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
 +LDNR_HLE("_ZN2nn6socket4SendEiPKvmNS0_7MsgFlagE", long, lr_send_new, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
 +LDNR_HLE("nnsocketSend", long, lr_send_c, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
-+static long lr_recv(int fd, void *data, unsigned long size, int flags) { return g_ldnr ? ldnr_recv(g_ldnr, fd, data, size, flags, -2) : ldnr_fail(LDNR_ENETDOWN); }
++static long lr_recv(int fd, void *data, unsigned long size, int flags) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    long result = ldnr_recv(l, fd, data, size, flags, -2);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket4RecvEiPvmi", long, lr_recv_old, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
 +LDNR_HLE("_ZN2nn6socket4RecvEiPvmNS0_7MsgFlagE", long, lr_recv_new, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
 +LDNR_HLE("nnsocketRecv", long, lr_recv_c, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
 +
 +static int lr_name(int fd, void *address, unsigned *size, int peer) {
 +    ldnr_sockaddr parsed;
-+    int result = g_ldnr ? (peer ? ldnr_get_peer_name(g_ldnr, fd, &parsed) : ldnr_get_sock_name(g_ldnr, fd, &parsed)) : ldnr_fail(LDNR_ENETDOWN);
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = peer ? ldnr_get_peer_name(l, fd, &parsed) : ldnr_get_sock_name(l, fd, &parsed);
++    lr_release();
 +    if (!result && address) lr_put_address(address, size, &parsed);
 +    return result;
 +}
@@ -396,24 +717,52 @@ index 0000000..fd3f748
 +LDNR_HLE("nnsocketGetSockName", int, lr_sockname_c, int fd, void *address, unsigned *size) { return lr_name(fd, address, size, 0); }
 +LDNR_HLE("_ZN2nn6socket11GetPeerNameEiPNS0_8SockAddrEPj", int, lr_peername_new, int fd, void *address, unsigned *size) { return lr_name(fd, address, size, 1); }
 +LDNR_HLE("nnsocketGetPeerName", int, lr_peername_c, int fd, void *address, unsigned *size) { return lr_name(fd, address, size, 1); }
-+static int lr_setopt(int fd, int level, int option, const void *value, unsigned size) { return g_ldnr ? ldnr_setsockopt(g_ldnr, fd, level, option, value, size) : ldnr_fail(LDNR_ENETDOWN); }
++static int lr_setopt(int fd, int level, int option, const void *value, unsigned size) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_setsockopt(l, fd, level, option, value, size);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", int, lr_setopt_new, int fd, int level, int option, const void *value, unsigned size) { return lr_setopt(fd, level, option, value, size); }
 +LDNR_HLE("_ZN2nn6socket10SetSockOptEiiiPKvj", int, lr_setopt_old, int fd, int level, int option, const void *value, unsigned size) { return lr_setopt(fd, level, option, value, size); }
 +LDNR_HLE("nnsocketSetSockOpt", int, lr_setopt_c, int fd, int level, int option, const void *value, unsigned size) { return lr_setopt(fd, level, option, value, size); }
-+static int lr_getopt(int fd, int level, int option, void *value, unsigned *size) { return g_ldnr ? ldnr_getsockopt(g_ldnr, fd, level, option, value, size) : ldnr_fail(LDNR_ENETDOWN); }
++static int lr_getopt(int fd, int level, int option, void *value, unsigned *size) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_getsockopt(l, fd, level, option, value, size);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket10GetSockOptEiNS0_5LevelENS0_6OptionEPvPj", int, lr_getopt_new, int fd, int level, int option, void *value, unsigned *size) { return lr_getopt(fd, level, option, value, size); }
 +LDNR_HLE("_ZN2nn6socket10GetSockOptEiiiPvPj", int, lr_getopt_old, int fd, int level, int option, void *value, unsigned *size) { return lr_getopt(fd, level, option, value, size); }
 +LDNR_HLE("nnsocketGetSockOpt", int, lr_getopt_c, int fd, int level, int option, void *value, unsigned *size) { return lr_getopt(fd, level, option, value, size); }
-+static int lr_fcntl(int fd, int command, long argument) { return g_ldnr ? ldnr_fcntl(g_ldnr, fd, command, argument) : ldnr_fail(LDNR_ENETDOWN); }
++static int lr_fcntl(int fd, int command, long argument) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_fcntl(l, fd, command, argument);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket5FcntlEiNS0_12FcntlCommandEz", int, lr_fcntl_new, int fd, int command, long argument) { return lr_fcntl(fd, command, argument); }
 +LDNR_HLE("_ZN2nn6socket5FcntlEiiz", int, lr_fcntl_old, int fd, int command, long argument) { return lr_fcntl(fd, command, argument); }
 +LDNR_HLE("nnsocketFcntl", int, lr_fcntl_c, int fd, int command, long argument) { return lr_fcntl(fd, command, argument); }
-+static int lr_poll(void *fds, uint64_t count, int timeout) { return g_ldnr ? ldnr_poll(g_ldnr, fds, count, timeout) : ldnr_fail(LDNR_ENETDOWN); }
++static int lr_poll(void *fds, uint64_t count, int timeout) {
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_poll(l, fds, count, timeout);
++    lr_release();
++    return result;
++}
 +LDNR_HLE("_ZN2nn6socket4PollEPNS0_6PollFdEmi", int, lr_poll_new, void *fds, uint64_t count, int timeout) { return lr_poll(fds, count, timeout); }
 +LDNR_HLE("_ZN2nn6socket4PollEP6pollfdmi", int, lr_poll_old, void *fds, uint64_t count, int timeout) { return lr_poll(fds, count, timeout); }
 +LDNR_HLE("nnsocketPoll", int, lr_poll_c, void *fds, uint64_t count, int timeout) { return lr_poll(fds, count, timeout); }
 +static int lr_select(int nfds, void *readfds, void *writefds, void *exceptfds, const int64_t *tv) {
-+    return g_ldnr ? ldnr_select(g_ldnr, nfds, readfds, writefds, exceptfds, lr_timeval_ms(tv)) : ldnr_fail(LDNR_ENETDOWN);
++    ldnr *l = lr_acquire();
++    if (!l) return ldnr_fail(LDNR_ENETDOWN);
++    int result = ldnr_select(l, nfds, readfds, writefds, exceptfds, lr_timeval_ms(tv));
++    lr_release();
++    return result;
 +}
 +LDNR_HLE("_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", int, lr_select_new, int nfds, void *r, void *w, void *e, const int64_t *tv) { return lr_select(nfds, r, w, e, tv); }
 +LDNR_HLE("_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval", int, lr_select_old, int nfds, void *r, void *w, void *e, const int64_t *tv) { return lr_select(nfds, r, w, e, tv); }
@@ -460,10 +809,10 @@ index 0000000..fd3f748
 +#include "ldnr/ldnr.c"
 diff --git a/dm/host/ldnr/ldnr.c b/dm/host/ldnr/ldnr.c
 new file mode 100644
-index 0000000..2b2a5a7
+index 0000000..383bd83
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr.c
-@@ -0,0 +1,490 @@
+@@ -0,0 +1,660 @@
 +// LDN service state and the public lifecycle API. Relay I/O and virtual
 +// sockets are separate so illegal transitions can be tested without a server.
 +#include "ldnr_internal.h"
@@ -478,7 +827,16 @@ index 0000000..2b2a5a7
 +void ldnr_set_errno(int error) { ldnr_errno_value = error; }
 +int ldnr_last_errno(void) { return ldnr_errno_value; }
 +int ldnr_fail(int error) { ldnr_set_errno(error); return -1; }
-+const char *ldnr_last_error(const ldnr *l) { return l ? l->error : "no LDNR context"; }
++const char *ldnr_last_error(const ldnr *l) {
++    static _Thread_local char text[256];
++    if (!l) return "no LDNR context";
++    ldnr *mutable_l = (ldnr *)l;
++    pthread_mutex_lock(&mutable_l->error_mutex);
++    memcpy(text, mutable_l->error, sizeof text);
++    pthread_mutex_unlock(&mutable_l->error_mutex);
++    text[sizeof text - 1] = 0;
++    return text;
++}
 +
 +static char *ldnr_strdup(const char *s) {
 +    if (!s) return NULL;
@@ -502,7 +860,9 @@ index 0000000..2b2a5a7
 +void ldnr_set_error(ldnr *l, const char *format, ...) {
 +    va_list ap;
 +    va_start(ap, format);
++    pthread_mutex_lock(&l->error_mutex);
 +    vsnprintf(l->error, sizeof l->error, format, ap);
++    pthread_mutex_unlock(&l->error_mutex);
 +    va_end(ap);
 +    ldnr_log(l, "%s", l->error);
 +}
@@ -545,6 +905,13 @@ index 0000000..2b2a5a7
 +    if (l->config.state_changed) l->config.state_changed(l->config.callback_ctx);
 +}
 +
++void ldnr_notify(ldnr *l) {
++    // The room changed in a way the guest can observe (a node joined or left,
++    // the advertisement or the accept policy changed): the event that the
++    // game waits on is signalled even when the state itself did not move.
++    if (l->config.state_changed) l->config.state_changed(l->config.callback_ctx);
++}
++
 +int ldnr_create(const ldnr_config *config, ldnr **out) {
 +    if (!out || !config) return ldnr_fail(LDNR_EINVAL);
 +    *out = NULL;
@@ -555,6 +922,8 @@ index 0000000..2b2a5a7
 +    l->subnet_mask = ldnr_htonl(0xffff0000u);
 +    l->disconnect_reason = 0;
 +    pthread_mutex_init(&l->mutex, NULL);
++    pthread_mutex_init(&l->control, NULL);
++    pthread_mutex_init(&l->error_mutex, NULL);
 +    pthread_cond_init(&l->condition, NULL);
 +    ldnr_vnet_init(l);
 +    l->server = ldnr_strdup(config->server);
@@ -575,7 +944,8 @@ index 0000000..2b2a5a7
 +        return ldnr_fail(LDNR_ENOBUFS);
 +    }
 +    l->next_request_id = 1;
-+    atomic_init(&l->connection_id_seq, 0x1000000);
++    atomic_init(&l->node_id, 0);
++    atomic_init(&l->connection_id_seq, 1);
 +    *out = l;
 +    return 0;
 +}
@@ -604,6 +974,10 @@ index 0000000..2b2a5a7
 +    l->has_network = l->has_network_config = l->has_security = 0;
 +    l->network_id = 0;
 +    l->scan_count = 0;
++    // The cached addressing belongs to the membership that just ended.
++    l->ipv4 = 0;
++    l->subnet_mask = ldnr_htonl(0xffff0000u);
++    l->latest_update.state_change = 0;
 +    ldnr_protocol_message_free(&l->reply);
 +    ldnr_state_set(l, LDNR_STATE_NONE);
 +    pthread_mutex_unlock(&l->mutex);
@@ -616,6 +990,8 @@ index 0000000..2b2a5a7
 +    if (l->transport && l->transport->destroy) l->transport->destroy(l->transport->ctx);
 +    if (l->owns_transport) free((void *)l->transport);
 +    pthread_mutex_destroy(&l->mutex);
++    pthread_mutex_destroy(&l->control);
++    pthread_mutex_destroy(&l->error_mutex);
 +    pthread_cond_destroy(&l->condition);
 +    free(l->server);
 +    free(l->room_password);
@@ -664,6 +1040,9 @@ index 0000000..2b2a5a7
 +    ldnr_client_close(l);
 +    pthread_mutex_lock(&l->mutex);
 +    ldnr_vnet_reset(l);
++    // The cached addressing belonged to the closed membership.
++    l->ipv4 = 0;
++    l->latest_update.state_change = 0;
 +    ldnr_state_set(l, LDNR_STATE_INITIALIZED);
 +    pthread_mutex_unlock(&l->mutex);
 +    return 0;
@@ -682,7 +1061,10 @@ index 0000000..2b2a5a7
 +    }
 +}
 +
-+static int ldnr_accept_network(ldnr *l, const ldnr_message *reply) {
++// Installs the network identity of a create or connect acknowledgement. The
++// local address is taken from this acknowledgement only: the address of an
++// earlier membership must never be reused.
++int ldnr_apply_network(ldnr *l, const ldnr_message *reply) {
 +    if (!reply->has_network_info) {
 +        ldnr_set_error(l, "relay reply has no NetworkInfo");
 +        return ldnr_fail(LDNR_EINVAL);
@@ -693,11 +1075,17 @@ index 0000000..2b2a5a7
 +    memcpy(l->security.server_random, l->network.server_random, 16);
 +    memcpy(l->security.session_id, l->network.network_id.session_id, 16);
 +    l->has_security = 1;
++    atomic_store(&l->node_id, reply->node_id);
++    atomic_store(&l->connection_id_seq, 1);
++    l->ipv4 = 0;
 +    if (reply->ipv4) l->ipv4 = reply->ipv4;
 +    if (!l->ipv4 && l->network.node_count) {
 +        // The host is normally node zero. A joiner gets its address explicitly.
-+        for (unsigned i = 0; i < l->network.node_count && i < 8; i++)
-+            if (l->network.nodes[i].is_connected) { l->ipv4 = l->network.nodes[i].ipv4_address; break; }
++        for (unsigned i = 0; i < l->network.node_count && i < LDNR_NATIVE_NODE_COUNT_MAX; i++)
++            if (l->network.nodes[i].is_connected) {
++                l->ipv4 = ldnr_ipv4_from_native(l->network.nodes[i].ipv4_address);
++                break;
++            }
 +    }
 +    if (reply->subnet_mask) l->subnet_mask = reply->subnet_mask;
 +    ldnr_vnet_set_address(l, l->ipv4, l->subnet_mask);
@@ -709,8 +1097,15 @@ index 0000000..2b2a5a7
 +                        const ldnr_security_parameter *private_security,
 +                        const ldnr_address_entry *addresses, int address_count) {
 +    if (!l || !config || !security || address_count < 0) return ldnr_fail(LDNR_EINVAL);
++    // A control operation runs from end to end: the inputs it sends and the
++    // state it changes belong to this call alone.
++    pthread_mutex_lock(&l->control);
 +    pthread_mutex_lock(&l->mutex);
-+    if (l->state != LDNR_STATE_AP_OPEN) { pthread_mutex_unlock(&l->mutex); return ldnr_fail(LDNR_EINVAL); }
++    if (l->state != LDNR_STATE_AP_OPEN) {
++        pthread_mutex_unlock(&l->mutex);
++        pthread_mutex_unlock(&l->control);
++        return ldnr_fail(LDNR_EINVAL);
++    }
 +    l->network_config = *config;
 +    l->security_config = *security;
 +    ldnr_apply_user(l, user, &l->user_config);
@@ -726,25 +1121,55 @@ index 0000000..2b2a5a7
 +    operation.private_operation = private_security != NULL;
 +    operation.room_password = l->room_password;
 +    operation.player_name = l->player_name;
-+    ldnr_message message = {0};
++    ldnr_message *reply = ldnr_message_new();
++    if (!reply) { pthread_mutex_unlock(&l->control); return ldnr_fail(LDNR_ENOBUFS); }
 +    int result = ldnr_client_request(l, LDNR_MSG_CREATE_ACK, LDNR_MSG_CREATE_ACK, 0,
-+                                     &message, &operation, l->config.connect_timeout_ms);
++                                     NULL, &operation, reply, l->config.connect_timeout_ms);
++    ldnr_message_delete(reply);
 +    pthread_mutex_lock(&l->mutex);
-+    if (!result) result = ldnr_accept_network(l, &l->reply);
-+    if (!result) {
-+        l->has_network_config = 1;
-+        ldnr_state_set(l, LDNR_STATE_AP_CREATED);
-+    }
++    // The room can be gone again before the caller looks at the result.
++    if (!result && !l->has_network) result = ldnr_fail(LDNR_ENETDOWN);
++    if (!result) l->has_network_config = 1;
 +    pthread_mutex_unlock(&l->mutex);
++    pthread_mutex_unlock(&l->control);
 +    return result;
++}
++
++// The relay does not know the network type or the BSSID of a room, so those
++// filters are applied here, before a result is kept.
++static int ldnr_scan_filter_valid(const ldnr_scan_filter *filter) {
++    if (!filter) return 1;
++    if (filter->flags & 0x04 && filter->network_type > 0xffu) return 0;
++    if (filter->flags & 0x08) {
++        uint8_t zero[6] = {0};
++        if (!memcmp(filter->bssid, zero, sizeof zero)) return 0;
++    }
++    return 1;
++}
++
++static int ldnr_scan_matches(const ldnr_scan_filter *filter, int channel,
++                              const ldnr_network_info *info) {
++    if (!filter) return 1;
++    if ((filter->flags & 0x04) && (uint32_t)info->common.network_type != filter->network_type)
++        return 0;
++    if ((filter->flags & 0x08) && memcmp(info->common.bssid, filter->bssid, sizeof filter->bssid))
++        return 0;
++    if (channel > 0 && info->common.channel != (int16_t)channel) return 0;
++    return 1;
 +}
 +
 +int ldnr_scan(ldnr *l, ldnr_network_info *out, int *count, int max_count,
 +              const ldnr_scan_filter *filter, int channel, int private_scan) {
 +    if (count) *count = 0;
 +    if (!l || !count || max_count < 0 || (max_count && !out)) return ldnr_fail(LDNR_EINVAL);
++    if (!ldnr_scan_filter_valid(filter)) return ldnr_fail(LDNR_EINVAL);
++    pthread_mutex_lock(&l->control);
 +    pthread_mutex_lock(&l->mutex);
-+    if (l->state != LDNR_STATE_STATION_OPEN) { pthread_mutex_unlock(&l->mutex); return ldnr_fail(LDNR_EINVAL); }
++    if (l->state != LDNR_STATE_STATION_OPEN) {
++        pthread_mutex_unlock(&l->mutex);
++        pthread_mutex_unlock(&l->control);
++        return ldnr_fail(LDNR_EINVAL);
++    }
 +    pthread_mutex_unlock(&l->mutex);
 +    ldnr_scan_filter empty_filter;
 +    if (!filter) { memset(&empty_filter, 0, sizeof empty_filter); filter = &empty_filter; }
@@ -752,21 +1177,32 @@ index 0000000..2b2a5a7
 +    operation.scan_filter = filter;
 +    operation.channel = channel;
 +    operation.private_operation = private_scan;
-+    ldnr_message message = {0};
++    ldnr_message *reply = ldnr_message_new();
++    if (!reply) { pthread_mutex_unlock(&l->control); return ldnr_fail(LDNR_ENOBUFS); }
 +    int result = ldnr_client_request(l, LDNR_MSG_SCAN_ACK, LDNR_MSG_SCAN_ACK, 0,
-+                                     &message, &operation, l->config.scan_timeout_ms);
-+    if (result) return result;
-+    pthread_mutex_lock(&l->mutex);
-+    int found = l->reply.network_count;
-+    if (found < 0 || found > LDNR_MAX_NETWORKS) found = LDNR_MAX_NETWORKS;
-+    l->scan_count = found;
-+    for (int i = 0; i < found; i++) {
-+        l->scan_ids[i] = l->reply.networks[i].network_id;
-+        memcpy(l->scan_sessions[i], l->reply.networks[i].info.network_id.session_id, 16);
-+        if (i < max_count) out[i] = l->reply.networks[i].info;
++                                     NULL, &operation, reply, l->config.scan_timeout_ms);
++    if (result) {
++        ldnr_message_delete(reply);
++        pthread_mutex_unlock(&l->control);
++        return result;
 +    }
-+    *count = found < max_count ? found : max_count;
++    pthread_mutex_lock(&l->mutex);
++    int found = reply->network_count;
++    if (found < 0 || found > LDNR_MAX_NETWORKS) found = LDNR_MAX_NETWORKS;
++    l->scan_count = 0;
++    int kept = 0;
++    for (int i = 0; i < found; i++) {
++        if (!ldnr_scan_matches(filter, channel, &reply->networks[i].info)) continue;
++        l->scan_ids[l->scan_count] = reply->networks[i].network_id;
++        memcpy(l->scan_sessions[l->scan_count], reply->networks[i].info.network_id.session_id, 16);
++        l->scan_count++;
++        if (kept < max_count) out[kept] = reply->networks[i].info;
++        kept++;
++    }
++    *count = kept < max_count ? kept : max_count;
 +    pthread_mutex_unlock(&l->mutex);
++    ldnr_message_delete(reply);
++    pthread_mutex_unlock(&l->control);
 +    return 0;
 +}
 +
@@ -780,13 +1216,22 @@ index 0000000..2b2a5a7
 +int ldnr_connect_network(ldnr *l, const ldnr_network_info *info,
 +                         const ldnr_network_config *private_config,
 +                         const ldnr_security_config *security, const ldnr_user_config *user,
-+                         const ldnr_security_parameter *private_security, int option) {
++                         const ldnr_security_parameter *private_security, int option,
++                         int version) {
 +    if (!l || !security || (!info && !private_config)) return ldnr_fail(LDNR_EINVAL);
++    // The local communication version is a number of its own (0x0-0x7FFF).
++    if (version < 0 || version > 0x7fff) return ldnr_fail(LDNR_EINVAL);
++    pthread_mutex_lock(&l->control);
 +    pthread_mutex_lock(&l->mutex);
-+    if (l->state != LDNR_STATE_STATION_OPEN) { pthread_mutex_unlock(&l->mutex); return ldnr_fail(LDNR_EINVAL); }
++    if (l->state != LDNR_STATE_STATION_OPEN) {
++        pthread_mutex_unlock(&l->mutex);
++        pthread_mutex_unlock(&l->control);
++        return ldnr_fail(LDNR_EINVAL);
++    }
 +    ldnr_apply_user(l, user, &l->user_config);
 +    if (security) l->security_config = *security;
 +    if (private_security) l->security = *private_security;
++    if (private_config) l->network_config = *private_config;
 +    uint64_t id = ldnr_find_network_id(l, info);
 +    if (info && !id) {
 +        // A game may reconnect from a saved NetworkInfo after a new scan. The
@@ -794,8 +1239,23 @@ index 0000000..2b2a5a7
 +        id = 0;
 +    }
 +    pthread_mutex_unlock(&l->mutex);
++    // A public connect carries the local communication version in the
++    // network configuration that goes out with the request.
++    ldnr_network_config public_config;
++    memset(&public_config, 0, sizeof public_config);
++    public_config.local_communication_version = (int16_t)version;
++    // The version argument is the local communication version of this
++    // connection. A private connect carries one in its own configuration;
++    // the argument wins when it is not zero.
++    ldnr_network_config out_config;
++    if (private_config) {
++        out_config = l->network_config;
++        if (version) out_config.local_communication_version = (int16_t)version;
++    } else {
++        out_config = public_config;
++    }
 +    ldnr_operation operation = {0};
-+    operation.network_config = private_config;
++    operation.network_config = &out_config;
 +    operation.security_config = &l->security_config;
 +    operation.user_config = &l->user_config;
 +    operation.security_parameter = private_security;
@@ -803,47 +1263,57 @@ index 0000000..2b2a5a7
 +    operation.private_operation = private_config != NULL;
 +    operation.room_password = l->room_password;
 +    operation.player_name = l->player_name;
-+    ldnr_message message = {0};
-+    if (info) { message.network_info = *info; message.has_network_info = 1; }
++    ldnr_message *message = ldnr_message_new();
++    if (!message) { pthread_mutex_unlock(&l->control); return ldnr_fail(LDNR_ENOBUFS); }
++    if (info) { message->network_info = *info; message->has_network_info = 1; }
 +    int result = ldnr_client_request(l, LDNR_MSG_CONNECT_ACK, LDNR_MSG_CONNECT_ACK, id,
-+                                     &message, &operation, l->config.connect_timeout_ms);
++                                     message, &operation, NULL, l->config.connect_timeout_ms);
++    ldnr_message_delete(message);
 +    pthread_mutex_lock(&l->mutex);
-+    if (!result) result = ldnr_accept_network(l, &l->reply);
++    if (!result && !l->has_network) result = ldnr_fail(LDNR_ENETDOWN);
 +    if (!result) {
-+        if (private_config) l->network_config = *private_config;
-+        else {
++        if (!private_config) {
 +            memset(&l->network_config, 0, sizeof l->network_config);
 +            l->network_config.intent_id = l->network.network_id.intent_id;
 +            l->network_config.channel = l->network.common.channel;
 +            l->network_config.node_count_max = l->network.node_count_max;
 +        }
++        // The version that was used is the one the configuration reports.
++        l->network_config.local_communication_version = out_config.local_communication_version;
 +        l->has_network_config = 1;
 +        l->disconnect_reason = 0;
-+        ldnr_state_set(l, LDNR_STATE_STATION_CONNECTED);
 +    }
 +    pthread_mutex_unlock(&l->mutex);
++    pthread_mutex_unlock(&l->control);
 +    return result;
 +}
 +
 +static int ldnr_leave(ldnr *l, int destroy) {
 +    if (!l) return ldnr_fail(LDNR_EINVAL);
++    pthread_mutex_lock(&l->control);
 +    pthread_mutex_lock(&l->mutex);
 +    int valid = l->state == (destroy ? LDNR_STATE_AP_CREATED : LDNR_STATE_STATION_CONNECTED);
 +    uint64_t id = l->network_id;
-+    ldnr_message message = {0};
-+    if (destroy) { message.network_info = l->network; message.has_network_info = 1; }
 +    pthread_mutex_unlock(&l->mutex);
-+    if (!valid) return ldnr_fail(LDNR_EINVAL);
++    if (!valid) { pthread_mutex_unlock(&l->control); return ldnr_fail(LDNR_EINVAL); }
 +    ldnr_message_type type = destroy ? LDNR_MSG_DESTROY_ACK : LDNR_MSG_DISCONNECTED;
++    ldnr_message *message = ldnr_message_new();
++    if (!message) { pthread_mutex_unlock(&l->control); return ldnr_fail(LDNR_ENOBUFS); }
++    pthread_mutex_lock(&l->mutex);
++    if (destroy) { message->network_info = l->network; message->has_network_info = 1; }
++    pthread_mutex_unlock(&l->mutex);
 +    int result = ldnr_client_request(l, type, type,
-+                                     id, &message, NULL, l->config.connect_timeout_ms);
-+    if (result) return result;
++                                     id, message, NULL, NULL, l->config.connect_timeout_ms);
++    ldnr_message_delete(message);
++    if (result) { pthread_mutex_unlock(&l->control); return result; }
 +    pthread_mutex_lock(&l->mutex);
 +    ldnr_vnet_reset(l);
 +    l->has_network = l->has_network_config = l->has_security = 0;
 +    l->network_id = 0;
++    l->ipv4 = 0;
 +    ldnr_state_set(l, destroy ? LDNR_STATE_AP_OPEN : LDNR_STATE_STATION_OPEN);
 +    pthread_mutex_unlock(&l->mutex);
++    pthread_mutex_unlock(&l->control);
 +    return 0;
 +}
 +int ldnr_disconnect(ldnr *l) { return ldnr_leave(l, 0); }
@@ -862,8 +1332,20 @@ index 0000000..2b2a5a7
 +    if (!l || !address || !mask) return ldnr_fail(LDNR_EINVAL);
 +    pthread_mutex_lock(&l->mutex);
 +    if (!l->has_network) { pthread_mutex_unlock(&l->mutex); return ldnr_fail(LDNR_ENOTCONN); }
-+    *address = l->ipv4;
-+    *mask = l->subnet_mask;
++    // nn::ldn keeps the address in host order.
++    *address = ldnr_ipv4_to_native(l->ipv4);
++    *mask = ldnr_ipv4_to_native(l->subnet_mask);
++    pthread_mutex_unlock(&l->mutex);
++    return 0;
++}
++
++int ldnr_get_network_info_latest_update(ldnr *l, ldnr_node_latest_update *out) {
++    if (!l || !out) return ldnr_fail(LDNR_EINVAL);
++    pthread_mutex_lock(&l->mutex);
++    if (!l->has_network) { pthread_mutex_unlock(&l->mutex); return ldnr_fail(LDNR_ENOTCONN); }
++    *out = l->latest_update;
++    // The state is cleared once it has been read.
++    l->latest_update.state_change = 0;
 +    pthread_mutex_unlock(&l->mutex);
 +    return 0;
 +}
@@ -895,9 +1377,8 @@ index 0000000..2b2a5a7
 +    ldnr_operation operation = {0};
 +    operation.data = data;
 +    operation.data_size = size;
-+    ldnr_message message = {0};
 +    int result = ldnr_client_request(l, LDNR_MSG_ADVERTISE_ACK, LDNR_MSG_ADVERTISE_ACK,
-+                                     id, &message, &operation, l->config.connect_timeout_ms);
++                                     id, NULL, &operation, NULL, l->config.connect_timeout_ms);
 +    if (!result) {
 +        pthread_mutex_lock(&l->mutex);
 +        memset(l->network.advertise_data, 0, sizeof l->network.advertise_data);
@@ -916,9 +1397,8 @@ index 0000000..2b2a5a7
 +    pthread_mutex_unlock(&l->mutex);
 +    ldnr_operation operation = {0};
 +    operation.option = policy;
-+    ldnr_message message = {0};
 +    int result = ldnr_client_request(l, LDNR_MSG_POLICY_ACK, LDNR_MSG_POLICY_ACK,
-+                                     id, &message, &operation, l->config.connect_timeout_ms);
++                                     id, NULL, &operation, NULL, l->config.connect_timeout_ms);
 +    if (!result) {
 +        pthread_mutex_lock(&l->mutex);
 +        l->network.station_accept_policy = (uint8_t)policy;
@@ -929,37 +1409,76 @@ index 0000000..2b2a5a7
 +
 +int ldnr_add_accept_filter_entry(ldnr *l, const uint8_t mac[6]) {
 +    if (!l || !mac) return ldnr_fail(LDNR_EINVAL);
++    pthread_mutex_lock(&l->control);
 +    pthread_mutex_lock(&l->mutex);
-+    if (l->state != LDNR_STATE_AP_CREATED) { pthread_mutex_unlock(&l->mutex); return ldnr_fail(LDNR_EINVAL); }
++    if (l->state != LDNR_STATE_AP_CREATED) {
++        pthread_mutex_unlock(&l->mutex);
++        pthread_mutex_unlock(&l->control);
++        return ldnr_fail(LDNR_EINVAL);
++    }
 +    uint64_t id = l->network_id;
 +    pthread_mutex_unlock(&l->mutex);
 +    ldnr_operation operation = {0};
 +    memcpy(operation.mac, mac, 6);
-+    return ldnr_client_request(l, LDNR_MSG_FILTER_ACK, LDNR_MSG_FILTER_ACK, id,
-+                               &(ldnr_message){0}, &operation, l->config.connect_timeout_ms);
++    int result = ldnr_client_request(l, LDNR_MSG_FILTER_ACK, LDNR_MSG_FILTER_ACK, id,
++                                     NULL, &operation, NULL, l->config.connect_timeout_ms);
++    pthread_mutex_unlock(&l->control);
++    return result;
++}
++
++int ldnr_clear_accept_filter(ldnr *l) {
++    if (!l) return ldnr_fail(LDNR_EINVAL);
++    pthread_mutex_lock(&l->control);
++    pthread_mutex_lock(&l->mutex);
++    if (l->state != LDNR_STATE_AP_CREATED) {
++        pthread_mutex_unlock(&l->mutex);
++        pthread_mutex_unlock(&l->control);
++        return ldnr_fail(LDNR_EINVAL);
++    }
++    uint64_t id = l->network_id;
++    pthread_mutex_unlock(&l->mutex);
++    int result = ldnr_client_request(l, LDNR_MSG_CLEAR_FILTER_ACK, LDNR_MSG_CLEAR_FILTER_ACK,
++                                     id, NULL, NULL, NULL, l->config.connect_timeout_ms);
++    pthread_mutex_unlock(&l->control);
++    return result;
 +}
 +
 +int ldnr_reject(ldnr *l, uint32_t address) {
 +    if (!l) return ldnr_fail(LDNR_EINVAL);
++    pthread_mutex_lock(&l->control);
 +    pthread_mutex_lock(&l->mutex);
-+    if (l->state != LDNR_STATE_AP_CREATED) { pthread_mutex_unlock(&l->mutex); return ldnr_fail(LDNR_EINVAL); }
-+    ldnr_message message = {0};
-+    message.node_id = -1;
-+    for (unsigned i = 0; i < 8; i++)
++    if (l->state != LDNR_STATE_AP_CREATED) {
++        pthread_mutex_unlock(&l->mutex);
++        pthread_mutex_unlock(&l->control);
++        return ldnr_fail(LDNR_EINVAL);
++    }
++    // The address is the host-order value of nn::ldn; the node list holds
++    // the same form, so the two can be compared directly.
++    ldnr_message *message = ldnr_message_new();
++    if (!message) { pthread_mutex_unlock(&l->mutex); pthread_mutex_unlock(&l->control); return ldnr_fail(LDNR_ENOBUFS); }
++    message->node_id = -1;
++    for (unsigned i = 0; i < LDNR_NATIVE_NODE_COUNT_MAX; i++)
 +        if (l->network.nodes[i].is_connected && l->network.nodes[i].ipv4_address == address)
-+            message.node_id = l->network.nodes[i].node_id;
++            message->node_id = l->network.nodes[i].node_id;
 +    uint64_t id = l->network_id;
 +    pthread_mutex_unlock(&l->mutex);
-+    if (message.node_id < 0) return ldnr_fail(LDNR_EINVAL);
-+    return ldnr_client_request(l, LDNR_MSG_REJECT_ACK, LDNR_MSG_REJECT_ACK, id,
-+                               &message, NULL, l->config.connect_timeout_ms);
++    if (message->node_id < 0) {
++        ldnr_message_delete(message);
++        pthread_mutex_unlock(&l->control);
++        return ldnr_fail(LDNR_EINVAL);
++    }
++    int result = ldnr_client_request(l, LDNR_MSG_REJECT_ACK, LDNR_MSG_REJECT_ACK, id,
++                                     message, NULL, NULL, l->config.connect_timeout_ms);
++    ldnr_message_delete(message);
++    pthread_mutex_unlock(&l->control);
++    return result;
 +}
 diff --git a/dm/host/ldnr/ldnr.h b/dm/host/ldnr/ldnr.h
 new file mode 100644
-index 0000000..54ea3aa
+index 0000000..b626d4b
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr.h
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,110 @@
 +// Public, host-independent LDN relay core. All IP addresses and ports in the
 +// socket API are in network byte order, as in BSD sockaddr_in.
 +#pragma once
@@ -1005,16 +1524,19 @@ index 0000000..54ea3aa
 +int ldnr_connect_network(ldnr *l, const ldnr_network_info *info,
 +                         const ldnr_network_config *private_config,
 +                         const ldnr_security_config *security, const ldnr_user_config *user,
-+                         const ldnr_security_parameter *private_security, int option);
++                         const ldnr_security_parameter *private_security, int option,
++                         int version);
 +int ldnr_disconnect(ldnr *l);
 +int ldnr_destroy_network(ldnr *l);
 +int ldnr_get_network_info(ldnr *l, ldnr_network_info *out);
++int ldnr_get_network_info_latest_update(ldnr *l, ldnr_node_latest_update *out);
 +int ldnr_get_ipv4_address(ldnr *l, uint32_t *address, uint32_t *mask);
 +int ldnr_get_security_parameter(ldnr *l, ldnr_security_parameter *out);
 +int ldnr_get_network_config(ldnr *l, ldnr_network_config *out);
 +int ldnr_set_advertise_data(ldnr *l, const void *data, size_t size);
 +int ldnr_set_station_accept_policy(ldnr *l, int policy);
 +int ldnr_add_accept_filter_entry(ldnr *l, const uint8_t mac[6]);
++int ldnr_clear_accept_filter(ldnr *l);
 +int ldnr_reject(ldnr *l, uint32_t address);
 +int ldnr_get_disconnect_reason(const ldnr *l);
 +
@@ -1054,16 +1576,25 @@ index 0000000..54ea3aa
 +uint16_t ldnr_htons(uint16_t value);
 +uint32_t ldnr_htonl(uint32_t value);
 +
++// The relay and the socket layer carry an address as the four network octets
++// in one word (10.114.0.1 -> 0x0100720A), while nn::ldn keeps the host-order
++// value (10.114.0.1 -> 0x0A720001). These convert between the two forms.
++uint32_t ldnr_ipv4_to_native(uint32_t wire);
++uint32_t ldnr_ipv4_from_native(uint32_t native);
++// Socket ports are in network byte order; the relay carries plain numbers.
++uint16_t ldnr_port_to_host(uint16_t network_order);
++uint16_t ldnr_port_from_host(uint16_t host_order);
++
 +// Test/diagnostic injection uses the same delivery path as relay UDP frames.
 +int ldnr_inject_udp(ldnr *l, uint32_t source_address, uint16_t source_port,
 +                    uint32_t destination_address, uint16_t destination_port,
 +                    const void *data, size_t size);
 diff --git a/dm/host/ldnr/ldnr_client.c b/dm/host/ldnr/ldnr_client.c
 new file mode 100644
-index 0000000..c7b81b6
+index 0000000..83a27f1
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_client.c
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,341 @@
 +// Relay connection, request/reply matching, and the background receive loop.
 +// The codec only turns frames into ldnr_message; this file owns no wire rules.
 +#include "ldnr_internal.h"
@@ -1073,6 +1604,11 @@ index 0000000..c7b81b6
 +
 +static int ldnr_send_encoded(ldnr *l, const uint8_t *frame, size_t size) {
 +    if (!l->transport_open || l->stop) return ldnr_fail(LDNR_ENETDOWN);
++    // The relay announced the largest payload it accepts: a frame above it
++    // would be dropped without an answer.
++    uint32_t limit = atomic_load(&l->max_frame);
++    if (limit && size > (size_t)limit + LDNR_WIRE_HEADER)
++        return ldnr_fail(LDNR_EMSGSIZE);
 +    if (l->transport->send(l->transport->ctx, frame, size) < 0) {
 +        ldnr_set_error(l, "relay send failed");
 +        return ldnr_fail(LDNR_ENETDOWN);
@@ -1107,7 +1643,8 @@ index 0000000..c7b81b6
 +
 +int ldnr_client_request(ldnr *l, ldnr_message_type want, ldnr_message_type send_type,
 +                        uint64_t network_id, const ldnr_message *message,
-+                        const ldnr_operation *operation, int timeout_ms) {
++                        const ldnr_operation *operation, ldnr_message *reply_out,
++                        int timeout_ms) {
 +    if (!l) return ldnr_fail(LDNR_EINVAL);
 +    if (timeout_ms <= 0) timeout_ms = 5000;
 +    pthread_mutex_lock(&l->mutex);
@@ -1129,9 +1666,29 @@ index 0000000..c7b81b6
 +    }
 +    if (!result && !l->reply_ready) result = ldnr_fail(LDNR_ENETDOWN);
 +    if (!result && l->reply_status) result = ldnr_fail((int)l->reply_status);
++    // The reply is handed over before the request slot is released, so no
++    // other request can replace it while the caller reads it.
++    if (reply_out) {
++        *reply_out = l->reply;
++        memset(&l->reply, 0, sizeof l->reply);
++    } else {
++        ldnr_protocol_message_free(&l->reply);
++        memset(&l->reply, 0, sizeof l->reply);
++    }
 +    l->pending_request = 0;
 +    pthread_mutex_unlock(&l->mutex);
 +    return result;
++}
++
++// Joins a receive thread that has ended (or is ending). The transport is
++// closed before, so the reader cannot stay blocked in recv().
++static void ldnr_retire_receiver(ldnr *l) {
++    pthread_mutex_lock(&l->mutex);
++    int join = l->receive_started;
++    pthread_t thread = l->receive_thread;
++    l->receive_started = 0;
++    pthread_mutex_unlock(&l->mutex);
++    if (join) pthread_join(thread, NULL);
 +}
 +
 +int ldnr_client_open(ldnr *l) {
@@ -1140,6 +1697,8 @@ index 0000000..c7b81b6
 +    l->stop = 0;
 +    l->error[0] = 0;
 +    pthread_mutex_unlock(&l->mutex);
++    // A reader that failed earlier must be gone before a new one starts.
++    ldnr_retire_receiver(l);
 +    char error[160] = {0};
 +    if (l->transport->connect(l->transport->ctx, l->server, error, sizeof error) < 0) {
 +        pthread_mutex_lock(&l->mutex);
@@ -1149,9 +1708,9 @@ index 0000000..c7b81b6
 +        return ldnr_fail(LDNR_ENETDOWN);
 +    }
 +    pthread_mutex_lock(&l->mutex);
-+    l->transport_open = 1;
++    atomic_store(&l->transport_open, 1);
 +    if (pthread_create(&l->receive_thread, NULL, ldnr_client_receive_main, l)) {
-+        l->transport_open = 0;
++        atomic_store(&l->transport_open, 0);
 +        l->stop = 1;
 +        pthread_mutex_unlock(&l->mutex);
 +        if (l->transport->close) l->transport->close(l->transport->ctx);
@@ -1159,12 +1718,15 @@ index 0000000..c7b81b6
 +    }
 +    l->receive_started = 1;
 +    pthread_mutex_unlock(&l->mutex);
-+    ldnr_message message = {0};
++    ldnr_message *message = ldnr_message_new();
++    if (!message) { ldnr_client_close(l); return ldnr_fail(LDNR_ENOBUFS); }
 +    ldnr_operation operation = {0};
 +    operation.room_password = l->room_password;
 +    operation.player_name = l->player_name;
-+    if (ldnr_client_request(l, LDNR_MSG_AUTH_OK, LDNR_MSG_AUTH_OK, 0, &message, &operation,
-+                            l->config.connect_timeout_ms)) {
++    int result = ldnr_client_request(l, LDNR_MSG_AUTH_OK, LDNR_MSG_AUTH_OK, 0, message, &operation,
++                                     NULL, l->config.connect_timeout_ms);
++    ldnr_message_delete(message);
++    if (result) {
 +        ldnr_client_close(l);
 +        return -1;
 +    }
@@ -1174,14 +1736,12 @@ index 0000000..c7b81b6
 +
 +void ldnr_client_close(ldnr *l) {
 +    pthread_mutex_lock(&l->mutex);
-+    int join = l->receive_started;
 +    l->stop = 1;
 +    if (l->transport_open && l->transport->close) l->transport->close(l->transport->ctx);
 +    pthread_mutex_unlock(&l->mutex);
-+    if (join) pthread_join(l->receive_thread, NULL);
++    ldnr_retire_receiver(l);
 +    pthread_mutex_lock(&l->mutex);
-+    l->receive_started = 0;
-+    l->transport_open = 0;
++    atomic_store(&l->transport_open, 0);
 +    if (l->pending_request) {
 +        l->reply_status = LDNR_ENETDOWN;
 +        l->reply_ready = 1;
@@ -1192,10 +1752,21 @@ index 0000000..c7b81b6
 +}
 +
 +static void ldnr_reply(ldnr *l, const ldnr_message *message) {
-+    // Transfer ownership of the scan array to the requester.
-+    l->reply = *message;
-+    l->reply_status = message->type == LDNR_MSG_AUTH_ERROR || message->type == LDNR_MSG_ERROR
-+        ? LDNR_ENETDOWN : message->status;
++    // Only the fields a caller can see are copied; the scan array changes
++    // owner and is released with the reply.
++    l->reply.network_id = message->network_id;
++    l->reply.ipv4 = message->ipv4;
++    l->reply.node_id = message->node_id;
++    l->reply.status = message->status;
++    l->reply.reason = message->reason;
++    l->reply.subnet_mask = message->subnet_mask;
++    l->reply.max_frame = message->max_frame;
++    l->reply.has_network_info = message->has_network_info;
++    l->reply.network_info = message->network_info;
++    l->reply.networks = message->networks;
++    l->reply.network_count = message->network_count;
++    // The decoded error is kept: the caller maps it to its own result.
++    l->reply_status = (int)message->status;
 +    l->reply_ready = 1;
 +    pthread_cond_broadcast(&l->condition);
 +}
@@ -1204,14 +1775,36 @@ index 0000000..c7b81b6
 +    if (l->state == LDNR_STATE_STATION_CONNECTED) {
 +        l->disconnect_reason = (int)reason;
 +        l->has_network = l->has_network_config = l->has_security = 0;
++        l->ipv4 = 0;
 +        ldnr_vnet_network_down(l);
++        // The state change already signals the event: a second signal would
++        // wake the guest twice for one change.
 +        ldnr_state_set(l, LDNR_STATE_STATION_OPEN);
 +    } else if (l->state == LDNR_STATE_AP_CREATED) {
 +        l->disconnect_reason = (int)reason;
 +        l->has_network = l->has_network_config = l->has_security = 0;
++        l->ipv4 = 0;
 +        ldnr_vnet_network_down(l);
 +        ldnr_state_set(l, LDNR_STATE_AP_OPEN);
 +    }
++}
++
++// The node set of the room changed: the guest is told which kind of change
++// happened, and the state change event is signalled.
++static void ldnr_track_update(ldnr *l, const ldnr_network_info *before,
++                              const ldnr_network_info *after) {
++    uint8_t changes = 0;
++    for (unsigned i = 0; i < LDNR_NATIVE_NODE_COUNT_MAX; i++) {
++        if (before->nodes[i].is_connected && !after->nodes[i].is_connected) changes |= 0x02;
++        else if (!before->nodes[i].is_connected && after->nodes[i].is_connected) changes |= 0x01;
++    }
++    if (after->advertise_data_size != before->advertise_data_size ||
++        memcmp(after->advertise_data, before->advertise_data, sizeof after->advertise_data))
++        changes |= 0x04;
++    if (after->station_accept_policy != before->station_accept_policy) changes |= 0x08;
++    if (!changes) return;
++    l->latest_update.state_change |= changes;
++    ldnr_notify(l);
 +}
 +
 +static void ldnr_dispatch(ldnr *l, ldnr_message *message) {
@@ -1219,16 +1812,30 @@ index 0000000..c7b81b6
 +    if (message->request_id && message->request_id == l->pending_request) {
 +        if (message->type == l->pending_want || message->type == LDNR_MSG_ERROR ||
 +            message->type == LDNR_MSG_AUTH_ERROR) {
++            // A create or connect acknowledgement installs the network
++            // before the waiter is woken up: a push that follows it must
++            // find the new state, not an empty one.
++            if (message->type == LDNR_MSG_AUTH_OK && message->max_frame)
++                atomic_store(&l->max_frame, message->max_frame);
++            if (!message->status && (message->type == LDNR_MSG_CREATE_ACK ||
++                                      message->type == LDNR_MSG_CONNECT_ACK)) {
++                if (ldnr_apply_network(l, message)) message->status = LDNR_EINVAL;
++                else if (message->type == LDNR_MSG_CREATE_ACK) ldnr_state_set(l, LDNR_STATE_AP_CREATED);
++                else { l->disconnect_reason = 0; ldnr_state_set(l, LDNR_STATE_STATION_CONNECTED); }
++            }
 +            ldnr_reply(l, message);
++            message->networks = NULL;
++            message->network_count = 0;
 +            pthread_mutex_unlock(&l->mutex);
-+            memset(message, 0, sizeof *message); // reply owns any allocation now
 +            return;
 +        }
 +    }
 +    switch (message->type) {
 +    case LDNR_MSG_NETWORK_UPDATED:
 +        if (l->has_network && message->has_network_info) {
++            ldnr_network_info before = l->network;
 +            l->network = message->network_info;
++            ldnr_track_update(l, &before, &l->network);
 +            pthread_cond_broadcast(&l->condition);
 +        }
 +        break;
@@ -1252,10 +1859,13 @@ index 0000000..c7b81b6
 +        break;
 +    case LDNR_MSG_PING:
 +        pthread_mutex_unlock(&l->mutex);
-+        ldnr_message pong = {0};
-+        pong.request_id = message->request_id;
-+        pong.timestamp = message->timestamp;
-+        ldnr_client_send(l, LDNR_MSG_PONG, 0, &pong, NULL);
++        ldnr_message *pong = ldnr_message_new();
++        if (pong) {
++            pong->request_id = message->request_id;
++            pong->timestamp = message->timestamp;
++            ldnr_client_send(l, LDNR_MSG_PONG, 0, pong, NULL);
++            ldnr_message_delete(pong);
++        }
 +        return;
 +    case LDNR_MSG_ERROR:
 +        ldnr_set_error(l, "relay: %s", message->text);
@@ -1276,10 +1886,21 @@ index 0000000..c7b81b6
 +        int stop = l->stop;
 +        pthread_mutex_unlock(&l->mutex);
 +        if (stop) break;
++        uint32_t limit = atomic_load(&l->max_frame);
++        if (size > 0 && limit && (size_t)size > (size_t)limit + LDNR_WIRE_HEADER) {
++            pthread_mutex_lock(&l->mutex);
++            ldnr_set_error(l, "relay frame exceeds the negotiated limit");
++            pthread_mutex_unlock(&l->mutex);
++            ldnr_log(l, "discarding oversized relay frame");
++            continue;
++        }
 +        if (size <= 0) {
 +            pthread_mutex_lock(&l->mutex);
 +            if (!l->stop) {
 +                ldnr_set_error(l, size == 0 ? "relay closed the connection" : "relay receive failed");
++                // The transport is gone: the connection is not open any more,
++                // and every waiter is woken with the failure.
++                atomic_store(&l->transport_open, 0);
 +                if (l->pending_request) {
 +                    l->reply_status = LDNR_ENETDOWN;
 +                    l->reply_ready = 1;
@@ -1300,12 +1921,20 @@ index 0000000..c7b81b6
 +        ldnr_dispatch(l, &message);
 +        ldnr_protocol_message_free(&message);
 +    }
++    pthread_mutex_lock(&l->mutex);
++    // The transport is gone: a later open must not treat it as connected.
++    atomic_store(&l->transport_open, 0);
++    pthread_mutex_unlock(&l->mutex);
 +    free(frame);
 +    return NULL;
 +}
 +
 +uint64_t ldnr_next_connection_id(ldnr *l) {
-+    return atomic_fetch_add(&l->connection_id_seq, 1);
++    // Connection ids live in a node specific namespace (the high byte is our
++    // own node id), so two clients in the same room never pick the same id.
++    uint64_t sequence = atomic_fetch_add(&l->connection_id_seq, 1);
++    uint32_t node = (uint32_t)(atomic_load(&l->node_id) & 0xff);
++    return ((uint64_t)node << 24) | (sequence & 0x00ffffffu);
 +}
 diff --git a/dm/host/ldnr/ldnr_hook.h b/dm/host/ldnr/ldnr_hook.h
 new file mode 100644
@@ -1319,10 +1948,10 @@ index 0000000..590dd65
 +void *ldnr_hook_lookup(const char *name);
 diff --git a/dm/host/ldnr/ldnr_internal.h b/dm/host/ldnr/ldnr_internal.h
 new file mode 100644
-index 0000000..a70c33b
+index 0000000..e3e75e0
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_internal.h
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,139 @@
 +// Private shared state for the unity build and the standalone test build.
 +#pragma once
 +#include "ldnr.h"
@@ -1336,6 +1965,8 @@ index 0000000..a70c33b
 +#define LDNR_FD_BASE 512
 +#define LDNR_ACCEPT_MAX 16
 +#define LDNR_QUEUE_MAX 64
++// A stream must never lose bytes: it is reset instead of dropping data.
++#define LDNR_STREAM_LIMIT (1024 * 1024)
 +
 +enum {
 +    LDNR_STATE_NONE = 0, LDNR_STATE_INITIALIZED = 1,
@@ -1366,10 +1997,12 @@ index 0000000..a70c33b
 +    int bound, listening, backlog;
 +    int connecting, connected, remote_eof, shut_read, shut_write;
 +    int connect_error;
++    int remote_error;                  // peer reset: reported as ECONNRESET
 +    ldnr_sockaddr local, peer;
 +    uint64_t connection_id;
 +    ldnr_packet *head, *tail;
 +    int queued;
++    size_t queued_bytes;
 +    int accept_fds[LDNR_ACCEPT_MAX], accept_head, accept_count;
 +} ldnr_vsock;
 +
@@ -1384,6 +2017,8 @@ index 0000000..a70c33b
 +
 +struct ldnr {
 +    pthread_mutex_t mutex;
++    pthread_mutex_t control;           // serializes complete control operations
++    pthread_mutex_t error_mutex;
 +    pthread_cond_t condition;
 +    pthread_t receive_thread;
 +    int receive_started, owns_transport;
@@ -1392,6 +2027,8 @@ index 0000000..a70c33b
 +    ldnr_config config;
 +    char *server, *room_password, *player_name;
 +    int state, disconnect_reason, initialized;
++    _Atomic int node_id;               // our node id inside the relay room
++    _Atomic uint32_t max_frame;        // frame limit negotiated with the relay
 +    uint32_t ipv4, subnet_mask;
 +    int has_network, has_network_config, has_security;
 +    uint64_t network_id;
@@ -1408,6 +2045,7 @@ index 0000000..a70c33b
 +    ldnr_message_type pending_want;
 +    int reply_ready, reply_status;
 +    ldnr_message reply;
++    ldnr_node_latest_update latest_update;
 +    char error[256];
 +    ldnr_vnet vnet;
 +};
@@ -1417,6 +2055,7 @@ index 0000000..a70c33b
 +void ldnr_log(ldnr *l, const char *format, ...);
 +void ldnr_set_error(ldnr *l, const char *format, ...);
 +void ldnr_state_set(ldnr *l, int state);
++void ldnr_notify(ldnr *l);            // an observable network change happened
 +int64_t ldnr_monotonic_ms(void);
 +int ldnr_wait_until(ldnr *l, pthread_cond_t *condition, pthread_mutex_t *mutex,
 +                    void *wait_ctx, void (*native_wait)(void *, int), int64_t deadline);
@@ -1425,13 +2064,15 @@ index 0000000..a70c33b
 +void ldnr_client_close(ldnr *l);
 +int ldnr_client_request(ldnr *l, ldnr_message_type want, ldnr_message_type send_type,
 +                        uint64_t network_id, const ldnr_message *message,
-+                        const ldnr_operation *operation, int timeout_ms);
++                        const ldnr_operation *operation, ldnr_message *reply_out,
++                        int timeout_ms);
 +int ldnr_client_send(ldnr *l, ldnr_message_type type, uint64_t network_id,
 +                     const ldnr_message *message, const ldnr_operation *operation);
 +void *ldnr_client_receive_main(void *argument);
 +
 +void ldnr_vnet_init(ldnr *l);
 +void ldnr_vnet_destroy(ldnr *l);
++int ldnr_apply_network(ldnr *l, const ldnr_message *reply);
 +void ldnr_vnet_reset(ldnr *l);
 +void ldnr_vnet_set_address(ldnr *l, uint32_t address, uint32_t mask);
 +void ldnr_vnet_udp(ldnr *l, const ldnr_message *message);
@@ -1440,14 +2081,19 @@ index 0000000..a70c33b
 +void ldnr_vnet_proxy_data(ldnr *l, const ldnr_message *message);
 +void ldnr_vnet_proxy_disconnect(ldnr *l, const ldnr_message *message);
 +void ldnr_vnet_network_down(ldnr *l);
-+int ldnr_vnet_send_udp(ldnr *l, ldnr_vsock *socket, const ldnr_sockaddr *destination,
-+                       const void *data, size_t size);
-+int ldnr_vnet_send_proxy(ldnr *l, ldnr_message_type type, ldnr_vsock *socket,
-+                         const void *data, size_t size);
++// A frame is prepared while the socket lock is held and transmitted after it
++// is released: a blocked relay write must not freeze the socket layer.
++ldnr_message *ldnr_vnet_prepare_udp(ldnr *l, const ldnr_vsock *socket,
++                                    const ldnr_sockaddr *destination,
++                                    const void *data, size_t size);
++ldnr_message *ldnr_vnet_prepare_proxy(ldnr *l, ldnr_message_type type,
++                                       const ldnr_vsock *socket, uint32_t source_address,
++                                       const void *data, size_t size);
++int ldnr_vnet_transmit(ldnr *l, ldnr_message_type type, ldnr_message *message);
 +uint64_t ldnr_next_connection_id(ldnr *l);
 diff --git a/dm/host/ldnr/ldnr_native.c b/dm/host/ldnr/ldnr_native.c
 new file mode 100644
-index 0000000..41b2bae
+index 0000000..25cabbe
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_native.c
 @@ -0,0 +1,622 @@
@@ -1567,13 +2213,13 @@ index 0000000..41b2bae
 +static void encode_network_id(const ldnr_network_id *value, uint8_t *out)
 +{
 +    encode_intent_id(&value->intent_id, out);
-+    memcpy(out + 0x18, value->session_id, sizeof(value->session_id));
++    memcpy(out + 0x10, value->session_id, sizeof(value->session_id));
 +}
 +
 +static void decode_network_id(ldnr_network_id *value, const uint8_t *in)
 +{
 +    decode_intent_id(&value->intent_id, in);
-+    memcpy(value->session_id, in + 0x18, sizeof(value->session_id));
++    memcpy(value->session_id, in + 0x10, sizeof(value->session_id));
 +}
 +
 +static void encode_ssid(const ldnr_ssid *value, uint8_t *out)
@@ -1801,17 +2447,17 @@ index 0000000..41b2bae
 +
 +    memset(out, 0, LDNR_NATIVE_NETWORK_INFO_SIZE);
 +    encode_network_id(&value->network_id, out);
-+    encode_common(&value->common, out + 0x28);
-+    memcpy(out + 0x58, value->server_random, sizeof(value->server_random));
-+    put_u16(out + 0x68, value->security_mode);
-+    out[0x6a] = value->station_accept_policy;
-+    out[0x6b] = value->version;
-+    out[0x6e] = (uint8_t)value->node_count_max;
-+    out[0x6f] = value->node_count;
++    encode_common(&value->common, out + 0x20);
++    memcpy(out + 0x50, value->server_random, sizeof(value->server_random));
++    put_u16(out + 0x60, value->security_mode);
++    out[0x62] = value->station_accept_policy;
++    out[0x63] = value->version;
++    out[0x66] = (uint8_t)value->node_count_max;
++    out[0x67] = value->node_count;
 +    for (i = 0; i < LDNR_NATIVE_NODE_COUNT_MAX; ++i)
-+        encode_node_info(&value->nodes[i], out + 0x70 + i * LDNR_NATIVE_NODE_INFO_SIZE);
-+    put_u16(out + 0x272, value->advertise_data_size);
-+    memcpy(out + 0x274, value->advertise_data, sizeof(value->advertise_data));
++        encode_node_info(&value->nodes[i], out + 0x68 + i * LDNR_NATIVE_NODE_INFO_SIZE);
++    put_u16(out + 0x26a, value->advertise_data_size);
++    memcpy(out + 0x26c, value->advertise_data, sizeof(value->advertise_data));
 +    return LDNR_NATIVE_OK;
 +}
 +
@@ -1826,26 +2472,26 @@ index 0000000..41b2bae
 +    if (status != LDNR_NATIVE_OK)
 +        return status;
 +    decode_network_id(&decoded.network_id, in);
-+    status = decode_common(&decoded.common, in + 0x28);
++    status = decode_common(&decoded.common, in + 0x20);
 +    if (status != LDNR_NATIVE_OK)
 +        return status;
-+    memcpy(decoded.server_random, in + 0x58, sizeof(decoded.server_random));
-+    decoded.security_mode = get_u16(in + 0x68);
-+    decoded.station_accept_policy = in[0x6a];
-+    decoded.version = in[0x6b];
-+    decoded.node_count_max = get_i8(in + 0x6e);
-+    decoded.node_count = in[0x6f];
++    memcpy(decoded.server_random, in + 0x50, sizeof(decoded.server_random));
++    decoded.security_mode = get_u16(in + 0x60);
++    decoded.station_accept_policy = in[0x62];
++    decoded.version = in[0x63];
++    decoded.node_count_max = get_i8(in + 0x66);
++    decoded.node_count = in[0x67];
 +    status = validate_node_count_max(decoded.node_count_max);
 +    if (status == LDNR_NATIVE_OK && decoded.node_count > LDNR_NATIVE_NODE_COUNT_MAX)
 +        status = LDNR_NATIVE_ERROR_INVALID;
 +    if (status != LDNR_NATIVE_OK)
 +        return status;
 +    for (i = 0; i < LDNR_NATIVE_NODE_COUNT_MAX; ++i)
-+        decode_node_info(&decoded.nodes[i], in + 0x70 + i * LDNR_NATIVE_NODE_INFO_SIZE);
-+    decoded.advertise_data_size = get_u16(in + 0x272);
++        decode_node_info(&decoded.nodes[i], in + 0x68 + i * LDNR_NATIVE_NODE_INFO_SIZE);
++    decoded.advertise_data_size = get_u16(in + 0x26a);
 +    if (decoded.advertise_data_size > LDNR_NATIVE_ADVERTISE_DATA_MAX)
 +        return LDNR_NATIVE_ERROR_INVALID;
-+    memcpy(decoded.advertise_data, in + 0x274, sizeof(decoded.advertise_data));
++    memcpy(decoded.advertise_data, in + 0x26c, sizeof(decoded.advertise_data));
 +    *value = decoded;
 +    return LDNR_NATIVE_OK;
 +}
@@ -1952,9 +2598,9 @@ index 0000000..41b2bae
 +        return status;
 +    memset(out, 0, LDNR_NATIVE_NETWORK_CONFIG_SIZE);
 +    encode_intent_id(&value->intent_id, out);
-+    put_u16(out + 0x18, (uint16_t)value->channel);
-+    out[0x1a] = (uint8_t)value->node_count_max;
-+    put_u16(out + 0x1c, (uint16_t)value->local_communication_version);
++    put_u16(out + 0x10, (uint16_t)value->channel);
++    out[0x12] = (uint8_t)value->node_count_max;
++    put_u16(out + 0x14, (uint16_t)value->local_communication_version);
 +    return LDNR_NATIVE_OK;
 +}
 +
@@ -1968,12 +2614,12 @@ index 0000000..41b2bae
 +    if (status != LDNR_NATIVE_OK)
 +        return status;
 +    decode_intent_id(&decoded.intent_id, in);
-+    decoded.channel = get_i16(in + 0x18);
-+    decoded.node_count_max = get_i8(in + 0x1a);
++    decoded.channel = get_i16(in + 0x10);
++    decoded.node_count_max = get_i8(in + 0x12);
 +    status = validate_node_count_max(decoded.node_count_max);
 +    if (status != LDNR_NATIVE_OK)
 +        return status;
-+    decoded.local_communication_version = get_i16(in + 0x1c);
++    decoded.local_communication_version = get_i16(in + 0x14);
 +    *value = decoded;
 +    return LDNR_NATIVE_OK;
 +}
@@ -1991,10 +2637,10 @@ index 0000000..41b2bae
 +        return status;
 +    memset(out, 0, LDNR_NATIVE_SCAN_FILTER_SIZE);
 +    encode_network_id(&value->network_id, out);
-+    put_u32(out + 0x28, value->network_type);
-+    memcpy(out + 0x2c, value->bssid, sizeof(value->bssid));
-+    encode_ssid(&value->ssid, out + 0x32);
-+    put_u32(out + 0x64, value->flags);
++    put_u32(out + 0x20, value->network_type);
++    memcpy(out + 0x24, value->bssid, sizeof(value->bssid));
++    encode_ssid(&value->ssid, out + 0x2a);
++    put_u32(out + 0x5c, value->flags);
 +    return LDNR_NATIVE_OK;
 +}
 +
@@ -2008,12 +2654,12 @@ index 0000000..41b2bae
 +    if (status != LDNR_NATIVE_OK)
 +        return status;
 +    decode_network_id(&decoded.network_id, in);
-+    decoded.network_type = get_u32(in + 0x28);
-+    memcpy(decoded.bssid, in + 0x2c, sizeof(decoded.bssid));
-+    status = decode_ssid(&decoded.ssid, in + 0x32);
++    decoded.network_type = get_u32(in + 0x20);
++    memcpy(decoded.bssid, in + 0x24, sizeof(decoded.bssid));
++    status = decode_ssid(&decoded.ssid, in + 0x2a);
 +    if (status != LDNR_NATIVE_OK)
 +        return status;
-+    decoded.flags = get_u32(in + 0x64);
++    decoded.flags = get_u32(in + 0x5c);
 +    *value = decoded;
 +    return LDNR_NATIVE_OK;
 +}
@@ -2075,10 +2721,10 @@ index 0000000..41b2bae
 +}
 diff --git a/dm/host/ldnr/ldnr_native.h b/dm/host/ldnr/ldnr_native.h
 new file mode 100644
-index 0000000..6374dc1
+index 0000000..75b6fbd
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_native.h
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,203 @@
 +#ifndef LDNR_NATIVE_H
 +#define LDNR_NATIVE_H
 +
@@ -2086,8 +2732,8 @@ index 0000000..6374dc1
 +#include <stdint.h>
 +
 +/* Public nn::ldn layouts, expressed without compiler packing extensions. */
-+#define LDNR_NATIVE_INTENT_ID_SIZE 0x18u
-+#define LDNR_NATIVE_NETWORK_ID_SIZE 0x28u
++#define LDNR_NATIVE_INTENT_ID_SIZE 0x10u
++#define LDNR_NATIVE_NETWORK_ID_SIZE 0x20u
 +#define LDNR_NATIVE_SSID_SIZE 0x22u
 +#define LDNR_NATIVE_COMMON_NETWORK_INFO_SIZE 0x30u
 +#define LDNR_NATIVE_NODE_INFO_SIZE 0x40u
@@ -2095,8 +2741,8 @@ index 0000000..6374dc1
 +#define LDNR_NATIVE_USER_CONFIG_SIZE 0x30u
 +#define LDNR_NATIVE_SECURITY_CONFIG_SIZE 0x44u
 +#define LDNR_NATIVE_SECURITY_PARAMETER_SIZE 0x20u
-+#define LDNR_NATIVE_NETWORK_CONFIG_SIZE 0x28u
-+#define LDNR_NATIVE_SCAN_FILTER_SIZE 0x68u
++#define LDNR_NATIVE_NETWORK_CONFIG_SIZE 0x20u
++#define LDNR_NATIVE_SCAN_FILTER_SIZE 0x60u
 +#define LDNR_NATIVE_ADDRESS_ENTRY_SIZE 0x0cu
 +#define LDNR_NATIVE_NODE_LATEST_UPDATE_SIZE 0x08u
 +
@@ -2109,7 +2755,7 @@ index 0000000..6374dc1
 +    int64_t local_communication_id;
 +    uint16_t reserved_08;
 +    uint16_t scene_id;
-+    uint8_t reserved_0c[0x0c];
++    uint8_t reserved_0c[0x04];
 +} ldnr_intent_id;
 +
 +typedef struct ldnr_network_id {
@@ -2149,14 +2795,15 @@ index 0000000..6374dc1
 +    uint16_t security_mode;
 +    uint8_t station_accept_policy;
 +    uint8_t version;
-+    uint8_t reserved_6c[2];
++    uint8_t reserved_64[2];
 +    int8_t node_count_max;
 +    uint8_t node_count;
 +    ldnr_node_info nodes[LDNR_NATIVE_NODE_COUNT_MAX];
-+    uint8_t reserved_270[2];
++    uint8_t reserved_268[2];
 +    uint16_t advertise_data_size;
 +    uint8_t advertise_data[LDNR_NATIVE_ADVERTISE_DATA_MAX];
-+    uint8_t reserved_3f4[0x8c];
++    uint8_t reserved_3ec[0x8c];
++    uint64_t reserved_478;
 +} ldnr_network_info;
 +
 +typedef struct ldnr_user_config {
@@ -2179,9 +2826,9 @@ index 0000000..6374dc1
 +    ldnr_intent_id intent_id;
 +    int16_t channel;
 +    int8_t node_count_max;
-+    uint8_t reserved_1b;
++    uint8_t reserved_13;
 +    int16_t local_communication_version;
-+    uint8_t reserved_1e[0x0a];
++    uint8_t reserved_16[0x0a];
 +} ldnr_network_config;
 +
 +typedef struct ldnr_scan_filter {
@@ -2189,7 +2836,7 @@ index 0000000..6374dc1
 +    uint32_t network_type;
 +    uint8_t bssid[6];
 +    ldnr_ssid ssid;
-+    uint8_t reserved_54[0x10];
++    uint8_t reserved_4c[0x10];
 +    uint32_t flags;
 +} ldnr_scan_filter;
 +
@@ -2207,7 +2854,7 @@ index 0000000..6374dc1
 +_Static_assert(sizeof(ldnr_intent_id) == LDNR_NATIVE_INTENT_ID_SIZE, "intent id size");
 +_Static_assert(offsetof(ldnr_intent_id, scene_id) == 0x0a, "intent id scene offset");
 +_Static_assert(sizeof(ldnr_network_id) == LDNR_NATIVE_NETWORK_ID_SIZE, "network id size");
-+_Static_assert(offsetof(ldnr_network_id, session_id) == 0x18, "network id session offset");
++_Static_assert(offsetof(ldnr_network_id, session_id) == 0x10, "network id session offset");
 +_Static_assert(sizeof(ldnr_ssid) == LDNR_NATIVE_SSID_SIZE, "ssid size");
 +_Static_assert(offsetof(ldnr_ssid, string) == 0x01, "ssid string offset");
 +_Static_assert(sizeof(ldnr_common_network_info) == LDNR_NATIVE_COMMON_NETWORK_INFO_SIZE, "common info size");
@@ -2221,16 +2868,16 @@ index 0000000..6374dc1
 +_Static_assert(offsetof(ldnr_node_info, platform) == 0x2d, "node info platform offset");
 +_Static_assert(offsetof(ldnr_node_info, local_communication_version) == 0x2e, "node info version offset");
 +_Static_assert(sizeof(ldnr_network_info) == LDNR_NATIVE_NETWORK_INFO_SIZE, "network info size");
-+_Static_assert(offsetof(ldnr_network_info, common) == 0x28, "network info common offset");
-+_Static_assert(offsetof(ldnr_network_info, server_random) == 0x58, "network info random offset");
-+_Static_assert(offsetof(ldnr_network_info, security_mode) == 0x68, "network info security offset");
-+_Static_assert(offsetof(ldnr_network_info, station_accept_policy) == 0x6a, "network info policy offset");
-+_Static_assert(offsetof(ldnr_network_info, version) == 0x6b, "network info version offset");
-+_Static_assert(offsetof(ldnr_network_info, node_count_max) == 0x6e, "network info max nodes offset");
-+_Static_assert(offsetof(ldnr_network_info, node_count) == 0x6f, "network info nodes offset");
-+_Static_assert(offsetof(ldnr_network_info, nodes) == 0x70, "network info node array offset");
-+_Static_assert(offsetof(ldnr_network_info, advertise_data_size) == 0x272, "network info advertise size offset");
-+_Static_assert(offsetof(ldnr_network_info, advertise_data) == 0x274, "network info advertise offset");
++_Static_assert(offsetof(ldnr_network_info, common) == 0x20, "network info common offset");
++_Static_assert(offsetof(ldnr_network_info, server_random) == 0x50, "network info random offset");
++_Static_assert(offsetof(ldnr_network_info, security_mode) == 0x60, "network info security offset");
++_Static_assert(offsetof(ldnr_network_info, station_accept_policy) == 0x62, "network info policy offset");
++_Static_assert(offsetof(ldnr_network_info, version) == 0x63, "network info version offset");
++_Static_assert(offsetof(ldnr_network_info, node_count_max) == 0x66, "network info max nodes offset");
++_Static_assert(offsetof(ldnr_network_info, node_count) == 0x67, "network info nodes offset");
++_Static_assert(offsetof(ldnr_network_info, nodes) == 0x68, "network info node array offset");
++_Static_assert(offsetof(ldnr_network_info, advertise_data_size) == 0x26a, "network info advertise size offset");
++_Static_assert(offsetof(ldnr_network_info, advertise_data) == 0x26c, "network info advertise offset");
 +_Static_assert(sizeof(ldnr_user_config) == LDNR_NATIVE_USER_CONFIG_SIZE, "user config size");
 +_Static_assert(sizeof(ldnr_security_config) == LDNR_NATIVE_SECURITY_CONFIG_SIZE, "security config size");
 +_Static_assert(offsetof(ldnr_security_config, passphrase_size) == 0x02, "passphrase size offset");
@@ -2238,14 +2885,14 @@ index 0000000..6374dc1
 +_Static_assert(sizeof(ldnr_security_parameter) == LDNR_NATIVE_SECURITY_PARAMETER_SIZE, "security parameter size");
 +_Static_assert(offsetof(ldnr_security_parameter, session_id) == 0x10, "security parameter session offset");
 +_Static_assert(sizeof(ldnr_network_config) == LDNR_NATIVE_NETWORK_CONFIG_SIZE, "network config size");
-+_Static_assert(offsetof(ldnr_network_config, channel) == 0x18, "network config channel offset");
-+_Static_assert(offsetof(ldnr_network_config, node_count_max) == 0x1a, "network config max nodes offset");
-+_Static_assert(offsetof(ldnr_network_config, local_communication_version) == 0x1c, "network config version offset");
++_Static_assert(offsetof(ldnr_network_config, channel) == 0x10, "network config channel offset");
++_Static_assert(offsetof(ldnr_network_config, node_count_max) == 0x12, "network config max nodes offset");
++_Static_assert(offsetof(ldnr_network_config, local_communication_version) == 0x14, "network config version offset");
 +_Static_assert(sizeof(ldnr_scan_filter) == LDNR_NATIVE_SCAN_FILTER_SIZE, "scan filter size");
-+_Static_assert(offsetof(ldnr_scan_filter, network_type) == 0x28, "scan filter type offset");
-+_Static_assert(offsetof(ldnr_scan_filter, bssid) == 0x2c, "scan filter BSSID offset");
-+_Static_assert(offsetof(ldnr_scan_filter, ssid) == 0x32, "scan filter SSID offset");
-+_Static_assert(offsetof(ldnr_scan_filter, flags) == 0x64, "scan filter flags offset");
++_Static_assert(offsetof(ldnr_scan_filter, network_type) == 0x20, "scan filter type offset");
++_Static_assert(offsetof(ldnr_scan_filter, bssid) == 0x24, "scan filter BSSID offset");
++_Static_assert(offsetof(ldnr_scan_filter, ssid) == 0x2a, "scan filter SSID offset");
++_Static_assert(offsetof(ldnr_scan_filter, flags) == 0x5c, "scan filter flags offset");
 +_Static_assert(sizeof(ldnr_address_entry) == LDNR_NATIVE_ADDRESS_ENTRY_SIZE, "address entry size");
 +_Static_assert(offsetof(ldnr_address_entry, mac_address) == 0x04, "address entry MAC offset");
 +_Static_assert(sizeof(ldnr_node_latest_update) == LDNR_NATIVE_NODE_LATEST_UPDATE_SIZE, "node update size");
@@ -2283,10 +2930,10 @@ index 0000000..6374dc1
 +#endif
 diff --git a/dm/host/ldnr/ldnr_protocol.c b/dm/host/ldnr/ldnr_protocol.c
 new file mode 100644
-index 0000000..4e5a8e8
+index 0000000..c01df2e
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_protocol.c
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,516 @@
 +// ldn-relay-server protocol 1.1. The Go package pkg/protocol is the reference
 +// while the relay repository's v1.0 document is being revised concurrently.
 +#include "ldnr_internal.h"
@@ -2297,9 +2944,22 @@ index 0000000..4e5a8e8
 +
 +#define LDNR_WIRE_VERSION 1
 +#define LDNR_WIRE_MINOR 1
-+#define LDNR_WIRE_HEADER 16
 +#define LDNR_WIRE_MAX_STRING 1024
 +#define LDNR_WIRE_CAPS 0x1fu
++
++// The relay writes an address as the four network octets in one word
++// (10.114.0.1 -> 0x0100720A) while nn::ldn keeps the host-order value
++// (10.114.0.1 -> 0x0A720001): the two differ by one byte swap.
++uint32_t ldnr_ipv4_to_native(uint32_t wire) {
++    return ((wire & 0xffu) << 24) | ((wire & 0xff00u) << 8) |
++           ((wire >> 8) & 0xff00u) | ((wire >> 24) & 0xffu);
++}
++uint32_t ldnr_ipv4_from_native(uint32_t native) { return ldnr_ipv4_to_native(native); }
++// Socket ports are in network byte order; the relay carries plain numbers.
++uint16_t ldnr_port_to_host(uint16_t network_order) {
++    return (uint16_t)((network_order << 8) | (network_order >> 8));
++}
++uint16_t ldnr_port_from_host(uint16_t host_order) { return ldnr_port_to_host(host_order); }
 +
 +static _Thread_local char ldnr_protocol_error_text[192];
 +const char *ldnr_protocol_error(void) { return ldnr_protocol_error_text; }
@@ -2442,12 +3102,18 @@ index 0000000..4e5a8e8
 +
 +static void ldnr_encode_scan(ldnr_writer *w, const ldnr_operation *op) {
 +    const ldnr_scan_filter *filter = op ? op->scan_filter : NULL;
++    // The native filter flags (nn::ldn) and the relay flags are different
++    // bit assignments: LocalCommunicationId 0x01, SessionId 0x02,
++    // NetworkType 0x04, Bssid 0x08, Ssid 0x10, SceneId 0x20 map to the
++    // relay's CommID 0x01, SceneID 0x02, Session 0x04, SSID 0x08.
++    // NetworkType and Bssid have no relay equivalent: they are matched
++    // locally by the caller.
 +    uint8_t flags = 0;
 +    if (filter) {
-+        if (filter->flags & 0x01) flags |= 0x01;
-+        if (filter->flags & 0x02) flags |= 0x02;
-+        if (filter->flags & 0x40) flags |= 0x04; // native SessionId
-+        if (filter->flags & 0x10) flags |= 0x08; // native Ssid
++        if (filter->flags & 0x01) flags |= 0x01; // LocalCommunicationId
++        if (filter->flags & 0x20) flags |= 0x02; // SceneId
++        if (filter->flags & 0x02) flags |= 0x04; // SessionId
++        if (filter->flags & 0x10) flags |= 0x08; // Ssid
 +        if (op->private_operation && !ldnr_session_is_zero(filter->network_id.session_id)) flags |= 0x04;
 +    }
 +    ldnr_u8w(w, flags);
@@ -2522,6 +3188,9 @@ index 0000000..4e5a8e8
 +        wire_type = 0x1b;
 +        if (!operation) w->failed = 1; else ldnr_put(w, operation->mac, 6);
 +        break;
++    case LDNR_MSG_CLEAR_FILTER_ACK:
++        wire_type = 0x1c;
++        break;
 +    case LDNR_MSG_REJECT_ACK:
 +        wire_type = 0x1a;
 +        if (!message || message->node_id < 0 || message->node_id > 255) w->failed = 1;
@@ -2530,16 +3199,20 @@ index 0000000..4e5a8e8
 +    case LDNR_MSG_UDP:
 +        wire_type = 0x30;
 +        if (!message || message->udp.size > LDNR_UDP_MTU) { w->failed = 1; break; }
-+        ldnr_u32w(w, message->udp.source_address); ldnr_u16w(w, message->udp.source_port);
-+        ldnr_u32w(w, message->udp.destination_address); ldnr_u16w(w, message->udp.destination_port);
++        ldnr_u32w(w, message->udp.source_address);
++        ldnr_u16w(w, ldnr_port_to_host(message->udp.source_port));
++        ldnr_u32w(w, message->udp.destination_address);
++        ldnr_u16w(w, ldnr_port_to_host(message->udp.destination_port));
 +        ldnr_u8w(w, 17); ldnr_u32w(w, 0); ldnr_blobw(w, message->udp.data, message->udp.size, 65472);
 +        break;
 +    case LDNR_MSG_PROXY_CONNECT:
 +        wire_type = 0x31;
 +        if (!message) { w->failed = 1; break; }
 +        ldnr_u32w(w, (uint32_t)message->proxy.connection_id);
-+        ldnr_u32w(w, message->proxy.source_address); ldnr_u16w(w, message->proxy.source_port);
-+        ldnr_u32w(w, message->proxy.destination_address); ldnr_u16w(w, message->proxy.destination_port);
++        ldnr_u32w(w, message->proxy.source_address);
++        ldnr_u16w(w, ldnr_port_to_host(message->proxy.source_port));
++        ldnr_u32w(w, message->proxy.destination_address);
++        ldnr_u16w(w, ldnr_port_to_host(message->proxy.destination_port));
 +        break;
 +    case LDNR_MSG_PROXY_CONNECT_ACK:
 +        wire_type = 0x32;
@@ -2552,8 +3225,10 @@ index 0000000..4e5a8e8
 +    case LDNR_MSG_PROXY_DATA:
 +        wire_type = 0x30;
 +        if (!message || message->proxy.size > LDNR_TCP_CHUNK) { w->failed = 1; break; }
-+        ldnr_u32w(w, message->proxy.source_address); ldnr_u16w(w, message->proxy.source_port);
-+        ldnr_u32w(w, message->proxy.destination_address); ldnr_u16w(w, message->proxy.destination_port);
++        ldnr_u32w(w, message->proxy.source_address);
++        ldnr_u16w(w, ldnr_port_to_host(message->proxy.source_port));
++        ldnr_u32w(w, message->proxy.destination_address);
++        ldnr_u16w(w, ldnr_port_to_host(message->proxy.destination_port));
 +        ldnr_u8w(w, 6); ldnr_u32w(w, (uint32_t)message->proxy.connection_id);
 +        ldnr_blobw(w, message->proxy.data, message->proxy.size, 65472);
 +        break;
@@ -2595,7 +3270,9 @@ index 0000000..4e5a8e8
 +    for (unsigned i = 0; i < 8; i++) {
 +        ldnr_reader node = ldnr_record_read(&body);
 +        if (body.failed) return -1;
-+        value.nodes[i].ipv4_address = ldnr_u32r(&node);
++        // The relay carries the address as the four network octets in one
++        // word; nn::ldn keeps the host order value.
++        value.nodes[i].ipv4_address = ldnr_ipv4_to_native(ldnr_u32r(&node));
 +        ldnr_get(&node, value.nodes[i].mac_address, 6);
 +        value.nodes[i].node_id = (int8_t)ldnr_u8r(&node); value.nodes[i].is_connected = ldnr_u8r(&node);
 +        ldnr_get(&node, value.nodes[i].user_name, 33);
@@ -2670,7 +3347,10 @@ index 0000000..4e5a8e8
 +        uint32_t capabilities = ldnr_u32r(r);
 +        uint8_t connection_id[16]; ldnr_get(r, connection_id, 16);
 +        ldnr_strr(r, decoded.text, sizeof decoded.text);
-+        (void)ldnr_u32r(r); (void)ldnr_u32r(r);
++        // The relay announces the largest payload it accepts; the client
++        // keeps it and never sends a frame above it.
++        decoded.max_frame = ldnr_u32r(r);
++        (void)ldnr_u32r(r); // keepalive interval, unused for now
 +        decoded.reason = capabilities;
 +        if (major != 1 || minor < 1 || (capabilities & 0x1e) != 0x1e) {
 +            decoded.type = LDNR_MSG_AUTH_ERROR; decoded.status = LDNR_ENETDOWN;
@@ -2696,7 +3376,8 @@ index 0000000..4e5a8e8
 +    case 0x18: decoded.type = LDNR_MSG_ADVERTISE_ACK; break;
 +    case 0x19: decoded.type = LDNR_MSG_POLICY_ACK; break;
 +    case 0x1a: decoded.type = LDNR_MSG_REJECT_ACK; break;
-+    case 0x1b: case 0x1c: decoded.type = LDNR_MSG_FILTER_ACK; break;
++    case 0x1b: decoded.type = LDNR_MSG_FILTER_ACK; break;
++    case 0x1c: decoded.type = LDNR_MSG_CLEAR_FILTER_ACK; break;
 +    case 0x20:
 +        decoded.type = LDNR_MSG_NETWORK_UPDATED; decoded.has_network_info = 1;
 +        result = ldnr_decode_network(r, &decoded.network_info, &decoded.network_id); break;
@@ -2706,8 +3387,10 @@ index 0000000..4e5a8e8
 +        break;
 +    case 0x22: decoded.type = LDNR_MSG_NONE; (void)ldnr_u8r(r); (void)ldnr_u8r(r); break;
 +    case 0x30: {
-+        decoded.proxy.source_address = ldnr_u32r(r); decoded.proxy.source_port = ldnr_u16r(r);
-+        decoded.proxy.destination_address = ldnr_u32r(r); decoded.proxy.destination_port = ldnr_u16r(r);
++        decoded.proxy.source_address = ldnr_u32r(r);
++        decoded.proxy.source_port = ldnr_port_from_host(ldnr_u16r(r));
++        decoded.proxy.destination_address = ldnr_u32r(r);
++        decoded.proxy.destination_port = ldnr_port_from_host(ldnr_u16r(r));
 +        uint8_t protocol = ldnr_u8r(r); decoded.proxy.connection_id = ldnr_u32r(r);
 +        uint16_t length = ldnr_u16r(r);
 +        if (length > r->size - r->offset) { r->failed = 1; break; }
@@ -2729,8 +3412,10 @@ index 0000000..4e5a8e8
 +    }
 +    case 0x31:
 +        decoded.type = LDNR_MSG_PROXY_CONNECT; decoded.proxy.connection_id = ldnr_u32r(r);
-+        decoded.proxy.source_address = ldnr_u32r(r); decoded.proxy.source_port = ldnr_u16r(r);
-+        decoded.proxy.destination_address = ldnr_u32r(r); decoded.proxy.destination_port = ldnr_u16r(r); break;
++        decoded.proxy.source_address = ldnr_u32r(r);
++        decoded.proxy.source_port = ldnr_port_from_host(ldnr_u16r(r));
++        decoded.proxy.destination_address = ldnr_u32r(r);
++        decoded.proxy.destination_port = ldnr_port_from_host(ldnr_u16r(r)); break;
 +    case 0x32:
 +        decoded.type = LDNR_MSG_PROXY_CONNECT_ACK; decoded.proxy.connection_id = ldnr_u32r(r);
 +        decoded.proxy.source_address = ldnr_u32r(r);
@@ -2753,12 +3438,24 @@ index 0000000..4e5a8e8
 +    if (!message) return;
 +    free(message->networks); message->networks = NULL; message->network_count = 0;
 +}
++
++ldnr_message *ldnr_message_new(void) {
++    ldnr_message *message = calloc(1, sizeof *message);
++    if (!message) ldnr_wire_fail("out of memory for a relay message");
++    return message;
++}
++
++void ldnr_message_delete(ldnr_message *message) {
++    if (!message) return;
++    ldnr_protocol_message_free(message);
++    free(message);
++}
 diff --git a/dm/host/ldnr/ldnr_protocol.h b/dm/host/ldnr/ldnr_protocol.h
 new file mode 100644
-index 0000000..79a49d6
+index 0000000..1362cfc
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_protocol.h
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,114 @@
 +// Protocol-neutral messages exchanged between the codec and the LDN core.
 +// The wire representation lives only in ldnr_protocol.c.
 +#pragma once
@@ -2767,6 +3464,9 @@ index 0000000..79a49d6
 +#define LDNR_UDP_MTU 1500
 +#define LDNR_TCP_CHUNK 16384
 +#define LDNR_MAX_NETWORKS 32
++
++// The fixed frame header: magic, version, type, flags, payload size, request.
++#define LDNR_WIRE_HEADER 16
 +
 +typedef enum {
 +    LDNR_MSG_NONE = 0,
@@ -2781,6 +3481,7 @@ index 0000000..79a49d6
 +    LDNR_MSG_ADVERTISE_ACK,
 +    LDNR_MSG_POLICY_ACK,
 +    LDNR_MSG_FILTER_ACK,
++    LDNR_MSG_CLEAR_FILTER_ACK,
 +    LDNR_MSG_REJECT_ACK,
 +    LDNR_MSG_UDP,
 +    LDNR_MSG_PROXY_CONNECT,
@@ -2805,6 +3506,7 @@ index 0000000..79a49d6
 +    uint32_t status;
 +    uint32_t reason;
 +    uint32_t ipv4;
++    uint32_t max_frame;               // frame limit announced by the relay
 +    int node_id;
 +    uint32_t subnet_mask;
 +    int has_network_info;
@@ -2847,6 +3549,15 @@ index 0000000..79a49d6
 +    uint8_t mac[6];
 +} ldnr_operation;
 +
++// The relay carries an address as the four network octets in one word
++// (10.114.0.1 -> 0x0100720A), while nn::ldn keeps the host order value
++// (10.114.0.1 -> 0x0A720001). The socket ports are in network byte order,
++// the relay carries plain numbers.
++uint32_t ldnr_ipv4_to_native(uint32_t wire);
++uint32_t ldnr_ipv4_from_native(uint32_t native);
++uint16_t ldnr_port_to_host(uint16_t network_order);
++uint16_t ldnr_port_from_host(uint16_t host_order);
++
 +int ldnr_protocol_encode_auth(uint8_t *out, size_t capacity, size_t *size,
 +                              const char *room_password, const char *player_name);
 +int ldnr_protocol_encode(uint8_t *out, size_t capacity, size_t *size,
@@ -2854,13 +3565,17 @@ index 0000000..79a49d6
 +                         const ldnr_message *message, const ldnr_operation *operation);
 +int ldnr_protocol_decode(const uint8_t *frame, size_t size, ldnr_message *message);
 +void ldnr_protocol_message_free(ldnr_message *message);
++// A message carries the inline UDP and TCP payloads, so it is far too large
++// for a guest stack that can be as small as 8 KB: it is always heap allocated.
++ldnr_message *ldnr_message_new(void);
++void ldnr_message_delete(ldnr_message *message);
 +const char *ldnr_protocol_error(void);
 diff --git a/dm/host/ldnr/ldnr_tcp.c b/dm/host/ldnr/ldnr_tcp.c
 new file mode 100644
-index 0000000..4a11f3e
+index 0000000..5330662
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_tcp.c
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,210 @@
 +// POSIX stream transport for LDNR frames. TLS is deliberately not implicit:
 +// use a TLS endpoint/tunnel until this small transport gains certificate verification.
 +#include "ldnr_transport.h"
@@ -2869,19 +3584,30 @@ index 0000000..4a11f3e
 +#include <netdb.h>
 +#include <netinet/in.h>
 +#include <netinet/tcp.h>
++#include <poll.h>
 +#include <pthread.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
 +#include <sys/socket.h>
++#include <time.h>
 +#include <unistd.h>
 +
 +#define LDNR_TCP_HEADER 16
++// A write may not block forever: the relay has to answer within this time.
++#define LDNR_TCP_WRITE_TIMEOUT_MS 10000
 +
 +typedef struct {
-+    pthread_mutex_t mutex;
++    pthread_mutex_t mutex;             // guards the descriptor lifetime
++    pthread_mutex_t send_mutex;         // serializes the writers
 +    int fd, retired_fd;
 +} ldnr_tcp;
++
++static int64_t ldnr_tcp_now_ms(void) {
++    struct timespec now;
++    if (clock_gettime(CLOCK_MONOTONIC, &now)) return 0;
++    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
++}
 +
 +static void ldnr_tcp_error(char *out, size_t size, const char *text) {
 +    if (out && size) snprintf(out, size, "%s", text);
@@ -2977,24 +3703,44 @@ index 0000000..4a11f3e
 +    return (ssize_t)(LDNR_TCP_HEADER + payload);
 +}
 +
++// The write is interruptible and bounded by a deadline: a relay that stops
++// reading must not keep the sender blocked, and close() has to be able to
++// interrupt it. The descriptor lock is never held while writing, so the
++// shutdown in close() always reaches the socket.
 +static int ldnr_tcp_send(void *ctx, const void *frame, size_t size) {
 +    ldnr_tcp *tcp = ctx;
 +    const uint8_t *data = frame;
-+    pthread_mutex_lock(&tcp->mutex);
-+    int fd = tcp->fd, result = 0;
-+    size_t done = 0;
-+    while (fd >= 0 && done < size) {
++    int flags = 0;
 +#ifdef MSG_NOSIGNAL
-+        ssize_t n = send(fd, data + done, size - done, MSG_NOSIGNAL);
-+#else
-+        ssize_t n = send(fd, data + done, size - done, 0);
++    flags |= MSG_NOSIGNAL;
 +#endif
++#ifdef MSG_DONTWAIT
++    flags |= MSG_DONTWAIT;
++#endif
++    pthread_mutex_lock(&tcp->send_mutex);
++    int64_t deadline = ldnr_tcp_now_ms() + LDNR_TCP_WRITE_TIMEOUT_MS;
++    size_t done = 0;
++    int result = 0;
++    while (done < size) {
++        pthread_mutex_lock(&tcp->mutex);
++        int fd = tcp->fd;
++        pthread_mutex_unlock(&tcp->mutex);
++        if (fd < 0) { result = -1; break; }
++        ssize_t n = send(fd, data + done, size - done, flags);
 +        if (n > 0) { done += (size_t)n; continue; }
 +        if (n < 0 && errno == EINTR) continue;
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            // The socket buffer is full: wait for room, but not forever.
++            int64_t remaining = deadline - ldnr_tcp_now_ms();
++            if (remaining <= 0) { result = -1; break; }
++            struct pollfd waiter = {fd, POLLOUT, 0};
++            int ready = poll(&waiter, 1, (int)(remaining > 1000 ? 1000 : remaining));
++            if (ready < 0) { if (errno == EINTR) continue; result = -1; break; }
++            continue;
++        }
 +        result = -1; break;
 +    }
-+    if (fd < 0 || (size == 0 && fd < 0)) result = -1;
-+    pthread_mutex_unlock(&tcp->mutex);
++    pthread_mutex_unlock(&tcp->send_mutex);
 +    return result;
 +}
 +
@@ -3009,6 +3755,8 @@ index 0000000..4a11f3e
 +        if (tcp->retired_fd < 0) tcp->retired_fd = fd;
 +    }
 +    pthread_mutex_unlock(&tcp->mutex);
++    // The shutdown happens outside the lock and without the send lock: a
++    // blocked writer is interrupted here.
 +    if (fd >= 0) shutdown(fd, SHUT_RDWR);
 +}
 +
@@ -3020,13 +3768,16 @@ index 0000000..4a11f3e
 +    int retired = tcp->retired_fd; tcp->retired_fd = -1;
 +    pthread_mutex_unlock(&tcp->mutex);
 +    if (retired >= 0) close(retired);
-+    pthread_mutex_destroy(&tcp->mutex); free(tcp);
++    pthread_mutex_destroy(&tcp->mutex);
++    pthread_mutex_destroy(&tcp->send_mutex);
++    free(tcp);
 +}
 +
 +const ldnr_transport *ldnr_tcp_transport_create(void) {
 +    ldnr_transport *transport = calloc(1, sizeof *transport);
 +    ldnr_tcp *tcp = calloc(1, sizeof *tcp);
-+    if (!transport || !tcp || pthread_mutex_init(&tcp->mutex, NULL)) {
++    if (!transport || !tcp || pthread_mutex_init(&tcp->mutex, NULL) ||
++        pthread_mutex_init(&tcp->send_mutex, NULL)) {
 +        free(transport); free(tcp); return NULL;
 +    }
 +    tcp->fd = tcp->retired_fd = -1; transport->ctx = tcp;
@@ -3060,10 +3811,10 @@ index 0000000..4883014
 +const ldnr_transport *ldnr_tcp_transport_create(void);
 diff --git a/dm/host/ldnr/ldnr_vnet.c b/dm/host/ldnr/ldnr_vnet.c
 new file mode 100644
-index 0000000..578ce9b
+index 0000000..d710d74
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_vnet.c
-@@ -0,0 +1,748 @@
+@@ -0,0 +1,861 @@
 +// Virtual BSD sockets on the LDN subnet. No host socket descriptor escapes:
 +// readiness and datagram queues are entirely under this layer's control.
 +#include "ldnr_internal.h"
@@ -3223,17 +3974,45 @@ index 0000000..578ce9b
 +    return (address & mask) == (l->vnet.local_address & mask);
 +}
 +
-+int ldnr_vnet_send_udp(ldnr *l, ldnr_vsock *s, const ldnr_sockaddr *destination,
-+                       const void *data, size_t size) {
-+    ldnr_message message;
-+    memset(&message, 0, sizeof message);
-+    message.udp.source_address = l->vnet.local_address;
-+    message.udp.source_port = s->local.port;
-+    message.udp.destination_address = destination->address;
-+    message.udp.destination_port = destination->port;
-+    message.udp.size = size;
-+    if (size) memcpy(message.udp.data, data, size);
-+    return ldnr_client_send(l, LDNR_MSG_UDP, 0, &message, NULL);
++// The socket layer must not hold its lock while the relay transport writes:
++// a relay that stops reading would freeze every socket in the process. The
++// frame is prepared under the lock and transmitted after it is released.
++ldnr_message *ldnr_vnet_prepare_udp(ldnr *l, const ldnr_vsock *s,
++                                    const ldnr_sockaddr *destination,
++                                    const void *data, size_t size) {
++    ldnr_message *message = ldnr_message_new();
++    if (!message) return NULL;
++    message->udp.source_address = l->vnet.local_address;
++    message->udp.source_port = s->local.port;
++    message->udp.destination_address = destination->address;
++    message->udp.destination_port = destination->port;
++    message->udp.size = size;
++    if (size) memcpy(message->udp.data, data, size);
++    return message;
++}
++
++ldnr_message *ldnr_vnet_prepare_proxy(ldnr *l, ldnr_message_type type,
++                                       const ldnr_vsock *s, uint32_t source_address,
++                                       const void *data, size_t size) {
++    (void)l; (void)type;
++    ldnr_message *message = ldnr_message_new();
++    if (!message) return NULL;
++    message->proxy.connection_id = s->connection_id;
++    message->proxy.source_address = source_address;
++    message->proxy.destination_address = s->peer.address;
++    message->proxy.source_port = s->local.port;
++    message->proxy.destination_port = s->peer.port;
++    message->proxy.size = size;
++    if (size) memcpy(message->proxy.data, data, size);
++    return message;
++}
++
++// Sends a prepared frame and releases it.
++int ldnr_vnet_transmit(ldnr *l, ldnr_message_type type, ldnr_message *message) {
++    if (!message) return ldnr_fail(LDNR_ENOBUFS);
++    int result = ldnr_client_send(l, type, 0, message, NULL);
++    ldnr_message_delete(message);
++    return result;
 +}
 +
 +ssize_t ldnr_sendto(ldnr *l, int fd, const void *data, size_t size, int flags,
@@ -3250,14 +4029,31 @@ index 0000000..578ce9b
 +        return ldnr_fail(LDNR_ENETDOWN);
 +    }
 +    int result = s->bound ? 0 : ldnr_bind_locked(l, s, NULL);
-+    if (!result) result = ldnr_vnet_send_udp(l, s, destination, data, size);
++    ldnr_message *message = result ? NULL :
++        ldnr_vnet_prepare_udp(l, s, destination, data, size);
 +    pthread_mutex_unlock(&l->vnet.mutex);
++    if (!result) result = ldnr_vnet_transmit(l, LDNR_MSG_UDP, message);
++    else ldnr_message_delete(message);
 +    return result ? -1 : (ssize_t)size;
 +}
 +
 +static int ldnr_packet_queue(ldnr *l, ldnr_vsock *s, const ldnr_sockaddr *source,
-+                             const void *data, size_t size) {
-+    if (s->queued >= LDNR_QUEUE_MAX) {
++                             const void *data, size_t size, int stream) {
++    if (stream) {
++        // A stream must not lose bytes in the middle. Back off until the
++        // reader catches up, and reset the stream when it stays behind.
++        if (s->queued_bytes + size > LDNR_STREAM_LIMIT) {
++            ldnr_free_packets(s->head);
++            s->head = s->tail = NULL;
++            s->queued = 0;
++            s->queued_bytes = 0;
++            s->remote_error = LDNR_ECONNRESET;
++            s->remote_eof = 1;
++            pthread_cond_broadcast(&l->vnet.condition);
++            return -1;
++        }
++    } else if (s->queued >= LDNR_QUEUE_MAX) {
++        // Datagrams may be dropped when the reader falls behind.
 +        ldnr_packet *old = s->head;
 +        if (old) {
 +            s->head = old->next;
@@ -3277,6 +4073,7 @@ index 0000000..578ce9b
 +    else s->head = packet;
 +    s->tail = packet;
 +    s->queued++;
++    s->queued_bytes += size;
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    return 0;
 +}
@@ -3297,7 +4094,7 @@ index 0000000..578ce9b
 +        if (s->local.address && s->local.address != message->udp.destination_address &&
 +            s->local.address != l->vnet.local_address) continue;
 +        ldnr_sockaddr source = {message->udp.source_address, message->udp.source_port};
-+        ldnr_packet_queue(l, s, &source, message->udp.data, message->udp.size);
++        ldnr_packet_queue(l, s, &source, message->udp.data, message->udp.size, 0);
 +        if (!broadcast) break;
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
@@ -3360,6 +4157,7 @@ index 0000000..578ce9b
 +        s->head = packet->next;
 +        if (!s->head) s->tail = NULL;
 +        s->queued--;
++        s->queued_bytes -= packet->size;
 +        free(packet);
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
@@ -3367,7 +4165,7 @@ index 0000000..578ce9b
 +}
 +
 +static int ldnr_stream_can_read(const ldnr_vsock *s) {
-+    return s->head || s->remote_eof || s->shut_read || s->connect_error;
++    return s->head || s->remote_eof || s->shut_read || s->connect_error || s->remote_error;
 +}
 +
 +ssize_t ldnr_recv(ldnr *l, int fd, void *data, size_t capacity, int flags, int timeout_ms) {
@@ -3393,6 +4191,7 @@ index 0000000..578ce9b
 +        if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
 +    }
 +    if (s->connect_error && !s->head) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_ECONNRESET); }
++    if (s->remote_error && !s->head) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_ECONNRESET); }
 +    if (!s->head) { pthread_mutex_unlock(&l->vnet.mutex); return 0; }
 +    ldnr_packet *packet = s->head;
 +    size_t available = packet->size - packet->offset;
@@ -3400,6 +4199,7 @@ index 0000000..578ce9b
 +    if (copied) memcpy(data, packet->data + packet->offset, copied);
 +    if (!(flags & 2)) {
 +        packet->offset += copied;
++        s->queued_bytes -= copied;
 +        if (packet->offset == packet->size) {
 +            s->head = packet->next;
 +            if (!s->head) s->tail = NULL;
@@ -3411,19 +4211,6 @@ index 0000000..578ce9b
 +    return (ssize_t)copied;
 +}
 +
-+int ldnr_vnet_send_proxy(ldnr *l, ldnr_message_type type, ldnr_vsock *s,
-+                         const void *data, size_t size) {
-+    ldnr_message message;
-+    memset(&message, 0, sizeof message);
-+    message.proxy.connection_id = s->connection_id;
-+    message.proxy.source_address = l->vnet.local_address;
-+    message.proxy.destination_address = s->peer.address;
-+    message.proxy.source_port = s->local.port;
-+    message.proxy.destination_port = s->peer.port;
-+    message.proxy.size = size;
-+    if (size) memcpy(message.proxy.data, data, size);
-+    return ldnr_client_send(l, type, 0, &message, NULL);
-+}
 +
 +ssize_t ldnr_send(ldnr *l, int fd, const void *data, size_t size, int flags) {
 +    (void)flags;
@@ -3435,19 +4222,30 @@ index 0000000..578ce9b
 +        if (size > LDNR_UDP_MTU) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EMSGSIZE); }
 +        ldnr_sockaddr peer = s->peer;
 +        if (!s->connected) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_ENOTCONN); }
-+        int result = ldnr_vnet_send_udp(l, s, &peer, data, size);
++        ldnr_message *message = ldnr_vnet_prepare_udp(l, s, &peer, data, size);
 +        pthread_mutex_unlock(&l->vnet.mutex);
++        int result = ldnr_vnet_transmit(l, LDNR_MSG_UDP, message);
 +        return result ? -1 : (ssize_t)size;
 +    }
-+    if (!s->connected || s->shut_write || s->remote_eof) {
++    if (!s->connected || s->shut_write || s->remote_error) {
 +        pthread_mutex_unlock(&l->vnet.mutex);
-+        return ldnr_fail(LDNR_EPIPE);
++        return ldnr_fail(s->remote_error ? LDNR_ECONNRESET : LDNR_EPIPE);
 +    }
 +    size_t sent = 0;
 +    while (sent < size) {
 +        size_t chunk = size - sent;
 +        if (chunk > LDNR_TCP_CHUNK) chunk = LDNR_TCP_CHUNK;
-+        if (ldnr_vnet_send_proxy(l, LDNR_MSG_PROXY_DATA, s, (const uint8_t *)data + sent, chunk)) {
++        // The frame is prepared under the lock and written after it is
++        // released, so a blocked relay cannot hold the socket layer hostage.
++        ldnr_message *message = ldnr_vnet_prepare_proxy(l, LDNR_MSG_PROXY_DATA, s,
++                                                        l->vnet.local_address,
++                                                        (const uint8_t *)data + sent, chunk);
++        pthread_mutex_unlock(&l->vnet.mutex);
++        int result = ldnr_vnet_transmit(l, LDNR_MSG_PROXY_DATA, message);
++        pthread_mutex_lock(&l->vnet.mutex);
++        s = ldnr_socket_at(l, fd);
++        if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return sent ? (ssize_t)sent : -1; }
++        if (result) {
 +            pthread_mutex_unlock(&l->vnet.mutex);
 +            return sent ? (ssize_t)sent : -1;
 +        }
@@ -3481,7 +4279,14 @@ index 0000000..578ce9b
 +    s->connection_id = ldnr_next_connection_id(l);
 +    s->connecting = 1;
 +    s->connect_error = 0;
-+    if (ldnr_vnet_send_proxy(l, LDNR_MSG_PROXY_CONNECT, s, NULL, 0)) {
++    ldnr_message *message = ldnr_vnet_prepare_proxy(l, LDNR_MSG_PROXY_CONNECT, s,
++                                                    l->vnet.local_address, NULL, 0);
++    pthread_mutex_unlock(&l->vnet.mutex);
++    int sent = ldnr_vnet_transmit(l, LDNR_MSG_PROXY_CONNECT, message);
++    pthread_mutex_lock(&l->vnet.mutex);
++    s = ldnr_socket_at(l, fd);
++    if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
++    if (sent) {
 +        s->connecting = 0;
 +        pthread_mutex_unlock(&l->vnet.mutex);
 +        return -1;
@@ -3551,6 +4356,26 @@ index 0000000..578ce9b
 +    return newfd;
 +}
 +
++// A stream is identified by its connection id and its peer: two clients can
++// use the same id, and the relay echoes the sender in every frame.
++static ldnr_vsock *ldnr_stream_by_connection(ldnr *l, const ldnr_message *message,
++                                             int only_connecting, int check_peer) {
++    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
++        ldnr_vsock *s = &l->vnet.sockets[i];
++        if (!s->used || s->type != 1) continue;
++        if (s->connection_id != message->proxy.connection_id) continue;
++        if (only_connecting && !s->connecting) continue;
++        if (check_peer) {
++            if (message->proxy.source_address && s->peer.address &&
++                message->proxy.source_address != s->peer.address) continue;
++            if (message->proxy.source_port && s->peer.port &&
++                message->proxy.source_port != s->peer.port) continue;
++        }
++        return s;
++    }
++    return NULL;
++}
++
 +void ldnr_vnet_proxy_connect(ldnr *l, const ldnr_message *message) {
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *listener = NULL;
@@ -3560,7 +4385,17 @@ index 0000000..578ce9b
 +            (!s->local.address || s->local.address == message->proxy.destination_address) &&
 +            s->accept_count < s->backlog) { listener = s; break; }
 +    }
-+    ldnr_vsock *accepted = listener ? ldnr_socket_alloc(l, 1) : NULL;
++    // An incoming id that is already in use belongs to another stream: the
++    // relay may reset such a collision, so the stream is refused here.
++    int duplicate = 0;
++    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
++        ldnr_vsock *s = &l->vnet.sockets[i];
++        if (s->used && s->type == 1 && s->connection_id == message->proxy.connection_id) {
++            duplicate = 1;
++            break;
++        }
++    }
++    ldnr_vsock *accepted = listener && !duplicate ? ldnr_socket_alloc(l, 1) : NULL;
 +    if (accepted) {
 +        accepted->bound = accepted->connected = 1;
 +        accepted->local.address = message->proxy.destination_address;
@@ -3574,23 +4409,22 @@ index 0000000..578ce9b
 +        pthread_cond_broadcast(&l->vnet.condition);
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
-+    ldnr_message reply;
-+    memset(&reply, 0, sizeof reply);
-+    reply.proxy = message->proxy;
-+    reply.status = accepted ? 0 : LDNR_ECONNREFUSED;
-+    ldnr_client_send(l, LDNR_MSG_PROXY_CONNECT_ACK, 0, &reply, NULL);
++    ldnr_message *reply = ldnr_message_new();
++    if (!reply) return;
++    reply->proxy = message->proxy;
++    reply->status = accepted ? 0 : LDNR_ECONNREFUSED;
++    ldnr_client_send(l, LDNR_MSG_PROXY_CONNECT_ACK, 0, reply, NULL);
++    ldnr_message_delete(reply);
 +}
 +
 +void ldnr_vnet_proxy_ack(ldnr *l, const ldnr_message *message) {
 +    pthread_mutex_lock(&l->vnet.mutex);
-+    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
-+        ldnr_vsock *s = &l->vnet.sockets[i];
-+        if (!s->used || s->connection_id != message->proxy.connection_id) continue;
++    ldnr_vsock *s = ldnr_stream_by_connection(l, message, 1, 0);
++    if (s) {
 +        s->connecting = 0;
 +        if (message->status) s->connect_error = (int)message->status;
 +        else s->connected = 1;
 +        pthread_cond_broadcast(&l->vnet.condition);
-+        break;
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
 +}
@@ -3598,24 +4432,21 @@ index 0000000..578ce9b
 +void ldnr_vnet_proxy_data(ldnr *l, const ldnr_message *message) {
 +    if (message->proxy.size > LDNR_TCP_CHUNK) return;
 +    pthread_mutex_lock(&l->vnet.mutex);
-+    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
-+        ldnr_vsock *s = &l->vnet.sockets[i];
-+        if (!s->used || !s->connected || s->connection_id != message->proxy.connection_id) continue;
-+        ldnr_packet_queue(l, s, &s->peer, message->proxy.data, message->proxy.size);
-+        break;
-+    }
++    ldnr_vsock *s = ldnr_stream_by_connection(l, message, 0, 1);
++    if (s && s->connected) ldnr_packet_queue(l, s, &s->peer, message->proxy.data, message->proxy.size, 1);
 +    pthread_mutex_unlock(&l->vnet.mutex);
 +}
 +
 +void ldnr_vnet_proxy_disconnect(ldnr *l, const ldnr_message *message) {
 +    pthread_mutex_lock(&l->vnet.mutex);
-+    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
-+        ldnr_vsock *s = &l->vnet.sockets[i];
-+        if (!s->used || s->connection_id != message->proxy.connection_id) continue;
-+        s->remote_eof = 1;
++    ldnr_vsock *s = ldnr_stream_by_connection(l, message, 0, 1);
++    if (s) {
++        // The relay marks a reset with the first flag bit; a plain FIN only
++        // closes the peer's sending side.
++        if (message->status & 1) { s->remote_error = LDNR_ECONNRESET; s->remote_eof = 1; }
++        else s->remote_eof = 1;
 +        if (s->connecting) { s->connecting = 0; s->connect_error = LDNR_ECONNREFUSED; }
 +        pthread_cond_broadcast(&l->vnet.condition);
-+        break;
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
 +}
@@ -3631,10 +4462,11 @@ index 0000000..578ce9b
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    pthread_mutex_unlock(&l->vnet.mutex);
 +    if (notify) {
-+        ldnr_message message;
-+        memset(&message, 0, sizeof message);
-+        message.proxy.connection_id = connection_id;
-+        ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, &message, NULL);
++        ldnr_message *message = ldnr_message_new();
++        if (!message) return ldnr_fail(LDNR_ENOBUFS);
++        message->proxy.connection_id = connection_id;
++        ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, message, NULL);
++        ldnr_message_delete(message);
 +    }
 +    return 0;
 +}
@@ -3647,11 +4479,24 @@ index 0000000..578ce9b
 +    if (how == 0 || how == 2) s->shut_read = 1;
 +    if (how == 1 || how == 2) s->shut_write = 1;
 +    if (s->shut_read) ldnr_free_packets(s->head);
-+    if (s->shut_read) { s->head = s->tail = NULL; s->queued = 0; }
++    if (s->shut_read) { s->head = s->tail = NULL; s->queued = 0; s->queued_bytes = 0; }
++    // The disconnect is built while the socket is locked: the slot can be
++    // closed and reused by another thread as soon as the lock is released.
++    ldnr_vsock snapshot;
++    memset(&snapshot, 0, sizeof snapshot);
++    uint32_t source_address = l->vnet.local_address;
++    int notify = 0;
++    if ((how == 1 || how == 2) && s->connection_id) {
++        snapshot = *s;
++        notify = 1;
++    }
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    pthread_mutex_unlock(&l->vnet.mutex);
-+    if ((how == 1 || how == 2) && s->connection_id)
-+        ldnr_vnet_send_proxy(l, LDNR_MSG_PROXY_DISCONNECT, s, NULL, 0);
++    if (notify) {
++        ldnr_message *message = ldnr_vnet_prepare_proxy(l, LDNR_MSG_PROXY_DISCONNECT,
++                                                        &snapshot, source_address, NULL, 0);
++        ldnr_vnet_transmit(l, LDNR_MSG_PROXY_DISCONNECT, message);
++    }
 +    return 0;
 +}
 +
@@ -3726,7 +4571,7 @@ index 0000000..578ce9b
 +    ldnr_vsock *s = ldnr_socket_at(l, fd);
 +    if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
 +    int32_t v;
-+    if (option == 0x1007) { v = s->connect_error; s->connect_error = 0; }
++    if (option == 0x1007) { v = s->remote_error ? s->remote_error : s->connect_error; s->connect_error = 0; }
 +    else if (option == 0x1008) v = s->type;
 +    else if (option == 0x20) v = s->broadcast;
 +    else if (option == 4) v = s->reuse_address;
@@ -3783,23 +4628,42 @@ index 0000000..578ce9b
 +    if (!l || nfds < 0 || nfds > 1024) return ldnr_fail(LDNR_EINVAL);
 +    ldnr_pollfd *fds = calloc((size_t)nfds, sizeof *fds);
 +    if (!fds && nfds) return ldnr_fail(LDNR_ENOBUFS);
++    // Only the descriptors that are in one of the sets are polled: an unused
++    // descriptor would report an invalid descriptor and wake the caller.
++    size_t count = 0;
 +    for (int fd = 0; fd < nfds; fd++) {
-+        fds[fd].fd = fd;
 +        uint64_t bit = 1ull << (fd & 63);
-+        if (readfds && (readfds[fd >> 6] & bit)) fds[fd].events |= LDNR_POLLIN;
-+        if (writefds && (writefds[fd >> 6] & bit)) fds[fd].events |= LDNR_POLLOUT;
-+        if (exceptfds && (exceptfds[fd >> 6] & bit)) fds[fd].events |= LDNR_POLLPRI;
++        int events = 0;
++        if (readfds && (readfds[fd >> 6] & bit)) events |= LDNR_POLLIN;
++        if (writefds && (writefds[fd >> 6] & bit)) events |= LDNR_POLLOUT;
++        if (exceptfds && (exceptfds[fd >> 6] & bit)) events |= LDNR_POLLPRI;
++        if (!events) continue;
++        fds[count].fd = fd;
++        fds[count].events = (int16_t)events;
++        count++;
 +    }
-+    int result = ldnr_poll(l, fds, (size_t)nfds, timeout_ms);
++    if (!count) {
++        // Nothing to wait for: the call returns at once.
++        free(fds);
++        return 0;
++    }
++    int result = ldnr_poll(l, fds, count, timeout_ms);
 +    if (result >= 0) {
 +        uint64_t r[16] = {0}, w[16] = {0}, e[16] = {0};
 +        int ready = 0;
-+        for (int fd = 0; fd < nfds; fd++) {
++        for (size_t i = 0; i < count; i++) {
++            int fd = fds[i].fd;
 +            uint64_t bit = 1ull << (fd & 63);
 +            int descriptor_ready = 0;
-+            if (fds[fd].revents & LDNR_POLLIN) { r[fd >> 6] |= bit; descriptor_ready = 1; }
-+            if (fds[fd].revents & LDNR_POLLOUT) { w[fd >> 6] |= bit; descriptor_ready = 1; }
-+            if (fds[fd].revents & (LDNR_POLLPRI | LDNR_POLLERR | LDNR_POLLHUP)) {
++            if (fds[i].revents & LDNR_POLLNVAL) {
++                // A selected descriptor that is not a virtual socket is an
++                // error, the way select() reports a bad descriptor.
++                free(fds);
++                return ldnr_fail(LDNR_EBADF);
++            }
++            if (fds[i].revents & LDNR_POLLIN) { r[fd >> 6] |= bit; descriptor_ready = 1; }
++            if (fds[i].revents & LDNR_POLLOUT) { w[fd >> 6] |= bit; descriptor_ready = 1; }
++            if (fds[i].revents & (LDNR_POLLPRI | LDNR_POLLERR | LDNR_POLLHUP)) {
 +                e[fd >> 6] |= bit; descriptor_ready = 1;
 +            }
 +            if (descriptor_ready) ready++;
@@ -3812,15 +4676,30 @@ index 0000000..578ce9b
 +    free(fds);
 +    return result;
 +}
+diff --git a/dm/host/ldnr/tests/.gitignore b/dm/host/ldnr/tests/.gitignore
+new file mode 100644
+index 0000000..567609b
+--- /dev/null
++++ b/dm/host/ldnr/tests/.gitignore
+@@ -0,0 +1 @@
++build/
 diff --git a/dm/host/ldnr/tests/Makefile b/dm/host/ldnr/tests/Makefile
 new file mode 100644
-index 0000000..f7cf73f
+index 0000000..58f6b5f
 --- /dev/null
 +++ b/dm/host/ldnr/tests/Makefile
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,50 @@
 +CC ?= cc
-+BUILD_DIR ?= /tmp/nx2apple-ldnr-tests
++# The build output stays inside the source tree: it is removed with "make
++# clean" and never lands outside the checkout.
++BUILD_DIR ?= $(CURDIR)/build
 +CPPFLAGS += -D_POSIX_C_SOURCE=200809L -I..
++# macOS hides the BSD names (INADDR_LOOPBACK among them) behind a strict
++# POSIX feature level, so the Darwin sources are enabled as well.
++UNAME_S := $(shell uname -s)
++ifeq ($(UNAME_S),Darwin)
++CPPFLAGS += -D_DARWIN_C_SOURCE
++endif
 +CFLAGS ?= -O2 -g
 +CFLAGS += -std=c11 -Wall -Wextra -Werror -pedantic
 +LDLIBS += -pthread
@@ -3891,10 +4770,10 @@ index 0000000..f79d42b
 +void hle_signal_bound_system_event(void *event);
 diff --git a/dm/host/ldnr/tests/t_ldnr_e2e.c b/dm/host/ldnr/tests/t_ldnr_e2e.c
 new file mode 100644
-index 0000000..adb994b
+index 0000000..c0303c5
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_ldnr_e2e.c
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,186 @@
 +// Real relay integration test. No server is bundled: set LDNR_SERVER_BIN.
 +#include "ldnr.h"
 +#include <arpa/inet.h>
@@ -3917,7 +4796,7 @@ index 0000000..adb994b
 +    if (fd < 0) return 0;
 +    struct sockaddr_in address;
 +    memset(&address, 0, sizeof address); address.sin_family = AF_INET;
-+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    address.sin_addr.s_addr = htonl(0x7f000001u); // 127.0.0.1
 +    if (bind(fd, (struct sockaddr *)&address, sizeof address) ||
 +        listen(fd, 1)) { close(fd); return 0; }
 +    socklen_t size = sizeof address;
@@ -3997,7 +4876,8 @@ index 0000000..adb994b
 +
 +    ldnr_scan_filter filter;
 +    memset(&filter, 0, sizeof filter);
-+    filter.flags = 0x03;
++    // The native flags 0x01 (local communication id) and 0x20 (scene id).
++    filter.flags = 0x21;
 +    filter.network_id.intent_id.local_communication_id = network_config.intent_id.local_communication_id;
 +    filter.network_id.intent_id.scene_id = 7;
 +    ldnr_network_info found[4]; int count = 0;
@@ -4010,13 +4890,17 @@ index 0000000..adb994b
 +            !memcmp(found[i].advertise_data, advertise, sizeof advertise)) room = i;
 +    CHECK(room >= 0);
 +    memset(&user, 0, sizeof user); memcpy(user.user_name, "station", 7);
-+    CHECK(!ldnr_connect_network(station, &found[room], NULL, &security, &user, NULL, 0));
++    CHECK(!ldnr_connect_network(station, &found[room], NULL, &security, &user, NULL, 0, 0));
++    // The address of nn::ldn is the host order value of the four octets:
++    // 10.114.0.1 is 0x0A720001 there and 0x0100720A on the socket layer.
 +    uint32_t host_ip = 0, station_ip = 0, mask = 0;
 +    CHECK(!ldnr_get_ipv4_address(host, &host_ip, &mask));
 +    CHECK(!ldnr_get_ipv4_address(station, &station_ip, &mask));
-+    CHECK(host_ip == ldnr_ipv4(10, 114, 0, 1));
-+    CHECK(station_ip == ldnr_ipv4(10, 114, 0, 2));
-+    CHECK(mask == ldnr_ipv4(255, 255, 0, 0));
++    CHECK(host_ip == UINT32_C(0x0A720001));
++    CHECK(station_ip == UINT32_C(0x0A720002));
++    CHECK(mask == UINT32_C(0xFFFF0000));
++    uint32_t host_wire = ldnr_ipv4_from_native(host_ip);
++    uint32_t station_wire = ldnr_ipv4_from_native(station_ip);
 +    CHECK(wait_nodes(host, 2));
 +
 +    host_socket = ldnr_socket(host, 2, 2, 17); station_socket = ldnr_socket(station, 2, 2, 17);
@@ -4024,12 +4908,12 @@ index 0000000..adb994b
 +    ldnr_sockaddr host_udp = {0, ldnr_htons(40000)}, station_udp = {0, ldnr_htons(40001)};
 +    CHECK(!ldnr_bind(host, host_socket, &host_udp)); CHECK(!ldnr_bind(station, station_socket, &station_udp));
 +    const char udp_message[] = "udp unicast";
-+    station_udp.address = station_ip;
++    station_udp.address = station_wire;
 +    CHECK(ldnr_sendto(host, host_socket, udp_message, sizeof udp_message, 0, &station_udp) == sizeof udp_message);
 +    uint8_t buffer[128]; ldnr_sockaddr source;
 +    CHECK(ldnr_recvfrom(station, station_socket, buffer, sizeof buffer, 0, &source, 2000) == sizeof udp_message);
 +    CHECK(!memcmp(buffer, udp_message, sizeof udp_message));
-+    CHECK(source.address == host_ip && source.port == ldnr_htons(40000));
++    CHECK(source.address == host_wire && source.port == ldnr_htons(40000));
 +    const char broadcast_message[] = "udp broadcast";
 +    host_udp.address = ldnr_ipv4(10, 114, 255, 255);
 +    CHECK(ldnr_sendto(station, station_socket, broadcast_message, sizeof broadcast_message, 0, &host_udp) == sizeof broadcast_message);
@@ -4042,10 +4926,10 @@ index 0000000..adb994b
 +    CHECK(listener >= 0 && connector >= 0);
 +    ldnr_sockaddr tcp_address = {0, ldnr_htons(40002)};
 +    CHECK(!ldnr_bind(host, listener, &tcp_address)); CHECK(!ldnr_listen(host, listener, 4));
-+    tcp_address.address = host_ip;
++    tcp_address.address = host_wire;
 +    CHECK(!ldnr_connect_socket(station, connector, &tcp_address, 3000));
 +    int accepted = ldnr_accept(host, listener, &source, 2000);
-+    CHECK(accepted >= 0 && source.address == station_ip);
++    CHECK(accepted >= 0 && source.address == station_wire);
 +    const char request[] = "tcp request", response[] = "tcp response";
 +    CHECK(ldnr_send(station, connector, request, sizeof request, 0) == sizeof request);
 +    CHECK(ldnr_recv(host, accepted, buffer, sizeof buffer, 0, 2000) == sizeof request);
@@ -4059,7 +4943,7 @@ index 0000000..adb994b
 +
 +    CHECK(!ldnr_disconnect(station));
 +    CHECK(ldnr_get_state(station) == 3); CHECK(wait_nodes(host, 1));
-+    CHECK(!ldnr_connect_network(station, &found[room], NULL, &security, &user, NULL, 0));
++    CHECK(!ldnr_connect_network(station, &found[room], NULL, &security, &user, NULL, 0, 0));
 +    CHECK(wait_nodes(host, 2));
 +    CHECK(!ldnr_destroy_network(host));
 +    CHECK(ldnr_get_state(host) == 2); CHECK(wait_state(station, 3));
@@ -4078,10 +4962,10 @@ index 0000000..adb994b
 +}
 diff --git a/dm/host/ldnr/tests/t_native.c b/dm/host/ldnr/tests/t_native.c
 new file mode 100644
-index 0000000..6ea9810
+index 0000000..88dcf83
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_native.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,340 @@
 +#include "ldnr_native.h"
 +
 +#include <assert.h>
@@ -4108,39 +4992,55 @@ index 0000000..6ea9810
 +        assert(memcmp(&(source), &decoded_, sizeof(source)) == 0);                    \
 +    } while (0)
 +
++// The expectations are the libnx layouts (nn::ldn): IntentId 0x10,
++// NetworkId 0x20, CommonNetworkInfo 0x30, NodeInfo 0x40, NetworkInfo 0x480
++// with common at 0x20, server_random at 0x50 and the nodes at 0x68,
++// NetworkConfig 0x20 and ScanFilter 0x60 with the flags at 0x5c.
 +static void test_layouts(void)
 +{
-+    assert(sizeof(ldnr_intent_id) == 0x18);
++    assert(sizeof(ldnr_intent_id) == 0x10);
 +    assert(offsetof(ldnr_intent_id, scene_id) == 0x0a);
-+    assert(sizeof(ldnr_network_id) == 0x28);
-+    assert(offsetof(ldnr_network_id, session_id) == 0x18);
++    assert(sizeof(ldnr_network_id) == 0x20);
++    assert(offsetof(ldnr_network_id, session_id) == 0x10);
 +    assert(sizeof(ldnr_ssid) == 0x22);
 +    assert(offsetof(ldnr_ssid, string) == 0x01);
 +    assert(sizeof(ldnr_common_network_info) == 0x30);
 +    assert(offsetof(ldnr_common_network_info, ssid) == 0x06);
 +    assert(offsetof(ldnr_common_network_info, channel) == 0x28);
++    assert(offsetof(ldnr_common_network_info, network_type) == 0x2b);
 +    assert(sizeof(ldnr_node_info) == 0x40);
++    assert(offsetof(ldnr_node_info, mac_address) == 0x04);
 +    assert(offsetof(ldnr_node_info, node_id) == 0x0a);
 +    assert(offsetof(ldnr_node_info, user_name) == 0x0c);
 +    assert(offsetof(ldnr_node_info, platform) == 0x2d);
++    assert(offsetof(ldnr_node_info, local_communication_version) == 0x2e);
 +    assert(sizeof(ldnr_network_info) == 0x480);
-+    assert(offsetof(ldnr_network_info, common) == 0x28);
-+    assert(offsetof(ldnr_network_info, security_mode) == 0x68);
-+    assert(offsetof(ldnr_network_info, nodes) == 0x70);
-+    assert(offsetof(ldnr_network_info, advertise_data_size) == 0x272);
-+    assert(offsetof(ldnr_network_info, advertise_data) == 0x274);
++    assert(offsetof(ldnr_network_info, common) == 0x20);
++    assert(offsetof(ldnr_network_info, server_random) == 0x50);
++    assert(offsetof(ldnr_network_info, security_mode) == 0x60);
++    assert(offsetof(ldnr_network_info, station_accept_policy) == 0x62);
++    assert(offsetof(ldnr_network_info, version) == 0x63);
++    assert(offsetof(ldnr_network_info, node_count_max) == 0x66);
++    assert(offsetof(ldnr_network_info, node_count) == 0x67);
++    assert(offsetof(ldnr_network_info, nodes) == 0x68);
++    assert(offsetof(ldnr_network_info, advertise_data_size) == 0x26a);
++    assert(offsetof(ldnr_network_info, advertise_data) == 0x26c);
 +    assert(sizeof(ldnr_user_config) == 0x30);
 +    assert(sizeof(ldnr_security_config) == 0x44);
 +    assert(offsetof(ldnr_security_config, passphrase) == 0x04);
 +    assert(sizeof(ldnr_security_parameter) == 0x20);
 +    assert(offsetof(ldnr_security_parameter, session_id) == 0x10);
-+    assert(sizeof(ldnr_network_config) == 0x28);
-+    assert(offsetof(ldnr_network_config, channel) == 0x18);
-+    assert(offsetof(ldnr_network_config, local_communication_version) == 0x1c);
-+    assert(sizeof(ldnr_scan_filter) == 0x68);
-+    assert(offsetof(ldnr_scan_filter, ssid) == 0x32);
-+    assert(offsetof(ldnr_scan_filter, flags) == 0x64);
++    assert(sizeof(ldnr_network_config) == 0x20);
++    assert(offsetof(ldnr_network_config, channel) == 0x10);
++    assert(offsetof(ldnr_network_config, node_count_max) == 0x12);
++    assert(offsetof(ldnr_network_config, local_communication_version) == 0x14);
++    assert(sizeof(ldnr_scan_filter) == 0x60);
++    assert(offsetof(ldnr_scan_filter, network_type) == 0x20);
++    assert(offsetof(ldnr_scan_filter, bssid) == 0x24);
++    assert(offsetof(ldnr_scan_filter, ssid) == 0x2a);
++    assert(offsetof(ldnr_scan_filter, flags) == 0x5c);
 +    assert(sizeof(ldnr_address_entry) == 0x0c);
++    assert(offsetof(ldnr_address_entry, mac_address) == 0x04);
 +    assert(sizeof(ldnr_node_latest_update) == 0x08);
 +}
 +
@@ -4219,9 +5119,10 @@ index 0000000..6ea9810
 +    fill_bytes(info.advertise_data, sizeof(info.advertise_data), 67);
 +
 +    assert(ldnr_native_network_info_encode(&info, bytes, sizeof(bytes)) == LDNR_NATIVE_OK);
-+    assert(bytes[0x272] == 0x80 && bytes[0x273] == 0x01);
-+    assert(bytes[0x70] == 0x01 && bytes[0x71] == 0x00 && bytes[0x72] == 0xa8 &&
-+           bytes[0x73] == 0xc0);
++    // The advertise data size is at 0x26a and the first node at 0x68.
++    assert(bytes[0x26a] == 0x80 && bytes[0x26b] == 0x01);
++    assert(bytes[0x68] == 0x01 && bytes[0x69] == 0x00 && bytes[0x6a] == 0xa8 &&
++           bytes[0x6b] == 0xc0);
 +    assert(ldnr_native_network_info_decode(&decoded, bytes, sizeof(bytes)) == LDNR_NATIVE_OK);
 +    assert(memcmp(&info, &decoded, sizeof(info)) == 0);
 +}
@@ -4269,8 +5170,9 @@ index 0000000..6ea9810
 +
 +static void test_address_fixture(void)
 +{
++    // nn::ldn keeps the address in host order: 10.114.0.1 is 0x0A720001.
 +    static const uint8_t fixture[LDNR_NATIVE_ADDRESS_ENTRY_SIZE] = {
-+        0x78, 0x56, 0x34, 0x12,
++        0x01, 0x00, 0x72, 0x0a,
 +        0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
 +        0x00, 0x00
 +    };
@@ -4279,7 +5181,7 @@ index 0000000..6ea9810
 +
 +    assert(ldnr_native_address_entry_decode(&decoded, fixture, sizeof(fixture)) ==
 +           LDNR_NATIVE_OK);
-+    assert(decoded.ipv4_address == UINT32_C(0x12345678));
++    assert(decoded.ipv4_address == UINT32_C(0x0A720001));
 +    assert(memcmp(decoded.mac_address, fixture + 4, sizeof(decoded.mac_address)) == 0);
 +    assert(ldnr_native_address_entry_encode(&decoded, encoded, sizeof(encoded)) ==
 +           LDNR_NATIVE_OK);
@@ -4354,16 +5256,16 @@ index 0000000..6ea9810
 +    assert(ldnr_native_network_info_encode(&info, encoded, sizeof(encoded)) ==
 +           LDNR_NATIVE_ERROR_INVALID);
 +
-+    info_bytes[0x2e] = LDNR_NATIVE_SSID_MAX + 1;
++    info_bytes[0x26] = LDNR_NATIVE_SSID_MAX + 1;   // the SSID length
 +    assert(ldnr_native_network_info_decode(&info, info_bytes, sizeof(info_bytes)) ==
 +           LDNR_NATIVE_ERROR_INVALID);
-+    info_bytes[0x2e] = 0;
-+    info_bytes[0x6f] = LDNR_NATIVE_NODE_COUNT_MAX + 1;
++    info_bytes[0x26] = 0;
++    info_bytes[0x67] = LDNR_NATIVE_NODE_COUNT_MAX + 1;   // the node count
 +    assert(ldnr_native_network_info_decode(&info, info_bytes, sizeof(info_bytes)) ==
 +           LDNR_NATIVE_ERROR_INVALID);
-+    info_bytes[0x6f] = 0;
-+    info_bytes[0x272] = 0x81;
-+    info_bytes[0x273] = 0x01;
++    info_bytes[0x67] = 0;
++    info_bytes[0x26a] = 0x81;                       // the advertise data size
++    info_bytes[0x26b] = 0x01;
 +    assert(ldnr_native_network_info_decode(&info, info_bytes, sizeof(info_bytes)) ==
 +           LDNR_NATIVE_ERROR_INVALID);
 +
@@ -4371,7 +5273,7 @@ index 0000000..6ea9810
 +    assert(ldnr_native_network_config_encode(&network, network_bytes,
 +                                             sizeof(network_bytes)) ==
 +           LDNR_NATIVE_ERROR_INVALID);
-+    network_bytes[0x1a] = LDNR_NATIVE_NODE_COUNT_MAX + 1;
++    network_bytes[0x12] = LDNR_NATIVE_NODE_COUNT_MAX + 1;
 +    assert(ldnr_native_network_config_decode(&network, network_bytes,
 +                                             sizeof(network_bytes)) ==
 +           LDNR_NATIVE_ERROR_INVALID);
@@ -4388,7 +5290,7 @@ index 0000000..6ea9810
 +    filter.ssid.length = LDNR_NATIVE_SSID_MAX + 1;
 +    assert(ldnr_native_scan_filter_encode(&filter, filter_bytes, sizeof(filter_bytes)) ==
 +           LDNR_NATIVE_ERROR_INVALID);
-+    filter_bytes[0x32] = LDNR_NATIVE_SSID_MAX + 1;
++    filter_bytes[0x2a] = LDNR_NATIVE_SSID_MAX + 1;
 +    assert(ldnr_native_scan_filter_decode(&filter, filter_bytes, sizeof(filter_bytes)) ==
 +           LDNR_NATIVE_ERROR_INVALID);
 +}
@@ -4406,10 +5308,10 @@ index 0000000..6ea9810
 +}
 diff --git a/dm/host/ldnr/tests/t_protocol.c b/dm/host/ldnr/tests/t_protocol.c
 new file mode 100644
-index 0000000..e15fe0c
+index 0000000..085a2ed
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_protocol.c
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,898 @@
 +#include "ldnr_protocol.h"
 +
 +#include <stdint.h>
@@ -4757,7 +5659,7 @@ index 0000000..e15fe0c
 +        {policy_ack_frame, sizeof(policy_ack_frame), LDNR_MSG_POLICY_ACK},
 +        {reject_ack_frame, sizeof(reject_ack_frame), LDNR_MSG_REJECT_ACK},
 +        {filter_ack_frame, sizeof(filter_ack_frame), LDNR_MSG_FILTER_ACK},
-+        {clear_filter_ack_frame, sizeof(clear_filter_ack_frame), LDNR_MSG_FILTER_ACK}
++        {clear_filter_ack_frame, sizeof(clear_filter_ack_frame), LDNR_MSG_CLEAR_FILTER_ACK}
 +    };
 +
 +    memset(&operation, 0, sizeof(operation));
@@ -4810,7 +5712,8 @@ index 0000000..e15fe0c
 +    CHECK(info->station_accept_policy == 0);
 +    CHECK(info->node_count_max == 8);
 +    CHECK(info->node_count == 1);
-+    CHECK(info->nodes[0].ipv4_address == UINT32_C(0x0100720a));
++    /* 10.114.0.1: the relay sends 0x0100720a, nn::ldn keeps 0x0A720001. */
++    CHECK(info->nodes[0].ipv4_address == UINT32_C(0x0A720001));
 +    CHECK(memcmp(info->nodes[0].mac_address, mac, sizeof(mac)) == 0);
 +    CHECK(info->nodes[0].node_id == 0);
 +    CHECK(info->nodes[0].is_connected == 1);
@@ -4861,14 +5764,16 @@ index 0000000..e15fe0c
 +    ldnr_protocol_message_free(&message);
 +}
 +
++/* The ports in a message are the socket ones (network byte order); the wire
++ * carries the plain numbers. */
 +static void check_udp_message(const ldnr_message *message)
 +{
 +    CHECK(message->type == LDNR_MSG_UDP);
 +    CHECK(message->request_id == UINT64_C(0x44332211));
 +    CHECK(message->udp.source_address == UINT32_C(0x0100720a));
-+    CHECK(message->udp.source_port == 40000);
++    CHECK(message->udp.source_port == ldnr_port_from_host(40000));
 +    CHECK(message->udp.destination_address == UINT32_C(0x0200720a));
-+    CHECK(message->udp.destination_port == 40001);
++    CHECK(message->udp.destination_port == ldnr_port_from_host(40001));
 +    CHECK(message->udp.size == 3);
 +    CHECK(message->udp.data[0] == 0xaa);
 +    CHECK(message->udp.data[1] == 0x55);
@@ -4879,9 +5784,9 @@ index 0000000..e15fe0c
 +{
 +    CHECK(message->proxy.connection_id == UINT64_C(0x11223344));
 +    CHECK(message->proxy.source_address == UINT32_C(0x0100720a));
-+    CHECK(message->proxy.source_port == 40000);
++    CHECK(message->proxy.source_port == ldnr_port_from_host(40000));
 +    CHECK(message->proxy.destination_address == UINT32_C(0x0200720a));
-+    CHECK(message->proxy.destination_port == 40001);
++    CHECK(message->proxy.destination_port == ldnr_port_from_host(40001));
 +}
 +
 +static void test_udp_proxy_data(void)
@@ -4890,9 +5795,9 @@ index 0000000..e15fe0c
 +
 +    memset(&message, 0, sizeof(message));
 +    message.udp.source_address = UINT32_C(0x0100720a);
-+    message.udp.source_port = 40000;
++    message.udp.source_port = ldnr_port_from_host(40000);
 +    message.udp.destination_address = UINT32_C(0x0200720a);
-+    message.udp.destination_port = 40001;
++    message.udp.destination_port = ldnr_port_from_host(40001);
 +    message.udp.size = 3;
 +    message.udp.data[0] = 0xaa;
 +    message.udp.data[1] = 0x55;
@@ -4912,9 +5817,9 @@ index 0000000..e15fe0c
 +    memset(&message, 0, sizeof(message));
 +    message.proxy.connection_id = UINT64_C(0x11223344);
 +    message.proxy.source_address = UINT32_C(0x0100720a);
-+    message.proxy.source_port = 40000;
++    message.proxy.source_port = ldnr_port_from_host(40000);
 +    message.proxy.destination_address = UINT32_C(0x0200720a);
-+    message.proxy.destination_port = 40001;
++    message.proxy.destination_port = ldnr_port_from_host(40001);
 +    encode_ok(tcp_connect_frame, sizeof(tcp_connect_frame), LDNR_MSG_PROXY_CONNECT,
 +              UINT64_C(0x44332211), 0, &message, NULL);
 +    decode_ok(tcp_connect_frame, sizeof(tcp_connect_frame), &message);
@@ -4938,9 +5843,9 @@ index 0000000..e15fe0c
 +    memset(&message, 0, sizeof(message));
 +    message.proxy.connection_id = UINT64_C(0x11223344);
 +    message.proxy.source_address = UINT32_C(0x0100720a);
-+    message.proxy.source_port = 40000;
++    message.proxy.source_port = ldnr_port_from_host(40000);
 +    message.proxy.destination_address = UINT32_C(0x0200720a);
-+    message.proxy.destination_port = 40001;
++    message.proxy.destination_port = ldnr_port_from_host(40001);
 +    message.proxy.size = 3;
 +    message.proxy.data[0] = 1;
 +    message.proxy.data[1] = 2;
@@ -5183,6 +6088,104 @@ index 0000000..e15fe0c
 +                               1, 0, &message, &operation) != 0);
 +}
 +
++/* The message ids of the relay server code: reject 0x1a, add filter 0x1b and
++ * clear filter 0x1c. The fixtures pin them in both directions. */
++static void test_relay_message_ids(void)
++{
++    ldnr_message message;
++    ldnr_operation operation;
++    uint8_t output[256];
++    size_t size = 0;
++
++    memset(&message, 0, sizeof(message));
++    memset(&operation, 0, sizeof(operation));
++    message.node_id = 3;
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size, LDNR_MSG_REJECT_ACK,
++                               UINT64_C(0x01020304), 0, &message, NULL) == 0);
++    CHECK(output[5] == 0x1a);
++    CHECK(size == 17);
++    CHECK(output[16] == 3);
++
++    memcpy(operation.mac, "\x02\x4c\x44\x4e\x00\x07", 6);
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size, LDNR_MSG_FILTER_ACK,
++                               UINT64_C(0x01020304), 0, &message, &operation) == 0);
++    CHECK(output[5] == 0x1b);
++    CHECK(size == 22);
++
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size,
++                               LDNR_MSG_CLEAR_FILTER_ACK, UINT64_C(0x01020304), 0,
++                               &message, NULL) == 0);
++    CHECK(output[5] == 0x1c);
++    CHECK(size == 16);
++
++    decode_ok(reject_ack_frame, sizeof(reject_ack_frame), &message);
++    CHECK(message.type == LDNR_MSG_REJECT_ACK);
++    ldnr_protocol_message_free(&message);
++    decode_ok(filter_ack_frame, sizeof(filter_ack_frame), &message);
++    CHECK(message.type == LDNR_MSG_FILTER_ACK);
++    ldnr_protocol_message_free(&message);
++    decode_ok(clear_filter_ack_frame, sizeof(clear_filter_ack_frame), &message);
++    CHECK(message.type == LDNR_MSG_CLEAR_FILTER_ACK);
++    ldnr_protocol_message_free(&message);
++}
++
++/* The relay carries the four network octets in one word, nn::ldn keeps the
++ * host order value: 10.114.0.1 is 0x0100720a on the wire and 0x0A720001 in
++ * the guest structures. */
++static void test_address_and_port_conversions(void)
++{
++    CHECK(ldnr_ipv4_to_native(UINT32_C(0x0100720A)) == UINT32_C(0x0A720001));
++    CHECK(ldnr_ipv4_from_native(UINT32_C(0x0A720001)) == UINT32_C(0x0100720A));
++    CHECK(ldnr_ipv4_to_native(UINT32_C(0x080A720A)) == UINT32_C(0x0A720A08));
++    CHECK(ldnr_port_to_host(UINT16_C(0x9C40)) == UINT16_C(0x409C));
++    CHECK(ldnr_port_from_host(UINT16_C(0x409C)) == UINT16_C(0x9C40));
++}
++
++/* The native filter flags and the relay flags use different bits: the relay
++ * knows the communication id, the scene id, the session and the SSID. The
++ * network type and the BSSID have no relay equivalent. */
++static void test_scan_filter_flag_mapping(void)
++{
++    ldnr_scan_filter filter;
++    ldnr_operation operation;
++    uint8_t output[128];
++    size_t size = 0;
++
++    memset(&filter, 0, sizeof(filter));
++    memset(&operation, 0, sizeof(operation));
++    operation.scan_filter = &filter;
++
++    filter.flags = 0x01;   // LocalCommunicationId
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size, LDNR_MSG_SCAN_ACK,
++                               UINT64_C(0x01020304), 0, NULL, &operation) == 0);
++    CHECK(output[LDNR_WIRE_HEADER] == 0x01);
++
++    filter.flags = 0x02;   // SessionId
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size, LDNR_MSG_SCAN_ACK,
++                               UINT64_C(0x01020304), 0, NULL, &operation) == 0);
++    CHECK(output[LDNR_WIRE_HEADER] == 0x04);
++
++    filter.flags = 0x20;   // SceneId
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size, LDNR_MSG_SCAN_ACK,
++                               UINT64_C(0x01020304), 0, NULL, &operation) == 0);
++    CHECK(output[LDNR_WIRE_HEADER] == 0x02);
++
++    filter.flags = 0x10;   // Ssid
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size, LDNR_MSG_SCAN_ACK,
++                               UINT64_C(0x01020304), 0, NULL, &operation) == 0);
++    CHECK(output[LDNR_WIRE_HEADER] == 0x08);
++
++    filter.flags = 0x0c;   // NetworkType and Bssid have no relay bit
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size, LDNR_MSG_SCAN_ACK,
++                               UINT64_C(0x01020304), 0, NULL, &operation) == 0);
++    CHECK(output[LDNR_WIRE_HEADER] == 0x00);
++
++    filter.flags = 0x3b;   // every relay known flag at once
++    CHECK(ldnr_protocol_encode(output, sizeof(output), &size, LDNR_MSG_SCAN_ACK,
++                               UINT64_C(0x01020304), 0, NULL, &operation) == 0);
++    CHECK(output[LDNR_WIRE_HEADER] == 0x0f);
++}
++
 +int main(void)
 +{
 +    _Static_assert(sizeof(hello_frame) == 41, "HELLO fixture size");
@@ -5200,16 +6203,19 @@ index 0000000..e15fe0c
 +    test_record_trailing_extensions();
 +    test_bad_frames_and_truncation();
 +    test_invalid_lengths();
++    test_relay_message_ids();
++    test_address_and_port_conversions();
++    test_scan_filter_flag_mapping();
 +
 +    puts("PASS");
 +    return 0;
 +}
 diff --git a/dm/host/ldnr/tests/t_state.c b/dm/host/ldnr/tests/t_state.c
 new file mode 100644
-index 0000000..043da7f
+index 0000000..c6ccc8e
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_state.c
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,754 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
@@ -5270,6 +6276,7 @@ index 0000000..043da7f
 +    int auth_error;
 +    uint32_t create_status;
 +    uint32_t connect_status;
++    uint16_t connect_version;     // the version of the last connect request
 +} test_transport;
 +
 +typedef struct {
@@ -5530,6 +6537,21 @@ index 0000000..043da7f
 +    return (ssize_t)size;
 +}
 +
++// The connect request carries the session, the room password, the passphrase,
++// the user name and then the local communication version.
++static uint16_t test_read_connect_version(const uint8_t *bytes, size_t size)
++{
++    const uint8_t *body = bytes + 16;
++    size_t body_size = size - 16;
++    uint16_t room, passphrase, offset;
++    CHECK(body_size >= 16 + 2 + 2 + 33 + 2);
++    room = (uint16_t)(body[16] | (uint16_t)body[17] << 8);
++    passphrase = (uint16_t)(body[18 + room] | (uint16_t)body[19 + room] << 8);
++    offset = (uint16_t)(20 + room + passphrase + 33);
++    CHECK(body_size >= (size_t)offset + 2);
++    return (uint16_t)(body[offset] | (uint16_t)body[offset + 1] << 8);
++}
++
 +static int test_send(void *ctx, const void *frame, size_t size)
 +{
 +    test_transport *transport = ctx;
@@ -5544,6 +6566,7 @@ index 0000000..043da7f
 +    CHECK(size >= 16 && memcmp(bytes, "LDNR", 4) == 0 && bytes[4] == 1);
 +    request_id = (uint32_t)bytes[12] | (uint32_t)bytes[13] << 8 |
 +                 (uint32_t)bytes[14] << 16 | (uint32_t)bytes[15] << 24;
++    if (bytes[5] == 0x15) transport->connect_version = test_read_connect_version(bytes, size);
 +    test_reply_locked(transport, bytes[5], request_id);
 +    pthread_mutex_unlock(&transport->mutex);
 +    return 0;
@@ -5594,6 +6617,21 @@ index 0000000..043da7f
 +    test_u64(&writer, 0);
 +    test_u32(&writer, reason);
 +    test_finish(&writer, 0x21, 0);
++    pthread_mutex_lock(&transport->mutex);
++    CHECK(transport->connected);
++    test_enqueue_locked(transport, writer.bytes, writer.size);
++    pthread_mutex_unlock(&transport->mutex);
++}
++
++// The relay pushes the new state of the room when a node joins or leaves.
++static void test_push_network_update(test_transport *transport,
++                                     const ldnr_network_info *info)
++{
++    test_writer writer;
++    memset(&writer, 0, sizeof(writer));
++    writer.size = 16;
++    test_put_network(&writer, info);
++    test_finish(&writer, 0x20, 0);
 +    pthread_mutex_lock(&transport->mutex);
 +    CHECK(transport->connected);
 +    test_enqueue_locked(transport, writer.bytes, writer.size);
@@ -5733,7 +6771,8 @@ index 0000000..043da7f
 +
 +    transport->create_status = TEST_ECONNREFUSED;
 +    CHECK(ldnr_create_network(context, &network, &security, &user, NULL, NULL, 0) == -1);
-+    CHECK(ldnr_last_errno() == TEST_ENETDOWN);
++    // The relay error is kept: a full room is not the same as a lost relay.
++    CHECK(ldnr_last_errno() == TEST_ECONNREFUSED);
 +    CHECK(ldnr_get_state(context) == TEST_STATE_AP_OPEN);
 +    CHECK(ldnr_get_network_info(context, &actual_info) == -1);
 +    CHECK(test_change_count(&changes) == expected_changes);
@@ -5750,8 +6789,9 @@ index 0000000..043da7f
 +    CHECK(actual_network.channel == network.channel);
 +    CHECK(actual_network.node_count_max == network.node_count_max);
 +    CHECK(ldnr_get_ipv4_address(context, &address, &mask) == 0);
-+    CHECK(address == ldnr_ipv4(192, 168, 44, 10));
-+    CHECK(mask == ldnr_ipv4(255, 255, 0, 0));
++    // nn::ldn keeps the address in host order: 192.168.44.10 is 0xC0A82C0A.
++    CHECK(address == UINT32_C(0xC0A82C0A));
++    CHECK(mask == UINT32_C(0xFFFF0000));
 +    CHECK(ldnr_get_security_parameter(context, &parameter) == 0);
 +    CHECK(memcmp(parameter.server_random, info.server_random, 16) == 0);
 +    CHECK(memcmp(parameter.session_id, info.network_id.session_id, 16) == 0);
@@ -5779,13 +6819,14 @@ index 0000000..043da7f
 +    CHECK(test_change_count(&changes) == expected_changes);
 +
 +    transport->connect_status = TEST_ECONNREFUSED;
-+    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0) == -1);
-+    CHECK(ldnr_last_errno() == TEST_ENETDOWN);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0) == -1);
++    // The relay error is kept: a refused join is not the same as a lost relay.
++    CHECK(ldnr_last_errno() == TEST_ECONNREFUSED);
 +    CHECK(ldnr_get_state(context) == TEST_STATE_STATION_OPEN);
 +    CHECK(test_change_count(&changes) == expected_changes);
 +    transport->connect_status = 0;
 +
-+    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0) == 0);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0) == 0);
 +    CHECK(ldnr_get_state(context) == TEST_STATE_STATION_CONNECTED);
 +    CHECK(test_change_count(&changes) == ++expected_changes);
 +    CHECK(ldnr_get_disconnect_reason(context) == 0);
@@ -5797,7 +6838,7 @@ index 0000000..043da7f
 +    CHECK(ldnr_disconnect(context) == -1);
 +    CHECK(ldnr_get_network_info(context, &actual_info) == -1);
 +
-+    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0) == 0);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0) == 0);
 +    CHECK(test_change_count(&changes) == ++expected_changes);
 +    test_push_disconnect(transport, 47);
 +    test_wait_for_changes(&changes, expected_changes + 1);
@@ -5825,19 +6866,116 @@ index 0000000..043da7f
 +    free((void *)api);
 +}
 +
++// The local communication version reaches the relay and stays in the
++// configuration of the connection.
++static void test_communication_version(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    ldnr_config config;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    ldnr_network_info info = test_network_info();
++    ldnr_network_config actual_network;
++    ldnr *context = NULL;
++
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.connect_timeout_ms = 200;
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_station(context) == 0);
++    memset(&security, 0, sizeof(security));
++    memset(&user, 0, sizeof(user));
++    memcpy(user.user_name, "guest", 5);
++
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0x1234) == 0);
++    CHECK(transport->connect_version == 0x1234);
++    CHECK(ldnr_get_network_config(context, &actual_network) == 0);
++    CHECK(actual_network.local_communication_version == 0x1234);
++
++    // The version is a number of its own: 0x0 to 0x7FFF.
++    CHECK(ldnr_disconnect(context) == 0);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0x8000) == -1);
++    CHECK(ldnr_last_errno() == TEST_EINVAL);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, -1) == -1);
++    CHECK(ldnr_last_errno() == TEST_EINVAL);
++
++    ldnr_destroy(context);
++    free((void *)api);
++}
++
++// A node that joins is an observable change: the guest event is signalled
++// even when the state itself did not move, and the change is recorded.
++static void test_network_update(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_changes changes;
++    ldnr_config config;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    ldnr_network_info info = test_network_info();
++    ldnr_network_info updated = test_network_info();
++    ldnr_node_latest_update update;
++    ldnr *context = NULL;
++    int expected_changes = 0;
++
++    memset(&changes, 0, sizeof(changes));
++    pthread_mutex_init(&changes.mutex, NULL);
++    pthread_cond_init(&changes.condition, NULL);
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.callback_ctx = &changes;
++    config.state_changed = test_state_changed;
++    config.connect_timeout_ms = 200;
++
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_station(context) == 0);
++    expected_changes = test_change_count(&changes);
++    memset(&security, 0, sizeof(security));
++    memset(&user, 0, sizeof(user));
++    memcpy(user.user_name, "guest", 5);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0) == 0);
++    CHECK(test_change_count(&changes) == ++expected_changes);
++
++    // A second node joins the room: the state stays the same, but the guest
++    // has to learn about it.
++    updated.node_count = 2;
++    updated.nodes[1].ipv4_address = ldnr_ipv4(192, 168, 44, 11);
++    updated.nodes[1].node_id = 1;
++    updated.nodes[1].is_connected = 1;
++    test_push_network_update(transport, &updated);
++    test_wait_for_changes(&changes, expected_changes + 1);
++    expected_changes++;
++    CHECK(ldnr_get_network_info_latest_update(context, &update) == 0);
++    CHECK((update.state_change & 0x01) != 0);   // a node joined
++    // The change is read once: the state is cleared afterwards.
++    CHECK(ldnr_get_network_info_latest_update(context, &update) == 0);
++    CHECK(update.state_change == 0);
++
++    ldnr_destroy(context);
++    free((void *)api);
++    pthread_mutex_destroy(&changes.mutex);
++    pthread_cond_destroy(&changes.condition);
++}
++
 +int main(void)
 +{
 +    test_create_arguments();
 +    test_lifecycle_and_replies();
++    test_communication_version();
++    test_network_update();
 +    puts("PASS");
 +    return 0;
 +}
 diff --git a/dm/host/ldnr/tests/t_vnet.c b/dm/host/ldnr/tests/t_vnet.c
 new file mode 100644
-index 0000000..8bedc26
+index 0000000..8e12268
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_vnet.c
-@@ -0,0 +1,960 @@
+@@ -0,0 +1,1163 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
@@ -5882,6 +7020,7 @@ index 0000000..8bedc26
 +    TEST_ENETDOWN = 50,
 +    TEST_ENOBUFS = 55,
 +    TEST_ENOTCONN = 57,
++    TEST_ECONNRESET = 54,
 +    TEST_ECONNREFUSED = 61,
 +};
 +
@@ -5899,6 +7038,7 @@ index 0000000..8bedc26
 +    int connected;
 +    uint32_t proxy_ack_status;
 +    int auto_proxy_ack;
++    uint8_t node_id;            // the node id the relay assigned to us
 +    unsigned sent_count[LDNR_MSG_ERROR + 1];
 +    ldnr_message last;
 +} test_transport;
@@ -6085,7 +7225,7 @@ index 0000000..8bedc26
 +        break;
 +    case LDNR_MSG_CONNECT_ACK:
 +        info = test_network_info();
-+        test_u8(&writer, 0);
++        test_u8(&writer, transport->node_id);
 +        test_u32(&writer, ldnr_ipv4(192, 168, 44, 10));
 +        {
 +            static const uint8_t mac[6] = {0};
@@ -6185,9 +7325,9 @@ index 0000000..8bedc26
 +    case 0x30:
 +        CHECK(body_size >= 19);
 +        request->proxy.source_address = test_read_u32(body);
-+        request->proxy.source_port = test_read_u16(body + 4);
++        request->proxy.source_port = ldnr_port_from_host(test_read_u16(body + 4));
 +        request->proxy.destination_address = test_read_u32(body + 6);
-+        request->proxy.destination_port = test_read_u16(body + 10);
++        request->proxy.destination_port = ldnr_port_from_host(test_read_u16(body + 10));
 +        request->proxy.connection_id = test_read_u32(body + 13);
 +        length = test_read_u16(body + 17);
 +        CHECK(body_size >= 19 && length == body_size - 19);
@@ -6212,9 +7352,9 @@ index 0000000..8bedc26
 +        request->type = LDNR_MSG_PROXY_CONNECT;
 +        request->proxy.connection_id = test_read_u32(body);
 +        request->proxy.source_address = test_read_u32(body + 4);
-+        request->proxy.source_port = test_read_u16(body + 8);
++        request->proxy.source_port = ldnr_port_from_host(test_read_u16(body + 8));
 +        request->proxy.destination_address = test_read_u32(body + 10);
-+        request->proxy.destination_port = test_read_u16(body + 14);
++        request->proxy.destination_port = ldnr_port_from_host(test_read_u16(body + 14));
 +        break;
 +    case 0x32:
 +        CHECK(body_size == 9);
@@ -6302,10 +7442,11 @@ index 0000000..8bedc26
 +
 +    switch (message->type) {
 +    case LDNR_MSG_PROXY_DATA:
++        // The wire carries the plain port numbers, not the socket order.
 +        test_u32(&writer, message->proxy.source_address);
-+        test_u16(&writer, message->proxy.source_port);
++        test_u16(&writer, ldnr_port_to_host(message->proxy.source_port));
 +        test_u32(&writer, message->proxy.destination_address);
-+        test_u16(&writer, message->proxy.destination_port);
++        test_u16(&writer, ldnr_port_to_host(message->proxy.destination_port));
 +        test_u8(&writer, 6);
 +        test_u32(&writer, (uint32_t)message->proxy.connection_id);
 +        test_u16(&writer, (uint16_t)message->proxy.size);
@@ -6315,15 +7456,15 @@ index 0000000..8bedc26
 +    case LDNR_MSG_PROXY_CONNECT:
 +        test_u32(&writer, (uint32_t)message->proxy.connection_id);
 +        test_u32(&writer, message->proxy.source_address);
-+        test_u16(&writer, message->proxy.source_port);
++        test_u16(&writer, ldnr_port_to_host(message->proxy.source_port));
 +        test_u32(&writer, message->proxy.destination_address);
-+        test_u16(&writer, message->proxy.destination_port);
++        test_u16(&writer, ldnr_port_to_host(message->proxy.destination_port));
 +        test_finish(&writer, 0x31, 0);
 +        break;
 +    case LDNR_MSG_PROXY_DISCONNECT:
 +        test_u32(&writer, (uint32_t)message->proxy.connection_id);
 +        test_u32(&writer, message->proxy.source_address);
-+        test_u8(&writer, 0);
++        test_u8(&writer, (uint8_t)message->status);   // the flags of the frame
 +        test_u8(&writer, (uint8_t)message->reason);
 +        test_finish(&writer, 0x33, 0);
 +        break;
@@ -6394,10 +7535,11 @@ index 0000000..8bedc26
 +    memset(&security, 0, sizeof(security));
 +    CHECK(ldnr_initialize(context) == 0);
 +    CHECK(ldnr_open_station(context) == 0);
-+    CHECK(ldnr_connect_network(context, &info, NULL, &security, NULL, NULL, 0) == 0);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, NULL, NULL, 0, 0) == 0);
 +    CHECK(ldnr_get_ipv4_address(context, &address, &mask) == 0);
-+    CHECK(address == ldnr_ipv4(192, 168, 44, 10));
-+    CHECK(mask == ldnr_ipv4(255, 255, 0, 0));
++    // nn::ldn keeps the address in host order: 192.168.44.10 is 0xC0A82C0A.
++    CHECK(address == UINT32_C(0xC0A82C0A));
++    CHECK(mask == UINT32_C(0xFFFF0000));
 +    return context;
 +}
 +
@@ -6712,11 +7854,33 @@ index 0000000..8bedc26
 +        CHECK(size == -1 && ldnr_last_errno() == TEST_EAGAIN);
 +    }
 +    CHECK(size == 0);
-+    CHECK(ldnr_send(context, client, "x", 1, 0) == -1);
-+    CHECK(ldnr_last_errno() == TEST_EPIPE);
++    // A plain FIN closes the sending side of the peer only: the stream can
++    // still be written to.
++    CHECK(ldnr_send(context, client, "x", 1, 0) == 1);
 +    CHECK(ldnr_close_socket(context, client) == 0);
 +    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
 +    CHECK(sent.proxy.connection_id == connection_id);
++
++    // A reset is an error, not an orderly end of file.
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 50);
++    peer.port = ldnr_htons(9100);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    CHECK(sent.proxy.connection_id != connection_id);
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_DISCONNECT;
++    incoming.proxy.connection_id = sent.proxy.connection_id;
++    incoming.proxy.source_address = peer.address;
++    incoming.proxy.source_port = peer.port;
++    incoming.status = 1;   // the relay marks a reset with the first flag bit
++    test_push_message(transport, &incoming);
++    CHECK(ldnr_recv(context, client, buffer, sizeof(buffer), 0, 1000) == -1);
++    CHECK(ldnr_last_errno() == TEST_ECONNRESET);
++    CHECK(ldnr_send(context, client, "x", 1, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_ECONNRESET);
++    CHECK(ldnr_close_socket(context, client) == 0);
 +
 +    listener = ldnr_socket(context, 2, 1, 6);
 +    CHECK(listener >= 0);
@@ -6790,16 +7954,193 @@ index 0000000..8bedc26
 +    test_destroy_context(context, api);
 +}
 +
++// Only the descriptors that are in one of the sets are polled: an unused
++// descriptor below nfds must not wake the call, and a selected descriptor
++// that is not a socket is an error.
++static void test_select_descriptors(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr address;
++    uint64_t readfds[16], writefds[16], exceptfds[16];
++    char buffer[32];
++    int64_t started;
++    int fd;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    fd = ldnr_socket(context, 2, 2, 17);
++    CHECK(fd >= 0);
++    address.address = ldnr_ipv4(192, 168, 44, 10);
++    address.port = ldnr_htons(TEST_UDP_PORT);
++    CHECK(ldnr_bind(context, fd, &address) == 0);
++
++    // nfds covers every descriptor below the socket, but only the socket is
++    // in a set: the call waits for it instead of returning at once.
++    memset(readfds, 0, sizeof(readfds));
++    memset(writefds, 0, sizeof(writefds));
++    memset(exceptfds, 0, sizeof(exceptfds));
++    readfds[fd >> 6] |= UINT64_C(1) << (fd & 63);
++    started = test_now_ms();
++    CHECK(ldnr_select(context, fd + 1, readfds, writefds, exceptfds, 50) == 0);
++    CHECK(test_now_ms() - started >= 40);
++    CHECK((readfds[fd >> 6] & (UINT64_C(1) << (fd & 63))) == 0);
++
++    // A selected descriptor that is not a socket is an error, the way
++    // select() reports a bad descriptor.
++    memset(readfds, 0, sizeof(readfds));
++    readfds[0] |= UINT64_C(1) << 3;
++    CHECK(ldnr_select(context, fd + 1, readfds, writefds, exceptfds, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_EBADF);
++
++    // A datagram wakes the call.
++    CHECK(ldnr_inject_udp(context, ldnr_ipv4(192, 168, 44, 30), ldnr_htons(6000),
++                          ldnr_ipv4(192, 168, 44, 10), ldnr_htons(TEST_UDP_PORT),
++                          "wake", 4) == 0);
++    memset(readfds, 0, sizeof(readfds));
++    readfds[fd >> 6] |= UINT64_C(1) << (fd & 63);
++    CHECK(ldnr_select(context, fd + 1, readfds, writefds, exceptfds, 1000) == 1);
++    CHECK((readfds[fd >> 6] & (UINT64_C(1) << (fd & 63))) != 0);
++    CHECK(ldnr_recvfrom(context, fd, buffer, sizeof(buffer), 0, NULL, 0) == 4);
++
++    CHECK(ldnr_close_socket(context, fd) == 0);
++    test_destroy_context(context, api);
++}
++
++// The connection ids live in a namespace of their own: the high byte is the
++// node id of the client, so two clients of the same room never pick the same
++// id for their first stream.
++static void test_connection_id_namespace(void)
++{
++    test_transport *first_transport;
++    test_transport *second_transport;
++    const ldnr_transport *first_api = test_transport_create(&first_transport);
++    const ldnr_transport *second_api = test_transport_create(&second_transport);
++    test_waits first_waits;
++    test_waits second_waits;
++    ldnr *first;
++    ldnr *second;
++    ldnr_sockaddr peer;
++    ldnr_message sent;
++    uint64_t first_id, second_id, next_id;
++    int first_socket, second_socket;
++
++    atomic_init(&first_waits.entered, 0);
++    atomic_init(&first_waits.exited, 0);
++    atomic_init(&second_waits.entered, 0);
++    atomic_init(&second_waits.exited, 0);
++    first_transport->node_id = 3;
++    second_transport->node_id = 4;
++    first = test_connected_context(first_api, &first_waits);
++    second = test_connected_context(second_api, &second_waits);
++
++    first_socket = ldnr_socket(first, 2, 1, 6);
++    CHECK(first_socket >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 60);
++    peer.port = ldnr_htons(9200);
++    CHECK(ldnr_connect_socket(first, first_socket, &peer, 1000) == 0);
++    test_last_message(first_transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    first_id = sent.proxy.connection_id;
++    CHECK((first_id >> 24) == 3);
++
++    second_socket = ldnr_socket(second, 2, 1, 6);
++    CHECK(second_socket >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 61);
++    peer.port = ldnr_htons(9201);
++    CHECK(ldnr_connect_socket(second, second_socket, &peer, 1000) == 0);
++    test_last_message(second_transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    second_id = sent.proxy.connection_id;
++    CHECK((second_id >> 24) == 4);
++    CHECK(first_id != second_id);
++
++    // The next id of a client stays inside its own namespace.
++    first_socket = ldnr_socket(first, 2, 1, 6);
++    CHECK(first_socket >= 0);
++    peer.port = ldnr_htons(9202);
++    CHECK(ldnr_connect_socket(first, first_socket, &peer, 1000) == 0);
++    test_last_message(first_transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    next_id = sent.proxy.connection_id;
++    CHECK((next_id >> 24) == 3);
++    CHECK(next_id != first_id);
++
++    CHECK(ldnr_close_socket(first, first_socket) == 0);
++    CHECK(ldnr_close_socket(second, second_socket) == 0);
++    test_destroy_context(first, first_api);
++    test_destroy_context(second, second_api);
++}
++
++// An incoming connection with an id that is already in use belongs to another
++// stream: the relay may reset such a collision, so it is refused here.
++static void test_incoming_collision(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr name;
++    ldnr_sockaddr peer;
++    ldnr_message incoming;
++    ldnr_message sent;
++    int listener;
++    int accepted;
++    unsigned acknowledgements;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    listener = ldnr_socket(context, 2, 1, 6);
++    CHECK(listener >= 0);
++    name.address = ldnr_ipv4(192, 168, 44, 10);
++    name.port = ldnr_htons(TEST_LISTEN_PORT);
++    CHECK(ldnr_bind(context, listener, &name) == 0);
++    CHECK(ldnr_listen(context, listener, 2) == 0);
++
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_CONNECT;
++    incoming.proxy.connection_id = UINT64_C(0x23456789);
++    incoming.proxy.source_address = ldnr_ipv4(192, 168, 44, 30);
++    incoming.proxy.source_port = ldnr_htons(8000);
++    incoming.proxy.destination_address = ldnr_ipv4(192, 168, 44, 10);
++    incoming.proxy.destination_port = ldnr_htons(TEST_LISTEN_PORT);
++    acknowledgements = test_sent_count(transport, LDNR_MSG_PROXY_CONNECT_ACK);
++    test_push_message(transport, &incoming);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_CONNECT_ACK, acknowledgements + 1);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT_ACK, &sent);
++    CHECK(sent.status == 0);
++    accepted = ldnr_accept(context, listener, &peer, 1000);
++    CHECK(accepted >= 0);
++
++    // The same id a second time is refused: the relay would reset one of the
++    // two streams.
++    acknowledgements = test_sent_count(transport, LDNR_MSG_PROXY_CONNECT_ACK);
++    test_push_message(transport, &incoming);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_CONNECT_ACK, acknowledgements + 1);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT_ACK, &sent);
++    CHECK(sent.status == TEST_ECONNREFUSED);
++    CHECK(ldnr_accept(context, listener, &peer, 100) == -1);
++    CHECK(ldnr_last_errno() == TEST_EAGAIN);
++
++    CHECK(ldnr_close_socket(context, accepted) == 0);
++    CHECK(ldnr_close_socket(context, listener) == 0);
++    test_destroy_context(context, api);
++}
++
 +int main(void)
 +{
 +    test_offline_and_fd_limit();
 +    test_udp();
 +    test_tcp();
++    test_select_descriptors();
++    test_connection_id_namespace();
++    test_incoming_collision();
 +    puts("PASS");
 +    return 0;
 +}
 diff --git a/dm/host/loader.c b/dm/host/loader.c
-index fb14972..54836e8 100644
+index fb14972..ce5e817 100644
 --- a/dm/host/loader.c
 +++ b/dm/host/loader.c
 @@ -10,6 +10,7 @@
@@ -6810,15 +8151,33 @@ index fb14972..54836e8 100644
  
  module_t *g_mod;
  int g_nmod;
-@@ -163,6 +164,8 @@ static void force_init(void) {
+@@ -163,15 +164,22 @@ static void force_init(void) {
          }
  }
  static void *force_lookup(const char *name) {
+-    if (!g_fmask) return NULL;
+-    for (unsigned j = sym_hash(name) & g_fmask; g_fidx[j]; j = (j + 1) & g_fmask) {
 +    // LDNR hook (NX2Apple fork): its separate table wins only when DM_LDNR is enabled.
-+    void *ldnr = ldnr_hook_lookup(name); if (ldnr) return ldnr;
-     if (!g_fmask) return NULL;
-     for (unsigned j = sym_hash(name) & g_fmask; g_fidx[j]; j = (j + 1) & g_fmask) {
++    void *ldnr = ldnr_hook_lookup(name);
++    void *forced = NULL;
++    if (g_fmask) for (unsigned j = sym_hash(name) & g_fmask; g_fidx[j]; j = (j + 1) & g_fmask) {
          unsigned i = g_fidx[j] - 1;
+         if (!strcmp(g_force[i].name, name)) {
+             if (!g_force_hits[i]++ && g_flag.imports) LOG("force %s  (%s)", name, g_force[i].why);
+-            void *hlecount_wrap(const char *, const char *, void *); return hlecount_wrap("FORCE", name, g_force[i].fn);   // A counting stub when DM_HLECOUNT is set
++            forced = g_force[i].fn; break;
+         }
+     }
+-    return NULL;
++    // The relay implementation replaces the forced one, but it stays in the
++    // same path: the entry counts as hit and the call is wrapped like every
++    // other forced call (a counting stub when DM_HLECOUNT is set).
++    void *hlecount_wrap(const char *, const char *, void *);
++    if (ldnr) return hlecount_wrap("FORCE", name, ldnr);
++    return forced ? hlecount_wrap("FORCE", name, forced) : NULL;
+ }
+ // Generic host: the list serves several games, so entries a game does not reference are only noted; with DM_FORCE_STRICT=1 it still fails loudly (for checking a mistyped list)
+ static void force_check(void) {
 diff --git a/docs/LDN-RELAY.md b/docs/LDN-RELAY.md
 new file mode 100644
 index 0000000..c2d4b17
