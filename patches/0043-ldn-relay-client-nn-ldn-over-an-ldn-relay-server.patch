@@ -10,33 +10,33 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
 
 ---
  dm/host/Makefile                |    2 +-
- dm/host/hle_ldnr.c              |  989 +++++++++
+ dm/host/hle_ldnr.c              | 1007 +++++++++
  dm/host/ldnr/ldnr.c             |  989 +++++++++
  dm/host/ldnr/ldnr.h             |  131 ++
- dm/host/ldnr/ldnr_client.c      |  640 ++++++
+ dm/host/ldnr/ldnr_client.c      |  661 ++++++
  dm/host/ldnr/ldnr_hook.h        |   13 +
  dm/host/ldnr/ldnr_internal.h    |  255 +++
  dm/host/ldnr/ldnr_native.c      |  622 ++++++
  dm/host/ldnr/ldnr_native.h      |  203 ++
- dm/host/ldnr/ldnr_protocol.c    |  645 ++++++
- dm/host/ldnr/ldnr_protocol.h    |  163 ++
- dm/host/ldnr/ldnr_tcp.c         |  534 +++++
- dm/host/ldnr/ldnr_transport.h   |   44 +
- dm/host/ldnr/ldnr_vnet.c        | 1600 +++++++++++++++
+ dm/host/ldnr/ldnr_protocol.c    |  647 ++++++
+ dm/host/ldnr/ldnr_protocol.h    |  167 ++
+ dm/host/ldnr/ldnr_tcp.c         |  621 ++++++
+ dm/host/ldnr/ldnr_transport.h   |   51 +
+ dm/host/ldnr/ldnr_vnet.c        | 1646 ++++++++++++++
  dm/host/ldnr/ldnr_vnet.h        |   24 +
  dm/host/ldnr/tests/.gitignore   |    1 +
  dm/host/ldnr/tests/Makefile     |   60 +
  dm/host/ldnr/tests/shim/hle.h   |   38 +
- dm/host/ldnr/tests/t_glue.c     |  600 ++++++
+ dm/host/ldnr/tests/t_glue.c     |  662 ++++++
  dm/host/ldnr/tests/t_ldnr_e2e.c |  198 ++
- dm/host/ldnr/tests/t_native.c   |  340 ++++
+ dm/host/ldnr/tests/t_native.c   |  340 +++
  dm/host/ldnr/tests/t_protocol.c | 1101 ++++++++++
- dm/host/ldnr/tests/t_state.c    | 1652 +++++++++++++++
- dm/host/ldnr/tests/t_tcp.c      |  442 ++++
- dm/host/ldnr/tests/t_vnet.c     | 3328 +++++++++++++++++++++++++++++++
+ dm/host/ldnr/tests/t_state.c    | 1810 +++++++++++++++
+ dm/host/ldnr/tests/t_tcp.c      |  556 +++++
+ dm/host/ldnr/tests/t_vnet.c     | 3640 +++++++++++++++++++++++++++++++
  dm/host/loader.c                |   16 +-
  docs/LDN-RELAY.md               |   96 +
- 27 files changed, 14721 insertions(+), 5 deletions(-)
+ 27 files changed, 15552 insertions(+), 5 deletions(-)
  create mode 100644 dm/host/hle_ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.h
@@ -78,10 +78,10 @@ index 978fee0..3038a23 100644
  	rm -rf gen dmhost dmhost_* *.dSYM
 diff --git a/dm/host/hle_ldnr.c b/dm/host/hle_ldnr.c
 new file mode 100644
-index 0000000..4156272
+index 0000000..a5f0f61
 --- /dev/null
 +++ b/dm/host/hle_ldnr.c
-@@ -0,0 +1,989 @@
+@@ -0,0 +1,1007 @@
 +// Optional nn::ldn / nn::socket takeover for relay play. The separate swldnr
 +// section keeps force_init's upstream duplicate check and accounting unchanged.
 +#ifdef LDNR_GLUE_SYNTAX_TEST
@@ -240,11 +240,27 @@ index 0000000..4156272
 +    *size = sizeof bytes;
 +}
 +
++// Seconds and microseconds to milliseconds, saturated to INT32_MAX: every
++// field is widened and bounded before the multiply, so a huge value clamps
++// instead of overflowing signed arithmetic. The fields are non-negative;
++// the caller rejects a negative one.
++static int lr_timeout_ms(int64_t sec, int64_t usec) {
++    // Above these bounds the sum can only exceed the cap: the multiply and
++    // the add below then stay inside int64_t.
++    if (sec > INT32_MAX / 1000 || usec > (int64_t)INT32_MAX * 1000) return INT32_MAX;
++    int64_t ms = sec * 1000 + usec / 1000;
++    return ms > INT32_MAX ? INT32_MAX : (int)ms;
++}
++
++// The guest's select/timeval timeout. A NULL timeout waits forever; a
++// negative field is an invalid argument, the way the socket options reject
++// one. The return is the millisecond count, -1 for "forever", or -2 for a
++// value the guest cannot pass.
++#define LR_TIMEVAL_INVALID (-2)
 +static int lr_timeval_ms(const int64_t *tv) {
 +    if (!tv) return -1;
-+    int64_t ms = tv[0] * 1000 + tv[1] / 1000;
-+    if (ms > 0x7fffffff) return 0x7fffffff;
-+    return ms < 0 ? 0 : (int)ms;
++    if (tv[0] < 0 || tv[1] < 0) return LR_TIMEVAL_INVALID;
++    return lr_timeout_ms(tv[0], tv[1]);
 +}
 +
 +// ---------- nn::ldn ----------
@@ -932,9 +948,11 @@ index 0000000..4156272
 +LDNR_HLE("_ZN2nn6socket4PollEP6pollfdmi", int, lr_poll_old, void *fds, uint64_t count, int timeout) { return lr_poll(fds, count, timeout); }
 +LDNR_HLE("nnsocketPoll", int, lr_poll_c, void *fds, uint64_t count, int timeout) { return lr_poll(fds, count, timeout); }
 +static int lr_select(int nfds, void *readfds, void *writefds, void *exceptfds, const int64_t *tv) {
++    int timeout = lr_timeval_ms(tv);
++    if (timeout == LR_TIMEVAL_INVALID) return ldnr_fail(LDNR_EINVAL);
 +    ldnr *l = lr_acquire();
 +    if (!l) return ldnr_fail(LDNR_ENETDOWN);
-+    int result = ldnr_select(l, nfds, readfds, writefds, exceptfds, lr_timeval_ms(tv));
++    int result = ldnr_select(l, nfds, readfds, writefds, exceptfds, timeout);
 +    lr_release();
 +    return result;
 +}
@@ -2205,10 +2223,10 @@ index 0000000..d82f463
 +                    const void *data, size_t size);
 diff --git a/dm/host/ldnr/ldnr_client.c b/dm/host/ldnr/ldnr_client.c
 new file mode 100644
-index 0000000..ef8a4c0
+index 0000000..df51c33
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_client.c
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,661 @@
 +// Relay connection, request/reply matching, and the background receive loop.
 +// The codec only turns frames into ldnr_message; this file owns no wire rules.
 +#include "ldnr_internal.h"
@@ -2564,6 +2582,20 @@ index 0000000..ef8a4c0
 +        ldnr_membership_retire(l, (int)reason);
 +}
 +
++// A teardown names the session it ends. One that names another session is
++// not this membership's and must be ignored: the relay may carry several
++// rooms, and a teardown for one of them must not end the one the guest is
++// in. A teardown that names no session applies to whatever room the guest
++// is in, which is the form a relay without room tracking sends.
++static int ldnr_teardown_applies(const ldnr *l, const uint8_t session_id[16]) {
++    int named = 0;
++    for (unsigned i = 0; i < 16; i++)
++        if (session_id[i]) named = 1;
++    if (!named) return 1;
++    if (!l->has_network) return 1;
++    return !memcmp(session_id, l->network.network_id.session_id, 16);
++}
++
 +// The node set of the room changed: the guest is told which kind of change
 +// happened, and the state change event is signalled. Every node keeps its
 +// own history: a station that joined is not a change of the whole lobby.
@@ -2613,6 +2645,10 @@ index 0000000..ef8a4c0
 +                // before it reads its payload.
 +                if (l->transport->set_limit)
 +                    l->transport->set_limit(l->transport->ctx, message->max_frame);
++                // The relay announced how often it sends a PING: the
++                // transport uses it to notice a relay that went silent.
++                if (message->keepalive_ms && l->transport->set_keepalive)
++                    l->transport->set_keepalive(l->transport->ctx, message->keepalive_ms);
 +                // The relay selected the major: every frame after the
 +                // handshake carries it.
 +                if (message->protocol_major)
@@ -2664,7 +2700,10 @@ index 0000000..ef8a4c0
 +        }
 +        break;
 +    case LDNR_MSG_DISCONNECTED:
-+        ldnr_unexpected_disconnect(l, message->reason);
++        // The teardown ends the session it names (PROTOCOL.md §3.13): one
++        // for another room leaves this membership untouched.
++        if (ldnr_teardown_applies(l, message->session_id))
++            ldnr_unexpected_disconnect(l, message->reason);
 +        break;
 +    case LDNR_MSG_UDP:
 +        ldnr_vnet_udp(l, message);
@@ -3968,10 +4007,10 @@ index 0000000..75b6fbd
 +#endif
 diff --git a/dm/host/ldnr/ldnr_protocol.c b/dm/host/ldnr/ldnr_protocol.c
 new file mode 100644
-index 0000000..9c9ea55
+index 0000000..61afc6f
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_protocol.c
-@@ -0,0 +1,645 @@
+@@ -0,0 +1,647 @@
 +// ldn-relay-server protocol 1.2. The Go package pkg/protocol and the relay
 +// repository's PROTOCOL.md are the reference.
 +#include "ldnr_internal.h"
@@ -4466,7 +4505,7 @@ index 0000000..9c9ea55
 +        // The relay announces the largest payload it accepts; the client
 +        // keeps it and never sends a frame above it.
 +        decoded.max_frame = ldnr_u32r(r);
-+        (void)ldnr_u32r(r); // keepalive interval, unused for now
++        decoded.keepalive_ms = ldnr_u32r(r);
 +        decoded.reason = capabilities;
 +        decoded.protocol_major = chosen;
 +        decoded.protocol_minor = minor;
@@ -4505,8 +4544,10 @@ index 0000000..9c9ea55
 +        decoded.type = LDNR_MSG_NETWORK_UPDATED; decoded.has_network_info = 1;
 +        result = ldnr_decode_network(r, &decoded.network_info, &decoded.network_id); break;
 +    case 0x21:
++        // The room is torn down; the payload names the session it ended and
++        // the reason the relay gives.
 +        decoded.type = LDNR_MSG_DISCONNECTED;
-+        { uint8_t session[16]; ldnr_get(r, session, 16); decoded.reason = ldnr_u32r(r); }
++        ldnr_get(r, decoded.session_id, 16); decoded.reason = ldnr_u32r(r);
 +        break;
 +    case 0x22: decoded.type = LDNR_MSG_NONE; (void)ldnr_u8r(r); (void)ldnr_u8r(r); break;
 +    case 0x30: {
@@ -4619,10 +4660,10 @@ index 0000000..9c9ea55
 +}
 diff --git a/dm/host/ldnr/ldnr_protocol.h b/dm/host/ldnr/ldnr_protocol.h
 new file mode 100644
-index 0000000..cf46534
+index 0000000..db4132d
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_protocol.h
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,167 @@
 +// Protocol-neutral messages exchanged between the codec and the LDN core.
 +// The wire representation lives only in ldnr_protocol.c.
 +#pragma once
@@ -4686,11 +4727,15 @@ index 0000000..cf46534
 +    uint32_t error_code;              // the relay's own error code, if any
 +    uint32_t ipv4;
 +    uint32_t max_frame;               // frame limit announced by the relay
++    uint32_t keepalive_ms;            // keepalive interval announced by the relay
 +    uint8_t protocol_major;           // the major the relay selected
 +    uint8_t protocol_minor;           // the minor the relay speaks
 +    int node_id;
 +    uint32_t subnet_mask;
 +    int has_network_info;
++    // The room a NETWORK_DESTROYED names: only a teardown that carries this
++    // membership's own session id may retire it.
++    uint8_t session_id[16];
 +    ldnr_network_info network_info;
 +    ldnr_network_result *networks;
 +    int network_count;
@@ -4788,10 +4833,10 @@ index 0000000..cf46534
 +const char *ldnr_protocol_error(void);
 diff --git a/dm/host/ldnr/ldnr_tcp.c b/dm/host/ldnr/ldnr_tcp.c
 new file mode 100644
-index 0000000..68d0bab
+index 0000000..02525b8
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_tcp.c
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,621 @@
 +// POSIX stream transport for LDNR frames. TLS is deliberately not implicit:
 +// use a TLS endpoint/tunnel until this small transport gains certificate verification.
 +#include "ldnr_transport.h"
@@ -4820,6 +4865,18 @@ index 0000000..68d0bab
 +#define LDNR_TCP_CONNECT_TIMEOUT_MS 5000
 +// How long a connect waits between two checks of the cancellation.
 +#define LDNR_TCP_POLL_SLICE_MS 50
++// A frame that arrives in parts must complete within this deadline: a relay
++// that sends a header, or part of a payload, and then stalls must not keep
++// the sole receive thread waiting forever.
++#define LDNR_TCP_FRAME_TIMEOUT_MS 10000
++// How often a read that waits for the rest of its frame looks at the clock.
++// The slice is short so the deadline is honoured promptly; the receive
++// thread polls at this rate only while a frame is incomplete.
++#define LDNR_TCP_READ_SLICE_MS 250
++// The keepalive interval the relay announced, used before it announces one.
++#define LDNR_TCP_DEFAULT_KEEPALIVE_MS 15000
++// A relay that has sent nothing for this many keepalive intervals is dead.
++#define LDNR_TCP_KEEPALIVE_FACTOR 3
 +
 +// A connection of the transport. The descriptor belongs to the connection and
 +// not to the transport: a connection that is replaced is shut down at once,
@@ -4844,6 +4901,9 @@ index 0000000..68d0bab
 +    ldnr_tcp_conn *connecting;
 +    uint64_t generation;                // identity of the connection
 +    uint32_t limit;                     // the largest payload the relay accepts
++    uint32_t keepalive_ms;              // the interval the relay announced
++    int frame_timeout_ms;               // the deadline of a partial frame
++    int64_t last_rx;                    // when the relay last sent a byte
 +    int failed;                         // the framing stream is broken
 +    int closed;                         // the transport was closed
 +} ldnr_tcp;
@@ -5051,6 +5111,9 @@ index 0000000..68d0bab
 +    conn->generation = ++tcp->generation;
 +    tcp->current = conn;
 +    tcp->failed = 0;
++    // The liveness clock starts with the new connection: the relay was
++    // heard from at the moment the handshake started.
++    tcp->last_rx = ldnr_tcp_now_ms();
 +    pthread_mutex_unlock(&tcp->mutex);
 +    ldnr_tcp_conn_retire(tcp, old);
 +    return 0;
@@ -5080,15 +5143,48 @@ index 0000000..68d0bab
 +    return found ? &ldnr_tcp_caps : NULL;
 +}
 +
-+static ssize_t ldnr_tcp_read(int fd, uint8_t *out, size_t size) {
++static ssize_t ldnr_tcp_read(ldnr_tcp *tcp, ldnr_tcp_conn *conn, uint8_t *out, size_t size,
++                             int64_t *last_rx, int64_t *frame_deadline) {
 +    size_t done = 0;
 +    while (done < size) {
-+        ssize_t n = recv(fd, out + done, size - done, 0);
-+        if (n > 0) { done += (size_t)n; continue; }
++        ssize_t n = recv(conn->fd, out + done, size - done, 0);
++        if (n > 0) {
++            done += (size_t)n;
++            int64_t now = ldnr_tcp_now_ms();
++            *last_rx = now;
++            // The deadline of the frame is set at its first byte and kept
++            // for the rest of it: the header and the payload of one frame
++            // must complete within one deadline, or a relay that sends a
++            // byte, stalls, sends another byte would hold the sole receive
++            // thread forever.
++            if (!*frame_deadline) {
++                pthread_mutex_lock(&tcp->mutex);
++                int frame_timeout = tcp->frame_timeout_ms;
++                pthread_mutex_unlock(&tcp->mutex);
++                *frame_deadline = now + frame_timeout;
++            }
++            continue;
++        }
 +        if (n < 0 && errno == EINTR) continue;
 +        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-+            struct pollfd waiter = {fd, POLLIN, 0};
-+            if (poll(&waiter, 1, -1) < 0 && errno != EINTR) return -1;
++            // The wait is bounded by the incomplete frame and by the
++            // liveness of the connection: a relay that sent nothing for
++            // three keepalive intervals is dead, however healthy the
++            // socket looks.
++            pthread_mutex_lock(&tcp->mutex);
++            uint32_t keepalive = tcp->keepalive_ms ? tcp->keepalive_ms
++                                                  : LDNR_TCP_DEFAULT_KEEPALIVE_MS;
++            int failed = tcp->failed;
++            pthread_mutex_unlock(&tcp->mutex);
++            if (failed) return -1;
++            int64_t deadline = *last_rx + (int64_t)keepalive * LDNR_TCP_KEEPALIVE_FACTOR;
++            if (*frame_deadline && *frame_deadline < deadline) deadline = *frame_deadline;
++            int64_t remaining = deadline - ldnr_tcp_now_ms();
++            if (remaining <= 0) return -1;
++            struct pollfd waiter = {conn->fd, POLLIN, 0};
++            int slice = remaining > LDNR_TCP_READ_SLICE_MS ? LDNR_TCP_READ_SLICE_MS
++                                                           : (int)remaining;
++            if (poll(&waiter, 1, slice) < 0 && errno != EINTR) return -1;
 +            continue;
 +        }
 +        return n == 0 && done == 0 ? 0 : -1;
@@ -5115,6 +5211,10 @@ index 0000000..68d0bab
 +    ldnr_tcp_conn *conn = tcp->current;
 +    uint32_t limit = tcp->limit;
 +    int failed = tcp->failed;
++    // The liveness clock is the last byte the relay sent, not the last
++    // frame it completed: a relay that keeps a frame half-sent is not
++    // alive either, and the frame deadline below covers that case.
++    int64_t last_rx = tcp->last_rx;
 +    if (conn) conn->refs++;
 +    pthread_mutex_unlock(&tcp->mutex);
 +    if (!conn || failed || capacity < LDNR_TCP_HEADER) {
@@ -5124,7 +5224,10 @@ index 0000000..68d0bab
 +    if (!limit) limit = LDNR_TCP_DEFAULT_LIMIT;
 +    uint8_t *out = frame;
 +    ssize_t result = -1;
-+    if (ldnr_tcp_read(conn->fd, out, LDNR_TCP_HEADER) != LDNR_TCP_HEADER) {
++    // One deadline for the header and the payload of this frame.
++    int64_t frame_deadline = 0;
++    if (ldnr_tcp_read(tcp, conn, out, LDNR_TCP_HEADER, &last_rx, &frame_deadline)
++            != LDNR_TCP_HEADER) {
 +        ldnr_tcp_fail(tcp, conn);
 +    } else if (memcmp(out, "LDNR", 4)) {
 +        ldnr_tcp_fail(tcp, conn);
@@ -5135,12 +5238,19 @@ index 0000000..68d0bab
 +        // frame above it is refused instead of being read into the buffer.
 +        if (payload > limit || payload > capacity - LDNR_TCP_HEADER) {
 +            ldnr_tcp_fail(tcp, conn);
-+        } else if (ldnr_tcp_read(conn->fd, out + LDNR_TCP_HEADER, payload) != (ssize_t)payload) {
++        } else if (ldnr_tcp_read(tcp, conn, out + LDNR_TCP_HEADER, payload, &last_rx,
++                                 &frame_deadline) != (ssize_t)payload) {
 +            ldnr_tcp_fail(tcp, conn);
 +        } else {
 +            result = (ssize_t)(LDNR_TCP_HEADER + payload);
 +        }
 +    }
++    // The liveness clock advances with every byte that arrived, even for a
++    // frame that was refused afterwards: the reader learned the relay is
++    // there.
++    pthread_mutex_lock(&tcp->mutex);
++    if (tcp->current == conn && last_rx > tcp->last_rx) tcp->last_rx = last_rx;
++    pthread_mutex_unlock(&tcp->mutex);
 +    ldnr_tcp_conn_release(tcp, conn);
 +    return result;
 +}
@@ -5226,6 +5336,15 @@ index 0000000..68d0bab
 +    pthread_mutex_unlock(&tcp->mutex);
 +}
 +
++// The relay announces how often it sends a PING: a connection that hears
++// nothing for three of those intervals is dead.
++static void ldnr_tcp_set_keepalive(void *ctx, uint32_t interval_ms) {
++    ldnr_tcp *tcp = ctx;
++    pthread_mutex_lock(&tcp->mutex);
++    tcp->keepalive_ms = interval_ms;
++    pthread_mutex_unlock(&tcp->mutex);
++}
++
 +static void ldnr_tcp_close(void *ctx) {
 +    ldnr_tcp *tcp = ctx;
 +    pthread_mutex_lock(&tcp->mutex);
@@ -5278,12 +5397,14 @@ index 0000000..68d0bab
 +        free(transport); free(tcp); return NULL;
 +    }
 +    tcp->limit = LDNR_TCP_DEFAULT_LIMIT;
++    tcp->frame_timeout_ms = LDNR_TCP_FRAME_TIMEOUT_MS;
 +    transport->ctx = tcp;
 +    transport->connect = ldnr_tcp_connect;
 +    transport->recv = ldnr_tcp_recv;
 +    transport->send = ldnr_tcp_send; transport->close = ldnr_tcp_close;
 +    transport->destroy = ldnr_tcp_destroy;
 +    transport->set_limit = ldnr_tcp_set_limit;
++    transport->set_keepalive = ldnr_tcp_set_keepalive;
 +    // The transport joins the registry: the core asks it for the optional
 +    // capabilities that the plain contract does not carry.
 +    pthread_mutex_lock(&ldnr_tcp_registry_mutex);
@@ -5323,15 +5444,26 @@ index 0000000..68d0bab
 +    conn->refs = 1;
 +    tcp->current = conn;
 +    tcp->failed = 0;
++    tcp->last_rx = ldnr_tcp_now_ms();
 +    pthread_mutex_unlock(&tcp->mutex);
 +    ldnr_tcp_conn_retire(tcp, old);
 +}
++
++// Test hook: shortens the deadline of a partial frame read, so that the
++// tests do not wait the production ten seconds for a stalled relay.
++void ldnr_tcp_test_set_frame_timeout(const ldnr_transport *transport, int ms) {
++    if (!transport || !transport->ctx || ms <= 0) return;
++    ldnr_tcp *tcp = transport->ctx;
++    pthread_mutex_lock(&tcp->mutex);
++    tcp->frame_timeout_ms = ms;
++    pthread_mutex_unlock(&tcp->mutex);
++}
 diff --git a/dm/host/ldnr/ldnr_transport.h b/dm/host/ldnr/ldnr_transport.h
 new file mode 100644
-index 0000000..f158534
+index 0000000..c4a33e1
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_transport.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,51 @@
 +// Frame transport contract. recv returns exactly one protocol frame and blocks
 +// until one arrives. close must wake a concurrent recv. Implementations may be
 +// in-memory, which keeps the state machine and vnet tests independent of TCP.
@@ -5350,6 +5482,10 @@ index 0000000..f158534
 +    // The relay announces the largest payload it accepts: a frame above it
 +    // is refused before its payload is read. It may be left out.
 +    void (*set_limit)(void *ctx, uint32_t limit);
++    // The relay announces its keepalive interval in the handshake: a
++    // transport that can bound its own reads uses it to detect a relay that
++    // went silent. It may be left out.
++    void (*set_keepalive)(void *ctx, uint32_t interval_ms);
 +} ldnr_transport;
 +
 +// The optional capabilities of a transport. They live outside the contract
@@ -5376,12 +5512,15 @@ index 0000000..f158534
 +void ldnr_tcp_test_replace(const ldnr_transport *transport, int fd);
 +// Test hook only: the descriptor of the connect that is in progress, or -1.
 +int ldnr_tcp_test_connecting_fd(const ldnr_transport *transport);
++// Test hook only: shortens the deadline of a partial frame read, so the
++// tests do not wait the production ten seconds for a stalled relay.
++void ldnr_tcp_test_set_frame_timeout(const ldnr_transport *transport, int ms);
 diff --git a/dm/host/ldnr/ldnr_vnet.c b/dm/host/ldnr/ldnr_vnet.c
 new file mode 100644
-index 0000000..beaf062
+index 0000000..6ff883b
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_vnet.c
-@@ -0,0 +1,1600 @@
+@@ -0,0 +1,1646 @@
 +// Virtual BSD sockets on the LDN subnet. No host socket descriptor escapes:
 +// readiness and datagram queues are entirely under this layer's control.
 +#include "ldnr_internal.h"
@@ -6249,6 +6388,36 @@ index 0000000..beaf062
 +    return (ssize_t)sent;
 +}
 +
++// A blocking connect reached its deadline. The pending stream is retired:
++// the socket keeps its failed open, so a late acceptance cannot mark it
++// connected after the guest was told the open timed out, and the stream is
++// reset for its connection id so the relay reaps it. Its id is cleared with
++// it, so that a late PROXY_CONNECT_ACK for that id finds no stream here and
++// is ignored instead of answering or resetting anything a second time.
++//
++// The reset is what closes the entry of the open that waits for its answer:
++// once the stream is gone from this side there is nothing left to answer.
++static int ldnr_connect_timed_out(ldnr *l, int fd, uint64_t generation) {
++    // The caller holds the socket mutex.
++    ldnr_vsock *s = ldnr_socket_of(l, fd, generation);
++    uint64_t connection_id = 0;
++    uint32_t source_address = l->vnet.local_address;
++    if (s && s->connecting) {
++        s->connecting = 0;
++        s->connect_error = LDNR_ETIMEDOUT;
++        connection_id = s->connection_id;
++        s->connection_id = 0;
++        pthread_cond_broadcast(&l->vnet.condition);
++    }
++    pthread_mutex_unlock(&l->vnet.mutex);
++    if (connection_id) {
++        pthread_mutex_lock(&ldnr_stream_send_lock);
++        ldnr_send_stream_reset(l, connection_id, source_address);
++        pthread_mutex_unlock(&ldnr_stream_send_lock);
++    }
++    return ldnr_fail(LDNR_ETIMEDOUT);
++}
++
 +int ldnr_connect_socket(ldnr *l, int fd, const ldnr_sockaddr *destination, int timeout_ms) {
 +    if (!l || !destination) return ldnr_fail(LDNR_EINVAL);
 +    pthread_mutex_lock(&l->vnet.mutex);
@@ -6336,8 +6505,7 @@ index 0000000..beaf062
 +            break;
 +        }
 +        if (ldnr_vnet_wait(l, deadline) == ETIMEDOUT) {
-+            pthread_mutex_unlock(&l->vnet.mutex);
-+            return ldnr_fail(LDNR_ETIMEDOUT);
++            return ldnr_connect_timed_out(l, fd, generation);
 +        }
 +        s = ldnr_socket_of(l, fd, generation);
 +        if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
@@ -6524,6 +6692,11 @@ index 0000000..beaf062
 +void ldnr_vnet_proxy_ack(ldnr *l, const ldnr_message *message) {
 +    ldnr_retired_sweep(l);
 +    pthread_mutex_lock(&l->vnet.mutex);
++    // Only a stream that is still opening takes the answer. A stream whose
++    // open already failed (its deadline passed, or the relay refused it)
++    // keeps its error and no longer carries the id: a late acceptance must
++    // not mark it connected after the guest was told the open timed out,
++    // and it finds nothing here to answer.
 +    ldnr_vsock *s = ldnr_stream_by_connection(l, message, 1, 0);
 +    if (s) {
 +        s->connecting = 0;
@@ -6774,6 +6947,19 @@ index 0000000..beaf062
 +    return result;
 +}
 +
++// Seconds and microseconds to milliseconds, saturated to the largest int
++// the option stores: the operands are widened and bounded before the
++// multiply, so a huge guest timeout clamps instead of overflowing signed
++// arithmetic. The callers reject negative fields first.
++static int ldnr_ms_saturate(int64_t sec, int64_t usec) {
++    // Above these bounds the sum can only exceed the cap: sec * 1000 and
++    // usec / 1000 then stay small enough that the add cannot overflow.
++    if (sec > INT32_MAX / 1000 || usec > (int64_t)INT32_MAX * 1000)
++        return INT32_MAX;
++    int64_t ms = sec * 1000 + usec / 1000;
++    return ms > INT32_MAX ? INT32_MAX : (int)ms;
++}
++
 +// Parses a timeout option into milliseconds. A zero timeout disables the
 +// timeout, the way BSD defines it: it is reported as the internal infinite
 +// value -1, so that only a genuinely positive value is stored. Returns -2
@@ -6784,15 +6970,14 @@ index 0000000..beaf062
 +        const int64_t *tv = value;
 +        if (tv[0] < 0 || tv[1] < 0) return -2;
 +        if (!tv[0] && !tv[1]) { *out = -1; return 0; }
-+        int64_t ms = tv[0] * 1000 + tv[1] / 1000;
-+        *out = ms > 0x7fffffff ? 0x7fffffff : (int)ms;
++        *out = ldnr_ms_saturate(tv[0], tv[1]);
 +        return 0;
 +    }
 +    if (size == 8) {
 +        const int32_t *tv = value;
 +        if (tv[0] < 0 || tv[1] < 0) return -2;
 +        if (!tv[0] && !tv[1]) { *out = -1; return 0; }
-+        *out = tv[0] * 1000 + tv[1] / 1000;
++        *out = ldnr_ms_saturate(tv[0], tv[1]);
 +        return 0;
 +    }
 +    if (size == 4) {
@@ -7131,10 +7316,10 @@ index 0000000..6b13662
 +const struct dm_profile *dm_profile(void);
 diff --git a/dm/host/ldnr/tests/t_glue.c b/dm/host/ldnr/tests/t_glue.c
 new file mode 100644
-index 0000000..a8baf83
+index 0000000..e6a3cfd
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_glue.c
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,662 @@
 +// Runtime test of the Apple glue. The host symbols the glue calls are
 +// stubbed here, so the test runs without the Apple SDK. It checks the
 +// result translation, the event binding identity, the hook selection in
@@ -7325,7 +7510,7 @@ index 0000000..a8baf83
 +}
 +
 +static const ldnr_transport glue_transport = {
-+    NULL, glue_connect, glue_recv, glue_send, glue_close, NULL, NULL,
++    NULL, glue_connect, glue_recv, glue_send, glue_close, NULL, NULL, NULL,
 +};
 +
 +// The runtime glue reads its transport through this hook instead of opening
@@ -7689,6 +7874,67 @@ index 0000000..a8baf83
 +    CHECK(g_glue.core == NULL);
 +}
 +
++// A guest timeout is a pair of 64-bit fields (nn::socket::TimeVal and the
++// older timeval). The multiply into milliseconds must not overflow signed
++// arithmetic: a huge value saturates, a negative one is EINVAL, and a NULL
++// one waits forever.
++static void test_timeval_conversion_is_overflow_safe(void)
++{
++    int64_t tv[2];
++
++    CHECK(lr_timeval_ms(NULL) == -1);
++    tv[0] = 0; tv[1] = 0;
++    CHECK(lr_timeval_ms(tv) == 0);
++    tv[0] = 1; tv[1] = 500 * 1000;
++    CHECK(lr_timeval_ms(tv) == 1500);
++    tv[0] = 0; tv[1] = 999;
++    CHECK(lr_timeval_ms(tv) == 0);
++    // The boundaries of the cap, where the multiply still fits.
++    tv[0] = 0; tv[1] = (int64_t)INT32_MAX * 1000;
++    CHECK(lr_timeval_ms(tv) == INT32_MAX);
++    tv[0] = INT32_MAX / 1000; tv[1] = 0;
++    CHECK(lr_timeval_ms(tv) == (INT32_MAX / 1000) * 1000);
++    tv[0] = INT32_MAX / 1000; tv[1] = 1000;
++    CHECK(lr_timeval_ms(tv) == (INT32_MAX / 1000) * 1000 + 1);
++    // Values whose product would leave int64_t: they saturate, not wrap.
++    tv[0] = INT64_MAX; tv[1] = 0;
++    CHECK(lr_timeval_ms(tv) == INT32_MAX);
++    tv[0] = INT64_MAX / 2; tv[1] = INT64_MAX;
++    CHECK(lr_timeval_ms(tv) == INT32_MAX);
++    tv[0] = 0; tv[1] = INT64_MAX;
++    CHECK(lr_timeval_ms(tv) == INT32_MAX);
++    tv[0] = (int64_t)INT32_MAX / 1000 + 1; tv[1] = 0;
++    CHECK(lr_timeval_ms(tv) == INT32_MAX);
++    // A negative field is an invalid argument, the way the socket options
++    // reject one, and never a wrapped timeout.
++    tv[0] = -1; tv[1] = 0;
++    CHECK(lr_timeval_ms(tv) == LR_TIMEVAL_INVALID);
++    tv[0] = 0; tv[1] = -1;
++    CHECK(lr_timeval_ms(tv) == LR_TIMEVAL_INVALID);
++    tv[0] = INT64_MIN; tv[1] = INT64_MIN;
++    CHECK(lr_timeval_ms(tv) == LR_TIMEVAL_INVALID);
++
++    // The same through select(): a negative timeout is refused with EINVAL
++    // before the core sees it, and a small one reaches the wait as it is.
++    // (A saturated timeout is not waited out here: like any large one it is
++    // a real wait, and the conversion itself is checked above.)
++    setenv("DM_LDNR_SERVER", "127.0.0.1:1", 1);
++    CHECK(lr_ldn_initialize() == RES_OK);
++    tv[0] = -1; tv[1] = 0;
++    CHECK(lr_select_new(0, NULL, NULL, NULL, tv) != RES_OK);
++    CHECK(ldnr_last_errno() == 22);   // EINVAL
++    tv[0] = 0; tv[1] = -1;
++    CHECK(lr_select_old(0, NULL, NULL, NULL, tv) != RES_OK);
++    CHECK(ldnr_last_errno() == 22);
++    tv[0] = INT64_MIN; tv[1] = 0;
++    CHECK(lr_select_new(0, NULL, NULL, NULL, tv) != RES_OK);
++    CHECK(ldnr_last_errno() == 22);
++    tv[0] = 0; tv[1] = 50 * 1000;
++    CHECK(lr_select_new(0, NULL, NULL, NULL, tv) == RES_OK);
++    lr_ldn_finalize();
++    CHECK(g_glue.core == NULL);
++}
++
 +// A Connect whose security configuration the wire refuses must fail: the
 +// frame never goes out, and the caller does not see a success.
 +static void test_connect_with_an_unencodable_passphrase(void)
@@ -7731,6 +7977,7 @@ index 0000000..a8baf83
 +    test_scan_alloc_failure();
 +    test_connect_with_an_unencodable_passphrase();
 +    test_finalize_cancels_a_blocked_call();
++    test_timeval_conversion_is_overflow_safe();
 +    test_double_finalize();
 +    puts("PASS");
 +    return 0;
@@ -9394,10 +9641,10 @@ index 0000000..862a9ac
 +}
 diff --git a/dm/host/ldnr/tests/t_state.c b/dm/host/ldnr/tests/t_state.c
 new file mode 100644
-index 0000000..75c879a
+index 0000000..fd2d067
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_state.c
-@@ -0,0 +1,1652 @@
+@@ -0,0 +1,1810 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
@@ -9899,6 +10146,44 @@ index 0000000..75c879a
 +    return count;
 +}
 +
++typedef struct {
++    ldnr *core;
++    int fd;
++    ldnr_sockaddr destination;
++    int result;
++    volatile int done;
++} test_pending_open;
++
++static void *test_pending_open_thread(void *argument)
++{
++    test_pending_open *open = argument;
++    open->result = ldnr_connect_socket(open->core, open->fd, &open->destination, -1);
++    __atomic_store_n(&open->done, 1, __ATOMIC_RELEASE);
++    return NULL;
++}
++
++// An open still waits for its answer: the blocking connect runs on a thread
++// of its own, and the caller gets the thread back once the entry is in the
++// correlation table. This is the state the relay's timeout finds a stream
++// in. The wait is bounded, so a failure of the entry to appear cannot hang
++// the test.
++static void test_start_pending_open(test_pending_open *open, ldnr *l, int fd,
++                                    const ldnr_sockaddr *destination)
++{
++    memset(open, 0, sizeof *open);
++    open->core = l;
++    open->fd = fd;
++    open->destination = *destination;
++    pthread_t thread;
++    CHECK(pthread_create(&thread, NULL, test_pending_open_thread, open) == 0);
++    pthread_detach(thread);
++    for (int i = 0; i < 200 && test_proxy_open_count(l) == 0; i++) {
++        struct timespec delay = {0, 5 * 1000 * 1000};
++        nanosleep(&delay, NULL);
++    }
++    CHECK(test_proxy_open_count(l) == 1);
++}
++
 +// The connection id of the single open that waits for its answer. The test
 +// drives an inbound PROXY_DISCONNECT with this id, the way the relay does.
 +static uint32_t test_proxy_open_connection_id(ldnr *l)
@@ -9948,19 +10233,26 @@ index 0000000..75c879a
 +    return api;
 +}
 +
-+static void test_push_disconnect(test_transport *transport, uint32_t reason)
++static void test_push_disconnect_session(test_transport *transport,
++                                         const uint8_t *session_id, uint32_t reason)
 +{
 +    test_writer writer;
 +    memset(&writer, 0, sizeof(writer));
 +    writer.size = 16;
-+    test_u64(&writer, 0);
-+    test_u64(&writer, 0);
++    test_put(&writer, session_id, 16);
 +    test_u32(&writer, reason);
 +    test_finish(&writer, 0x21, 0);
 +    pthread_mutex_lock(&transport->mutex);
 +    CHECK(transport->connected);
 +    test_enqueue_locked(transport, writer.bytes, writer.size);
 +    pthread_mutex_unlock(&transport->mutex);
++}
++
++// A teardown that names no session applies to whatever room the guest is in.
++static void test_push_disconnect(test_transport *transport, uint32_t reason)
++{
++    static const uint8_t unnamed[16];
++    test_push_disconnect_session(transport, unnamed, reason);
 +}
 +
 +// The relay closes a proxied stream from its side: the server connect
@@ -10573,6 +10865,8 @@ index 0000000..75c879a
 +    ldnr_message message;
 +    ldnr *context = NULL;
 +    int socket, before, after;
++    int32_t option = 0;
++    uint32_t option_size = sizeof option;
 +
 +    // The relay never answers the opens: they wait for their deadline.
 +    transport->silent_proxy = 1;
@@ -10596,11 +10890,19 @@ index 0000000..75c879a
 +    memset(&destination, 0, sizeof(destination));
 +    destination.address = ldnr_ipv4(192, 168, 44, 10);
 +    destination.port = ldnr_htons(40002);
++    before = test_sent_count(transport);
 +    CHECK(ldnr_connect_socket(context, socket, &destination, 50) == -1);
 +    CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
-+    CHECK(test_proxy_open_count(context) == 1);
++    // The pending stream is retired at the deadline: the open that goes out
++    // and the reset that follows it are the two frames of the attempt.
++    CHECK(test_sent_count(transport) == before + 2);
++    CHECK(test_proxy_open_count(context) == 0);
 +
-+    // The socket is closed: the open is over and its entry is released.
++    // The socket stays failed: a late acceptance cannot resurrect it.
++    CHECK(ldnr_getsockopt(context, socket, 0, 0x1007, &option, &option_size) == 0);
++    CHECK(option == TEST_ETIMEDOUT);
++
++    // The socket is closed: there is no open left to release.
 +    CHECK(ldnr_close_socket(context, socket) == 0);
 +    CHECK(test_proxy_open_count(context) == 0);
 +
@@ -10763,19 +11065,29 @@ index 0000000..75c879a
 +    for (int i = 0; i < 100; i++) {
 +        socket = ldnr_socket(context, 2, 1, 6);
 +        CHECK(socket >= 0);
-+        // The open waits for its answer; the relay stays silent, so the
-+        // socket times out with the entry still in the table.
-+        CHECK(ldnr_connect_socket(context, socket, &destination, 20) == -1);
-+        CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++        // The open waits for its answer: it runs on a thread of its own, so
++        // it is still waiting here when the relay's answer arrives.
++        test_pending_open pending;
++        test_start_pending_open(&pending, context, socket, &destination);
 +        CHECK(test_proxy_open_count(context) == 1);
 +        // The relay's connect timeout arrives as an inbound PROXY_DISCONNECT
 +        // that names this stream: it releases the correlation entry.
 +        test_push_proxy_disconnect(transport, test_proxy_open_connection_id(context), 1, 3);
 +        // Give the receive thread a moment to deliver the reset.
-+        struct timespec delay = {0, 20 * 1000 * 1000};
-+        nanosleep(&delay, NULL);
++        for (int n = 0; n < 200 && test_proxy_open_count(context); n++) {
++            struct timespec delay = {0, 5 * 1000 * 1000};
++            nanosleep(&delay, NULL);
++        }
 +        CHECK(test_proxy_open_count(context) == 0);
++        // A close of a descriptor whose open is still waiting ends that
++        // wait; the entry it held is gone either way.
 +        CHECK(ldnr_close_socket(context, socket) == 0);
++        for (int n = 0; n < 200 && !__atomic_load_n(&pending.done, __ATOMIC_ACQUIRE); n++) {
++            struct timespec delay = {0, 5 * 1000 * 1000};
++            nanosleep(&delay, NULL);
++        }
++        CHECK(__atomic_load_n(&pending.done, __ATOMIC_ACQUIRE));
++        CHECK(pending.result == -1);
 +    }
 +    CHECK(test_proxy_open_count(context) == 0);
 +
@@ -10786,14 +11098,22 @@ index 0000000..75c879a
 +        CHECK(ldnr_create_network(context, &network, &security, &user, NULL, NULL, 0) == 0);
 +        socket = ldnr_socket(context, 2, 1, 6);
 +        CHECK(socket >= 0);
-+        CHECK(ldnr_connect_socket(context, socket, &destination, 20) == -1);
-+        CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++        // An open that is still waiting when the room is left.
++        test_pending_open pending;
++        test_start_pending_open(&pending, context, socket, &destination);
 +        CHECK(test_proxy_open_count(context) == 1);
 +        // Leaving the room clears the membership and the correlation table;
-+        // the socket is closed first, the way the application would.
++        // the socket is closed first, the way the application would (its
++        // open ends with the network it belonged to).
 +        CHECK(ldnr_close_socket(context, socket) == 0);
 +        CHECK(ldnr_destroy_network(context) == 0);
 +        CHECK(test_proxy_open_count(context) == 0);
++        for (int n = 0; n < 200 && !__atomic_load_n(&pending.done, __ATOMIC_ACQUIRE); n++) {
++            struct timespec delay = {0, 5 * 1000 * 1000};
++            nanosleep(&delay, NULL);
++        }
++        CHECK(__atomic_load_n(&pending.done, __ATOMIC_ACQUIRE));
++        CHECK(pending.result == -1);
 +    }
 +    CHECK(test_proxy_open_count(context) == 0);
 +    ldnr_destroy(context);
@@ -10986,8 +11306,9 @@ index 0000000..75c879a
 +        expected_changes++;
 +        socket = ldnr_socket(context, 2, 1, 6);
 +        CHECK(socket >= 0);
-+        CHECK(ldnr_connect_socket(context, socket, &destination, 20) == -1);
-+        CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++        // The open is still waiting when the kick arrives.
++        test_pending_open pending;
++        test_start_pending_open(&pending, context, socket, &destination);
 +        CHECK(test_proxy_open_count(context) == 1);
 +        // The relay kicks the station: the membership is lost without the
 +        // guest asking, and the opens it held are released with it.
@@ -11000,6 +11321,12 @@ index 0000000..75c879a
 +        // are gone either way, so nothing blocks the opens of the next room.
 +        CHECK(ldnr_close_socket(context, socket) == 0);
 +        CHECK(test_proxy_open_count(context) == 0);
++        for (int n = 0; n < 200 && !__atomic_load_n(&pending.done, __ATOMIC_ACQUIRE); n++) {
++            struct timespec delay = {0, 5 * 1000 * 1000};
++            nanosleep(&delay, NULL);
++        }
++        CHECK(__atomic_load_n(&pending.done, __ATOMIC_ACQUIRE));
++        CHECK(pending.result == -1);
 +    }
 +
 +    // A host that loses its own room the same way: the created membership
@@ -11014,8 +11341,8 @@ index 0000000..75c879a
 +    expected_changes++;
 +    socket = ldnr_socket(context, 2, 1, 6);
 +    CHECK(socket >= 0);
-+    CHECK(ldnr_connect_socket(context, socket, &destination, 20) == -1);
-+    CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++    test_pending_open pending;
++    test_start_pending_open(&pending, context, socket, &destination);
 +    CHECK(test_proxy_open_count(context) == 1);
 +    test_push_disconnect(transport, 4);
 +    test_wait_for_changes(&changes, expected_changes + 1);
@@ -11023,6 +11350,83 @@ index 0000000..75c879a
 +    CHECK(test_proxy_open_count(context) == 0);
 +    CHECK(ldnr_close_socket(context, socket) == 0);
 +    CHECK(test_proxy_open_count(context) == 0);
++    for (int n = 0; n < 200 && !__atomic_load_n(&pending.done, __ATOMIC_ACQUIRE); n++) {
++        struct timespec delay = {0, 5 * 1000 * 1000};
++        nanosleep(&delay, NULL);
++    }
++    CHECK(__atomic_load_n(&pending.done, __ATOMIC_ACQUIRE));
++    CHECK(pending.result == -1);
++
++    ldnr_destroy(context);
++    free((void *)api);
++    pthread_mutex_destroy(&changes.mutex);
++    pthread_cond_destroy(&changes.condition);
++}
++
++// A teardown names the session it ends (PROTOCOL.md §3.13). One for another
++// room must leave the current membership alone; one for the current room
++// ends it. A teardown that names no session applies to whatever room the
++// guest is in, which is what the lifecycle test exercises.
++static void test_teardown_matches_the_session(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_changes changes;
++    ldnr_config config;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    ldnr_network_info info = test_network_info();
++    ldnr_network_info actual;
++    ldnr_security_parameter parameter;
++    ldnr *context = NULL;
++    int expected_changes;
++
++    memset(&changes, 0, sizeof(changes));
++    pthread_mutex_init(&changes.mutex, NULL);
++    pthread_cond_init(&changes.condition, NULL);
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.callback_ctx = &changes;
++    config.state_changed = test_state_changed;
++    config.server = "relay.test:11470";
++    config.connect_timeout_ms = 200;
++    memset(&security, 0, sizeof(security));
++    memset(&user, 0, sizeof(user));
++    memcpy(user.user_name, "guest", 5);
++
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_station(context) == 0);
++    expected_changes = test_change_count(&changes);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0) == 0);
++    CHECK(ldnr_get_state(context) == TEST_STATE_STATION_CONNECTED);
++    CHECK(test_change_count(&changes) == ++expected_changes);
++    CHECK(ldnr_get_security_parameter(context, &parameter) == 0);
++    CHECK(memcmp(parameter.session_id, info.network_id.session_id, 16) == 0);
++
++    // A teardown of another room is not this membership's: the state, the
++    // room and its security parameter stay as they are.
++    uint8_t other[16];
++    memset(other, 0, sizeof other);
++    other[0] = 0x11;
++    other[15] = 0x99;
++    test_push_disconnect_session(transport, other, 47);
++    struct timespec delay = {0, 100 * 1000 * 1000};
++    nanosleep(&delay, NULL);
++    CHECK(ldnr_get_state(context) == TEST_STATE_STATION_CONNECTED);
++    CHECK(test_change_count(&changes) == expected_changes);
++    CHECK(ldnr_get_network_info(context, &actual) == 0);
++    CHECK(memcmp(actual.network_id.session_id, info.network_id.session_id, 16) == 0);
++    CHECK(ldnr_get_security_parameter(context, &parameter) == 0);
++    CHECK(memcmp(parameter.session_id, info.network_id.session_id, 16) == 0);
++
++    // The teardown of the current room ends it, with the reason it carries.
++    test_push_disconnect_session(transport, info.network_id.session_id, 48);
++    test_wait_for_changes(&changes, expected_changes + 1);
++    expected_changes++;
++    CHECK(ldnr_get_state(context) == TEST_STATE_STATION_OPEN);
++    CHECK(ldnr_get_disconnect_reason(context) == 48);
++    CHECK(ldnr_get_network_info(context, &actual) == -1);
 +
 +    ldnr_destroy(context);
 +    free((void *)api);
@@ -11047,15 +11451,16 @@ index 0000000..75c879a
 +    test_inbound_proxy_disconnect_releases_correlation();
 +    test_connect_publishes_the_requested_version();
 +    test_kick_releases_pending_opens();
++    test_teardown_matches_the_session();
 +    puts("PASS");
 +    return 0;
 +}
 diff --git a/dm/host/ldnr/tests/t_tcp.c b/dm/host/ldnr/tests/t_tcp.c
 new file mode 100644
-index 0000000..583b703
+index 0000000..20016c4
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_tcp.c
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,556 @@
 +// Regression tests for the TCP transport: a writer pinned to one connection
 +// must not continue on the connection that replaced it, and a write that
 +// fails part way must leave the framing stream unusable.
@@ -11202,6 +11607,125 @@ index 0000000..583b703
 +    free((void *)transport);
 +}
 +
++// The frame is read on a thread of its own: the test stalls the relay while
++// the read waits, so a read that never ends is observable as a deadline.
++typedef struct {
++    const ldnr_transport *transport;
++    uint8_t frame[4096];
++    ssize_t result;
++    int done;
++} test_reader;
++
++static void *test_read_thread(void *argument)
++{
++    test_reader *reader = argument;
++    reader->result = reader->transport->recv(reader->transport->ctx, reader->frame,
++                                             sizeof reader->frame);
++    __atomic_store_n(&reader->done, 1, __ATOMIC_RELEASE);
++    return NULL;
++}
++
++static int64_t test_now_ms(void)
++{
++    struct timespec now;
++    CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
++    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
++}
++
++// A relay that sends part of a frame and stalls must not hold the receive
++// thread forever: the incomplete frame has a deadline, and the transport
++// dies at it instead of waiting for bytes that never come.
++static void test_partial_frame_stalls_are_bounded(void)
++{
++    // A header cut short, and a payload cut short after a complete header:
++    // both are one frame that never completed.
++    static const size_t header_bytes[2] = {4, 6};
++    for (int round = 0; round < 2; round++) {
++        const ldnr_transport *transport = ldnr_tcp_transport_create();
++        int pair[2];
++        uint8_t header[16] = {'L', 'D', 'N', 'R', 1, 0x03};
++        uint8_t partial[64];
++        size_t partial_size = 0;
++        test_reader reader;
++
++        CHECK(transport != NULL);
++        test_pair(pair);
++        ldnr_tcp_test_replace(transport, pair[0]);
++        ldnr_tcp_test_set_frame_timeout(transport, 200);
++        memset(partial, 0, sizeof partial);
++        memcpy(partial, header, 6);
++        if (round == 0) {
++            partial_size = header_bytes[0];
++        } else {
++            // A complete header that announces a payload, and the first
++            // bytes of that payload: the rest never arrives.
++            header[8] = 8;
++            memcpy(partial, header, 16);
++            partial_size = 16 + header_bytes[1];
++            memset(partial + 16, 0x5a, header_bytes[1]);
++        }
++        CHECK(send(pair[1], partial, partial_size, 0) == (ssize_t)partial_size);
++
++        memset(&reader, 0, sizeof reader);
++        reader.transport = transport;
++        pthread_t thread;
++        int64_t started = test_now_ms();
++        CHECK(pthread_create(&thread, NULL, test_read_thread, &reader) == 0);
++        for (int i = 0; i < 400 && !__atomic_load_n(&reader.done, __ATOMIC_ACQUIRE); i++) {
++            struct timespec delay = {0, 5 * 1000 * 1000};
++            nanosleep(&delay, NULL);
++        }
++        CHECK(__atomic_load_n(&reader.done, __ATOMIC_ACQUIRE));
++        int64_t elapsed = test_now_ms() - started;
++        // The read failed at its deadline, not later and not before it.
++        CHECK(reader.result == -1);
++        CHECK(elapsed >= 150);
++        CHECK(elapsed < 2000);
++        CHECK(pthread_join(thread, NULL) == 0);
++        // The connection is dead: another frame is refused outright.
++        CHECK(transport->send(transport->ctx, "LDNR", 4) == -1);
++        close(pair[1]);
++        transport->destroy(transport->ctx);
++        free((void *)transport);
++    }
++}
++
++// A relay that went silent after the handshake is dead even though its
++// socket is healthy: the keepalive interval it announced bounds the wait
++// for its next byte.
++static void test_silent_relay_is_bounded_by_the_keepalive(void)
++{
++    const ldnr_transport *transport = ldnr_tcp_transport_create();
++    int pair[2];
++    test_reader reader;
++
++    CHECK(transport != NULL);
++    test_pair(pair);
++    ldnr_tcp_test_replace(transport, pair[0]);
++    // The relay announced a short interval and then sent nothing at all.
++    CHECK(transport->set_keepalive != NULL);
++    transport->set_keepalive(transport->ctx, 100);
++    memset(&reader, 0, sizeof reader);
++    reader.transport = transport;
++    pthread_t thread;
++    int64_t started = test_now_ms();
++    CHECK(pthread_create(&thread, NULL, test_read_thread, &reader) == 0);
++    for (int i = 0; i < 600 && !__atomic_load_n(&reader.done, __ATOMIC_ACQUIRE); i++) {
++        struct timespec delay = {0, 5 * 1000 * 1000};
++        nanosleep(&delay, NULL);
++    }
++    CHECK(__atomic_load_n(&reader.done, __ATOMIC_ACQUIRE));
++    int64_t elapsed = test_now_ms() - started;
++    // Three intervals of silence, and not much more than that.
++    CHECK(reader.result == -1);
++    CHECK(elapsed >= 250);
++    CHECK(elapsed < 3000);
++    CHECK(pthread_join(thread, NULL) == 0);
++    close(pair[1]);
++    transport->destroy(transport->ctx);
++    free((void *)transport);
++}
++
 +// A writer that waits for the writer's lock keeps the connection it was
 +// made for: the connection that replaces it in the meantime must not carry
 +// the frame of the waiting writer.
@@ -11260,13 +11784,6 @@ index 0000000..583b703
 +{
 +    (void)ctx;
 +    return 1;
-+}
-+
-+static int64_t test_now_ms(void)
-+{
-+    struct timespec now;
-+    clock_gettime(CLOCK_MONOTONIC, &now);
-+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 +}
 +
 +// A local listener whose accept queue is full: further SYNs are dropped, so
@@ -11492,6 +12009,8 @@ index 0000000..583b703
 +    test_writer_does_not_follow_a_replacement();
 +    test_queued_writer_does_not_follow_a_replacement();
 +    test_partial_write_breaks_the_stream();
++    test_partial_frame_stalls_are_bounded();
++    test_silent_relay_is_bounded_by_the_keepalive();
 +    test_oversized_frame_ends_the_connection();
 +    test_connect_is_bounded_and_cancellable();
 +    test_close_during_a_connect_keeps_the_descriptor();
@@ -11500,16 +12019,19 @@ index 0000000..583b703
 +}
 diff --git a/dm/host/ldnr/tests/t_vnet.c b/dm/host/ldnr/tests/t_vnet.c
 new file mode 100644
-index 0000000..508c423
+index 0000000..e6a2aef
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_vnet.c
-@@ -0,0 +1,3328 @@
+@@ -0,0 +1,3640 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
 +#include "../ldnr_protocol.h"
 +#include "../ldnr_transport.h"
 +#include "../ldnr_vnet.h"
++// The private state of the socket layer: the test reads the stream of an
++// open that is still waiting for its answer.
++#include "../ldnr_internal.h"
 +
 +#include <errno.h>
 +#include <pthread.h>
@@ -11594,6 +12116,9 @@ index 0000000..508c423
 +    int delay_disconnect;       // park the Nth PROXY_DISCONNECT before it is recorded
 +    int disconnect_delayed;     // that close is parked
 +    int release_disconnect;     // let the parked close through
++    uint32_t keepalive_ms;      // the interval the handshake announces
++    uint32_t transport_keepalive; // what the core passed to set_keepalive
++    int silent;                 // recv reports the relay gone, like a dead one
 +} test_transport;
 +
 +typedef struct {
@@ -11784,7 +12309,9 @@ index 0000000..508c423
 +        test_u64(&writer, 0);
 +        test_u16(&writer, 0);
 +        test_u32(&writer, transport->max_frame);
-+        test_u32(&writer, 0);
++        // The interval of the relay's own pings; zero leaves the transport
++        // on its default, like a relay that announces none.
++        test_u32(&writer, transport->keepalive_ms);
 +        test_finish(&writer, 0x02, (uint32_t)request->request_id);
 +        break;
 +    case LDNR_MSG_CONNECT_ACK:
@@ -11836,9 +12363,11 @@ index 0000000..508c423
 +    size_t size;
 +
 +    pthread_mutex_lock(&transport->mutex);
-+    while (transport->connected && transport->count == 0)
++    while (transport->connected && transport->count == 0 && !transport->silent)
 +        pthread_cond_wait(&transport->condition, &transport->mutex);
-+    if (!transport->connected) {
++    // A relay that went silent is gone: the transport reports the end of
++    // the stream the way a dead connection does.
++    if (!transport->connected || transport->silent) {
 +        pthread_mutex_unlock(&transport->mutex);
 +        return 0;
 +    }
@@ -12063,6 +12592,16 @@ index 0000000..508c423
 +    free(transport);
 +}
 +
++// The transport learns the interval of the relay's pings from the handshake:
++// a transport that bounds its own reads uses it to notice a silent relay.
++static void test_set_keepalive(void *ctx, uint32_t interval_ms)
++{
++    test_transport *transport = ctx;
++    pthread_mutex_lock(&transport->mutex);
++    transport->transport_keepalive = interval_ms;
++    pthread_mutex_unlock(&transport->mutex);
++}
++
 +static const ldnr_transport *test_transport_create(test_transport **out)
 +{
 +    test_transport *transport = calloc(1, sizeof(*transport));
@@ -12077,6 +12616,7 @@ index 0000000..508c423
 +    api->send = test_send;
 +    api->close = test_close;
 +    api->destroy = test_transport_destroy;
++    api->set_keepalive = test_set_keepalive;
 +    *out = transport;
 +    return api;
 +}
@@ -14379,6 +14919,75 @@ index 0000000..508c423
 +    test_destroy_context(context, api);
 +}
 +
++// A frame built by hand for a message the fake transport does not push by
++// itself: the late acceptance of a timed-out open.
++static void test_push_proxy_ack_frame(test_transport *transport,
++                                     uint32_t connection_id, uint32_t address,
++                                     int accepted)
++{
++    test_writer writer;
++    memset(&writer, 0, sizeof(writer));
++    writer.size = 16;
++    test_u32(&writer, connection_id);
++    test_u32(&writer, address);
++    test_u8(&writer, accepted ? 1 : 0);
++    test_finish(&writer, 0x32, 0);
++    test_push_frame(transport, writer.bytes, writer.size);
++}
++
++// A blocked connect runs on its own thread: the test drives the answer of
++// the relay while the guest is still inside the call.
++typedef struct {
++    ldnr *core;
++    int fd;
++    ldnr_sockaddr destination;
++    int result;
++    int done;
++} test_blocked_connect;
++
++static void *test_blocked_connect_thread(void *argument)
++{
++    test_blocked_connect *connect = argument;
++    // -2 makes the open take the socket's own SO_SNDTIMEO clock.
++    connect->result = ldnr_connect_socket(connect->core, connect->fd,
++                                          &connect->destination, -2);
++    __atomic_store_n(&connect->done, 1, __ATOMIC_RELEASE);
++    return NULL;
++}
++
++// The open that is still waiting, and its id: the answer of the relay is
++// matched against both.
++static int test_pending_stream(ldnr *l, ldnr_vsock *out)
++{
++    int found = 0;
++    pthread_mutex_lock(&l->vnet.mutex);
++    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
++        ldnr_vsock *s = &l->vnet.sockets[i];
++        if (!s->used || s->type != 1 || !s->connecting) continue;
++        *out = *s;
++        found = 1;
++        break;
++    }
++    pthread_mutex_unlock(&l->vnet.mutex);
++    return found;
++}
++
++// The socket of one descriptor, with the id it carries.
++static int test_stream_state(ldnr *l, int fd, ldnr_vsock *out)
++{
++    int found = 0;
++    pthread_mutex_lock(&l->vnet.mutex);
++    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
++        ldnr_vsock *s = &l->vnet.sockets[i];
++        if (!s->used || s->fd != fd) continue;
++        *out = *s;
++        found = 1;
++        break;
++    }
++    pthread_mutex_unlock(&l->vnet.mutex);
++    return found;
++}
++
 +// A blocking connect waits on the clock of SO_SNDTIMEO: the receive
 +// timeout belongs to the receive calls and must not end the open early.
 +static void test_connect_uses_the_send_timeout(void)
@@ -14435,6 +15044,159 @@ index 0000000..508c423
 +    test_destroy_context(context, api);
 +}
 +
++// A guest timeout arrives as a 64-bit pair or as the older 32-bit one. The
++// conversion into milliseconds saturates instead of overflowing signed
++// arithmetic, and a negative field is refused as EINVAL, the way the socket
++// layer rejects any other invalid argument.
++static void test_socket_timeout_conversion_is_overflow_safe(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    ldnr *context = test_create_context(api, NULL);
++    ldnr_vsock state;
++    int32_t narrow[2];
++    int64_t huge[2];
++    int fd;
++
++    CHECK(ldnr_initialize(context) == 0);
++    fd = ldnr_socket(context, 2, 1, 6);
++    CHECK(fd >= 0);
++
++    // The 64-bit pair: a huge field saturates instead of wrapping.
++    huge[0] = INT64_MAX;
++    huge[1] = INT64_MAX;
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1005, huge, sizeof huge) == 0);
++    CHECK(test_stream_state(context, fd, &state));
++    CHECK(state.send_timeout_ms == INT32_MAX);
++    huge[0] = INT64_MAX / 2;
++    huge[1] = 0;
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1006, huge, sizeof huge) == 0);
++    CHECK(test_stream_state(context, fd, &state));
++    CHECK(state.recv_timeout_ms == INT32_MAX);
++    huge[0] = 0;
++    huge[1] = INT64_MAX;
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1005, huge, sizeof huge) == 0);
++    CHECK(test_stream_state(context, fd, &state));
++    CHECK(state.send_timeout_ms == INT32_MAX);
++
++    // The 32-bit pair of the older guest: the fields are widened before the
++    // multiply, so a large one saturates too.
++    narrow[0] = INT32_MAX;
++    narrow[1] = INT32_MAX;
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1006, narrow, sizeof narrow) == 0);
++    CHECK(test_stream_state(context, fd, &state));
++    CHECK(state.recv_timeout_ms == INT32_MAX);
++
++    // Negative fields are invalid, never a wrapped timeout.
++    int32_t negative[2] = {-1, 0};
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1005, negative, sizeof negative) == -1);
++    CHECK(ldnr_last_errno() == TEST_EINVAL);
++    negative[0] = 0;
++    negative[1] = -1;
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1006, negative, sizeof negative) == -1);
++    CHECK(ldnr_last_errno() == TEST_EINVAL);
++    int64_t negative_wide[2] = {0, -1};
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1005, negative_wide, sizeof negative_wide) == -1);
++    CHECK(ldnr_last_errno() == TEST_EINVAL);
++
++    // A zero timeout still disables the timeout (the internal infinite).
++    narrow[0] = 0;
++    narrow[1] = 0;
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1005, narrow, sizeof narrow) == 0);
++    CHECK(test_stream_state(context, fd, &state));
++    CHECK(state.send_timeout_ms == -1);
++
++    CHECK(ldnr_close_socket(context, fd) == 0);
++    test_destroy_context(context, api);
++}
++
++// A blocking connect that runs out of its send timeout retires the pending
++// stream: the socket stays failed, the id of the open is released, and the
++// relay is told with a reset. A late acceptance for that id is ignored.
++static void test_connect_timeout_retires_the_open(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    ldnr_vsock pending;
++    ldnr_vsock after;
++    ldnr_message sent;
++    uint32_t connection_id;
++    uint64_t generation;
++    unsigned disconnects;
++    int32_t option;
++    int client;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    // The relay never answers the open: only the socket timeout ends it.
++    transport->auto_proxy_ack = 0;
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    // The send timeout is the clock of the open (BSD applies SO_SNDTIMEO
++    // to connect()); it is in place before the open starts.
++    option = 150;
++    CHECK(ldnr_setsockopt(context, client, 0, 0x1005, &option, sizeof option) == 0);
++    test_blocked_connect blocked;
++    memset(&blocked, 0, sizeof blocked);
++    blocked.core = context;
++    blocked.fd = client;
++    blocked.destination = peer;
++    pthread_t thread;
++    CHECK(pthread_create(&thread, NULL, test_blocked_connect_thread, &blocked) == 0);
++    // The open reaches the relay: its id is the one the relay would answer.
++    for (int i = 0; i < 400 && !__atomic_load_n(&blocked.done, __ATOMIC_ACQUIRE); i++) {
++        if (test_pending_stream(context, &pending)) break;
++        test_sleep_ms(5);
++    }
++    CHECK(test_pending_stream(context, &pending));
++    connection_id = (uint32_t)pending.connection_id;
++    generation = pending.generation;
++    CHECK(connection_id != 0);
++    // The open ends on the send clock: the relay stayed silent.
++    for (int i = 0; i < 400 && !__atomic_load_n(&blocked.done, __ATOMIC_ACQUIRE); i++)
++        test_sleep_ms(5);
++    CHECK(__atomic_load_n(&blocked.done, __ATOMIC_ACQUIRE));
++    CHECK(blocked.result == -1);
++    CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++    CHECK(pthread_join(thread, NULL) == 0);
++
++    // The stream is retired: it is no longer opening, it keeps no id, and
++    // the reset for it went out.
++    CHECK(test_stream_state(context, client, &after));
++    CHECK(after.generation == generation);
++    CHECK(!after.connecting);
++    CHECK(after.connect_error == TEST_ETIMEDOUT);
++    CHECK(!after.connected);
++    CHECK(after.connection_id == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.proxy.connection_id == connection_id);
++    CHECK(sent.status == 1);   // reset: the stream is reaped at both ends
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++
++    // A late acceptance of the retired open changes nothing: the socket
++    // stays failed and no second stream frame goes out.
++    test_push_proxy_ack_frame(transport, connection_id, peer.address, 1);
++    test_sleep_ms(50);
++    CHECK(test_stream_state(context, client, &after));
++    CHECK(!after.connected);
++    CHECK(!after.connecting);
++    CHECK(after.connect_error == TEST_ETIMEDOUT);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects);
++    // No data of a stream whose open failed ever leaves the host.
++    CHECK(ldnr_send(context, client, "x", 1, 0) == -1);
++
++    CHECK(ldnr_close_socket(context, client) == 0);
++    CHECK(atomic_load(&waits.entered) == atomic_load(&waits.exited));
++    test_destroy_context(context, api);
++}
++
 +typedef struct {
 +    ldnr *context;
 +    int fd;
@@ -14467,6 +15229,72 @@ index 0000000..508c423
 +// A datagram that was prepared for the room must never reach the room that
 +// replaces it: the membership transition and the in-flight datagram are
 +// serialized, so the wire sees it either before the leave or not at all.
++// The transport of the test hands its frames to the core, but it can also
++// say that the relay went silent after the handshake: the core then loses
++// the membership, and every socket waiter of it fails instead of waiting
++// for data that can no longer arrive. The keepalive interval the relay
++// announced reaches the transport, which is where the silence is detected.
++static void test_silent_relay_ends_the_membership(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr_config config;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    ldnr_network_info info = test_network_info();
++    ldnr *context = NULL;
++    ldnr_sockaddr address;
++    char byte = 'x';
++    int client;
++
++    // The relay announces a short keepalive, and then goes silent.
++    transport->keepalive_ms = 120;
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_station(context) == 0);
++    memset(&security, 0, sizeof security);
++    memset(&user, 0, sizeof user);
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0) == 0);
++    // The interval of the handshake reached the transport.
++    pthread_mutex_lock(&transport->mutex);
++    CHECK(transport->transport_keepalive == 120);
++    pthread_mutex_unlock(&transport->mutex);
++
++    // A socket of the room waits for datagrams that the silent relay can no
++    // longer deliver.
++    client = ldnr_socket(context, 2, 2, 17);
++    CHECK(client >= 0);
++    address.address = ldnr_ipv4(192, 168, 44, 10);
++    address.port = ldnr_htons(TEST_UDP_PORT);
++    CHECK(ldnr_bind(context, client, &address) == 0);
++
++    // The relay falls silent. The receive thread of the core sees the end of
++    // the stream and retires the membership; the waiters fail with it.
++    pthread_mutex_lock(&transport->mutex);
++    transport->silent = 1;
++    pthread_cond_broadcast(&transport->condition);
++    pthread_mutex_unlock(&transport->mutex);
++
++    // The receive thread of the core learns that the relay is gone at once:
++    // the membership is retired without a wait for a deadline.
++    for (int i = 0; i < 400 && ldnr_get_network_info(context, &info) == 0; i++)
++        test_sleep_ms(5);
++    CHECK(ldnr_get_network_info(context, &info) == -1);
++    // The socket no longer waits for data that cannot arrive: it reports the
++    // lost membership instead.
++    CHECK(ldnr_recvfrom(context, client, &byte, 1, 0, NULL, 500) == -1);
++    CHECK(ldnr_last_errno() == TEST_ENETDOWN);
++
++    CHECK(ldnr_close_socket(context, client) == 0);
++    ldnr_destroy(context);
++    free((void *)api);
++}
++
 +static void test_udp_never_reaches_the_new_room(void)
 +{
 +    test_transport *transport;
@@ -14827,7 +15655,10 @@ index 0000000..508c423
 +    test_close_is_fin_then_linger_reset();
 +    test_zero_socket_timeout_disables();
 +    test_msg_dontwait_is_per_call();
++    test_socket_timeout_conversion_is_overflow_safe();
 +    test_connect_uses_the_send_timeout();
++    test_connect_timeout_retires_the_open();
++    test_silent_relay_ends_the_membership();
 +    test_empty_select_waits_for_deadline();
 +    puts("PASS");
 +    return 0;
