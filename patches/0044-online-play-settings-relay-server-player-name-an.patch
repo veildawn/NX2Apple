@@ -1,0 +1,2402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: veildawn <40253459+veildawn@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 17:43:49 +0800
+Subject: [PATCH] Online play settings: relay server, player name and room
+ password in the game launchers
+
+The LDN relay client reads only DM_LDNR* environment variables, which a
+player cannot set on iPhone and should not have to set on Mac. The iOS
+launcher and the Mac settings window gain an Online play section
+(docs/LDN-SETTINGS.md): a toggle per game, saved servers with live
+address validation, a connection test (HELLO, HELLO_ACK, one PING timed),
+the player name within the 32-byte native field, an optional room
+password with explicit consent for the plaintext transport, and Copy and
+Paste invite (an nx2apple-ldn://join link). Play writes the variables the
+host already reads, and a variable set by an env file or the launch
+environment wins. Off by default: nothing is set and the host is unchanged.
+
+OnlinePlay.swift is Foundation only, so its regression check
+(dm/ios/tests/test_online_play.py) runs on macOS and on Linux with a
+Swift toolchain, including a fake relay on loopback.
+
+Upstream-Status: pending
+Reason: In-app settings for the LDN relay client (fork feature, depends on 0043)
+Issue: veildawn/NX2Apple (owner request, in-app online play settings for the LDN relay)
+
+---
+ dm/ios/Sources/Launcher.swift            |  24 +-
+ dm/ios/Sources/OnlinePlay.swift          | 693 ++++++++++++++++++++++
+ dm/ios/Sources/OnlinePlayView.swift      | 474 +++++++++++++++
+ dm/ios/project.yml                       |   1 +
+ dm/ios/tests/launcher_layout_check.swift |   3 +-
+ dm/ios/tests/online_play_check.swift     | 720 +++++++++++++++++++++++
+ dm/ios/tests/test_launcher_storage.py    |   3 +-
+ dm/ios/tests/test_online_play.py         |  48 ++
+ dm/mac/Launcher.swift                    |  31 +-
+ dm/mac/launcher.c                        |   3 +-
+ dm/mac/pack_app.py                       |   5 +-
+ dm/tools/tests/test_nsp_mac_app.py       |  10 +-
+ docs/LDN-RELAY.md                        |   2 +
+ docs/LDN-SETTINGS.md                     |  73 +++
+ docs/development.md                      |   2 +-
+ docs/settings.md                         |   5 +
+ 16 files changed, 2077 insertions(+), 20 deletions(-)
+ create mode 100644 dm/ios/Sources/OnlinePlay.swift
+ create mode 100644 dm/ios/Sources/OnlinePlayView.swift
+ create mode 100644 dm/ios/tests/online_play_check.swift
+ create mode 100644 dm/ios/tests/test_online_play.py
+ create mode 100644 docs/LDN-SETTINGS.md
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index f20e403..d0f2913 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -153,6 +153,7 @@ private struct DocumentPicker: UIViewControllerRepresentable {
+ 
+ private struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
++    @ObservedObject var online: OnlinePlayState
+     let play: () -> Void
+     @State private var memory = os_proc_available_memory()
+ 
+@@ -182,6 +183,7 @@ private struct LauncherView: View {
+                             }
+                         }
+                     }
++                    OnlinePlaySection(state: online)
+                     Section {
+                         Button("Reset to tested defaults") { m.reset() }
+                             .disabled(!m.changed)
+@@ -228,16 +230,30 @@ private struct LauncherView: View {
+ // Shows the launcher over the root view controller and calls done once the settings are in the environment; false (done is not called) when there is no launcher
+ @_cdecl("dm_show_launcher")
+ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @convention(c) () -> Void) -> Bool {
+-    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else { return false }
+-    guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
+-    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); LauncherModel(file.settings).applySaved(); return false }
++    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else {
++        OnlinePlayModel.applySaved(defaultName: OnlinePlayState.deviceName)   // the online settings apply on every path to the game
++        return false
++    }
++    guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else {
++        fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr)
++        OnlinePlayModel.applySaved(defaultName: OnlinePlayState.deviceName)
++        return false
++    }
++    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" {
++        fputs("launcher: off (DM_LAUNCHER=0)\n", stderr)
++        LauncherModel(file.settings).applySaved()
++        OnlinePlayModel.applySaved(defaultName: OnlinePlayState.deviceName)
++        return false
++    }
+     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
+     let model = LauncherModel(file.settings)
++    let online = OnlinePlayState(OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName))
+     var host: UIViewController?
+-    let view = LauncherView(m: model) {
++    let view = LauncherView(m: model, online: online) {
+         guard let h = host else { return }
+         host = nil
+         model.apply()
++        online.model.apply()
+         h.dismiss(animated: false) { done() }
+     }
+     let h = UIHostingController(rootView: view)
+diff --git a/dm/ios/Sources/OnlinePlay.swift b/dm/ios/Sources/OnlinePlay.swift
+new file mode 100644
+index 0000000..c246f71
+--- /dev/null
++++ b/dm/ios/Sources/OnlinePlay.swift
+@@ -0,0 +1,693 @@
++// Online play: the LDN relay settings the game launchers collect and write into the environment the host reads (docs/LDN-SETTINGS.md). Foundation only
++// (POSIX sockets for the connection test come from Darwin or Glibc), so the same file builds for the iPhone app, for the Mac launcher and for the regression
++// tests. The host still reads only the DM_LDNR* variables: nothing here changes the relay client.
++import Foundation
++#if canImport(Darwin)
++import Darwin
++#else
++import Glibc
++#endif
++
++// SOCK_STREAM is an enum on Linux and an Int32 constant on Darwin; the socket calls want the number.
++#if canImport(Darwin)
++let dmStreamSocket: Int32 = SOCK_STREAM
++#else
++let dmStreamSocket: Int32 = Int32(SOCK_STREAM.rawValue)
++#endif
++
++/// The strings of the section, in the system language: English, or Simplified Chinese when the system asks for it. Tests pin the choice.
++enum OnlineText {
++    static var chineseOverride: Bool?
++    static var chinese: Bool {
++        if let o = chineseOverride { return o }
++        return Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
++    }
++    static func t(_ en: String, _ zh: String) -> String { chinese ? zh : en }
++}
++
++enum RelayAddressError: Error, Equatable {
++    case empty, invalidCharacters, badPort, badBrackets, tooLong
++
++    var message: String {
++        switch self {
++        case .empty: return OnlineText.t("Enter a server address", "请输入服务器地址")
++        case .invalidCharacters: return OnlineText.t("An address has no spaces, /, @, ? or #", "地址中不能有空格、/、@、? 或 #")
++        case .badPort: return OnlineText.t("The port must be a number from 1 to 65535", "端口必须是 1 到 65535 之间的数字")
++        case .badBrackets: return OnlineText.t("Brackets hold an IPv6 address, for example [::1]:11470", "方括号内是 IPv6 地址，例如 [::1]:11470")
++        case .tooLong: return OnlineText.t("The address is too long", "地址太长")
++        }
++    }
++}
++
++/// One saved relay server: its display name (may be empty) and the address the client is given.
++struct RelayServer: Codable, Equatable, Identifiable {
++    var name: String
++    var address: String
++    var id: String { address }
++}
++
++/// The relay address rules of the client (`ldnr_tcp_split`, dm/host/ldnr/ldnr_tcp.c): `host`, `host:port`, `[IPv6]`, `[IPv6]:port`, or a bare IPv6 literal.
++/// The port defaults to 11470 when it is missing.
++enum RelayAddress {
++    static let defaultPort: UInt16 = 11470
++    static let maxHostBytes = 253
++
++    /// What the field shows and what is stored: trimmed, without a pasted `ldnr://` prefix and without one trailing `/`.
++    static func normalize(_ s: String) -> String {
++        var out = s.trimmingCharacters(in: .whitespacesAndNewlines)
++        if out.lowercased().hasPrefix("ldnr://") { out = String(out.dropFirst("ldnr://".count)) }
++        if out.hasSuffix("/") { out.removeLast() }
++        return out
++    }
++
++    /// nil when the address can be used. The rules are the client's, so an address the field accepts is one the host can split.
++    static func validate(_ s: String) -> RelayAddressError? {
++        let text = normalize(s)
++        if text.isEmpty { return .empty }
++        if text.contains(where: { $0.isWhitespace || "/@?#".contains($0) }) { return .invalidCharacters }
++        if text.hasPrefix("[") {
++            guard let close = text.firstIndex(of: "]") else { return .badBrackets }
++            let host = text[text.index(after: text.startIndex)..<close]
++            let rest = text[text.index(after: close)...]
++            guard !host.isEmpty, host.allSatisfy({ $0.isHexDigit || $0 == ":" || $0 == "." }) else { return .badBrackets }
++            guard host.utf8.count <= maxHostBytes else { return .tooLong }
++            if rest.isEmpty { return nil }
++            guard rest.hasPrefix(":") else { return .badBrackets }
++            return port(rest.dropFirst()) == nil ? .badPort : nil
++        }
++        let colons = text.reduce(into: 0) { if $1 == ":" { $0 += 1 } }
++        if colons >= 2 { return text.utf8.count <= maxHostBytes ? nil : .tooLong }   // a bare IPv6 literal, no port
++        if colons == 1 {
++            let parts = text.split(separator: ":", omittingEmptySubsequences: false)
++            let host = parts[0]
++            if host.isEmpty { return .empty }
++            guard host.utf8.count <= maxHostBytes else { return .tooLong }
++            return port(parts[1]) == nil ? .badPort : nil
++        }
++        return text.utf8.count <= maxHostBytes ? nil : .tooLong
++    }
++
++    /// The host and port the connection test connects to, with the client's default port when the address has none.
++    static func split(_ s: String) -> (host: String, port: UInt16)? {
++        guard validate(s) == nil else { return nil }
++        let text = normalize(s)
++        if text.hasPrefix("[") {
++            let close = text.firstIndex(of: "]")!
++            let host = String(text[text.index(after: text.startIndex)..<close])
++            let rest = text[text.index(after: close)...]
++            return (host, rest.hasPrefix(":") ? (port(rest.dropFirst()) ?? defaultPort) : defaultPort)
++        }
++        let colons = text.reduce(into: 0) { if $1 == ":" { $0 += 1 } }
++        if colons >= 2 { return (text, defaultPort) }
++        if colons == 1 {
++            let parts = text.split(separator: ":", omittingEmptySubsequences: false)
++            return (String(parts[0]), port(parts[1]) ?? defaultPort)
++        }
++        return (text, defaultPort)
++    }
++
++    private static func port(_ s: Substring) -> UInt16? {
++        guard !s.isEmpty, s.allSatisfy({ $0.isASCII && $0.isNumber }), let n = UInt16(s), n >= 1 else { return nil }
++        return n
++    }
++}
++
++/// The first `max` bytes of a string, cut at a character boundary and never inside one.
++private func cutToBytes(_ s: String, _ max: Int) -> String {
++    var out = ""
++    var used = 0
++    for c in s {
++        let n = String(c).utf8.count
++        if used + n > max { break }
++        out.append(c)
++        used += n
++    }
++    return out
++}
++
++/// The player name: the host's 32-byte field, cut at a character boundary and never inside one.
++enum PlayerName {
++    static let maxBytes = 32
++
++    /// What the field holds while it is typed: cut at the field's bytes, never trimmed, so a space stays where it was typed.
++    static func limit(_ s: String) -> String { cutToBytes(s, maxBytes) }
++
++    /// What is handed to the host: trimmed, then cut. An empty name falls back to the device name.
++    static func clamp(_ s: String) -> String { limit(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
++
++    /// What is left of the field for what was typed: 0 once the name no longer fits.
++    static func bytesLeft(_ s: String) -> Int {
++        max(0, maxBytes - s.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count)
++    }
++}
++
++/// The room password: the host's passphrase field (LDNR_NATIVE_PASSPHRASE_MAX in dm/host/ldnr/ldnr_native.h), cut at a character boundary.
++/// Whitespace is part of a password, so it is never trimmed.
++enum RoomPassword {
++    static let maxBytes = 64
++
++    static func clamp(_ s: String) -> String { cutToBytes(s, maxBytes) }
++
++    /// What is left of the field for what was typed: 0 once the password no longer fits.
++    static func bytesLeft(_ s: String) -> Int { max(0, maxBytes - s.utf8.count) }
++}
++
++/// An invite: the text one player sends another, and the `nx2apple-ldn://join` link inside it that carries the same fields.
++struct OnlineInvite: Equatable {
++    var server: String
++    var password: String
++    var name: String
++
++    /// The text Copy invite puts on the clipboard: two label lines and the link, so it reads in a chat and a client can pick the link out.
++    func text() -> String {
++        var lines = [OnlineText.t("Online play (LDN relay)", "联机游戏（LDN 中继）")]
++        let shown = name.isEmpty ? server : "\(name) (\(server))"
++        lines.append(OnlineText.t("Server", "服务器") + ": " + shown)
++        if !password.isEmpty { lines.append(OnlineText.t("Room password", "房间密码") + ": " + password) }
++        lines.append(link())
++        return lines.joined(separator: "\n")
++    }
++
++    /// The link: the server, and the password and name only when they are set. URLComponents percent-encodes the values (a password may hold `&=?#`).
++    func link() -> String {
++        var components = URLComponents()
++        components.scheme = "nx2apple-ldn"
++        components.host = "join"
++        var items = [URLQueryItem(name: "server", value: server)]
++        if !password.isEmpty { items.append(URLQueryItem(name: "password", value: password)) }
++        if !name.isEmpty { items.append(URLQueryItem(name: "name", value: name)) }
++        components.queryItems = items
++        return components.url?.absoluteString ?? "nx2apple-ldn://join?server=\(server)"
++    }
++
++    /// The first `nx2apple-ldn://join` link anywhere in a pasted text (a chat line, a note, the copied invite itself). nil when there is none or its server is invalid.
++    static func parse(_ text: String) -> OnlineInvite? {
++        let marker = "nx2apple-ldn://join"
++        guard let found = text.range(of: marker, options: [.caseInsensitive]) else { return nil }
++        let link = String(text[found.lowerBound...].prefix { !$0.isWhitespace })
++        guard let components = URLComponents(string: link), let items = components.queryItems,
++              let server = items.first(where: { $0.name == "server" })?.value else { return nil }
++        let address = RelayAddress.normalize(server)
++        guard RelayAddress.validate(address) == nil else { return nil }
++        return OnlineInvite(server: address,
++                            password: items.first { $0.name == "password" }?.value ?? "",
++                            name: items.first { $0.name == "name" }?.value ?? "")
++    }
++}
++
++/// The settings model: the keys, the server list, the invite and the environment Play writes. No SwiftUI, so the tests build it on any platform.
++final class OnlinePlayModel {
++    private enum Keys {
++        static let enabled = "online.enabled"
++        static let servers = "online.servers"
++        static let selected = "online.server"
++        static let name = "online.name"
++        static let password = "online.password"
++        static let consent = "online.plaintextConsent"
++        static let ldn = "DM_LDNR"
++        static let server = "DM_LDNR_SERVER"
++        static let ldnName = "DM_LDNR_NAME"
++        static let roomPassword = "DM_LDNR_ROOM_PASSWORD"
++        static let allowPlaintext = "DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"
++        /// Every variable this section owns, in the order the log lists them.
++        static let all = [ldn, server, ldnName, roomPassword, allowPlaintext]
++    }
++
++    let game: UserDefaults      // this game's app: whether it plays online
++    let shared: UserDefaults    // the servers, the chosen one, the name, the password (on the Mac every game app: com.nx2apple.online)
++    let launchEnvironment: [String: String]
++    let defaultName: String     // the device name an empty player name falls back to
++    let fixedKeys: Set<String>  // the DM_LDNR* variables an env file or the launch environment set: shown, never replaced
++
++    var enabled: Bool { didSet { game.set(enabled, forKey: Keys.enabled) } }
++    var playerName: String { didSet { shared.set(playerName, forKey: Keys.name) } }
++    var password: String {
++        didSet {
++            shared.set(password, forKey: Keys.password)
++            if password != oldValue { plaintextConsent = false }   // a new password is not the one that was allowed
++        }
++    }
++    var plaintextConsent: Bool { didSet { shared.set(plaintextConsent, forKey: Keys.consent) } }
++    var servers: [RelayServer] { didSet { storeServers() } }
++    var selected: String { didSet { shared.set(selected, forKey: Keys.selected) } }
++
++    init(game: UserDefaults, shared: UserDefaults, environment: [String: String] = ProcessInfo.processInfo.environment, defaultName: String) {
++        self.game = game
++        self.shared = shared
++        self.launchEnvironment = environment
++        self.defaultName = defaultName
++        self.fixedKeys = Set(Keys.all.filter { environment[$0] != nil })
++        self.enabled = game.bool(forKey: Keys.enabled)
++        self.playerName = shared.string(forKey: Keys.name) ?? ""
++        self.password = shared.string(forKey: Keys.password) ?? ""
++        self.plaintextConsent = shared.bool(forKey: Keys.consent)
++        self.servers = Self.loadServers(shared)
++        self.selected = shared.string(forKey: Keys.selected) ?? ""
++    }
++
++    /// The model a launcher uses: this game's preferences, and on the Mac the shared `com.nx2apple.online` suite the game apps read together.
++    /// The environment is the one the process started with (launchEnvironmentSnapshot), not the one Play writes.
++    static func standard(defaultName: String) -> OnlinePlayModel {
++        #if os(macOS)
++        let shared = UserDefaults(suiteName: "com.nx2apple.online") ?? .standard
++        #else
++        let shared = UserDefaults.standard
++        #endif
++        return OnlinePlayModel(game: .standard, shared: shared, environment: launchEnvironmentSnapshot, defaultName: defaultName)
++    }
++
++    /// The saved settings for a start without the settings screen (DM_LAUNCHER=0, no launcher.json, the Mac window off). DM_SAVED_CHOICES=0 ignores them
++    /// as it ignores the other saved choices: nothing is written, the host starts offline unless the environment itself turns online play on.
++    static func applySaved(defaultName: String) {
++        if launchEnvironmentSnapshot["DM_SAVED_CHOICES"] == "0" {
++            fputs("launcher: saved online play ignored (DM_SAVED_CHOICES=0)\n", stderr)
++            return
++        }
++        standard(defaultName: defaultName).apply()
++    }
++
++    /// The environment this process started with, read once the first time a launcher makes a model. A launcher shown again in the same process
++    /// (the game data was not there yet) must not take the DM_LDNR* values its own apply() wrote for an env file's.
++    static let launchEnvironmentSnapshot: [String: String] = ProcessInfo.processInfo.environment
++
++    /// The value an env file or the launch environment set for one of this section's variables, or nil when it is the player's to choose.
++    func fixedValue(_ key: String) -> String? {
++        fixedKeys.contains(key) ? launchEnvironment[key] ?? "" : nil
++    }
++
++    /// The plaintext consent that counts: an env file's DM_LDNR_ALLOW_PLAINTEXT_PASSWORD decides, else the toggle.
++    var effectiveConsent: Bool {
++        if let fixed = fixedValue(Keys.allowPlaintext) { return fixed == "1" }
++        return plaintextConsent
++    }
++
++    /// The room password that counts: the env file's when it fixes one (which may be empty), else the field's.
++    var effectivePassword: String { fixedValue(Keys.roomPassword) ?? password }
++
++    // MARK: servers
++
++    /// Adds a server (or updates the name of one that is already saved under this address) and chooses it.
++    @discardableResult
++    func addServer(name: String, address: String) -> RelayAddressError? {
++        let normalized = RelayAddress.normalize(address)
++        if let error = RelayAddress.validate(normalized) { return error }
++        let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
++        if let i = servers.firstIndex(where: { $0.address == normalized }) {
++            servers[i].name = label
++        } else {
++            servers.append(RelayServer(name: label, address: normalized))
++        }
++        selected = normalized
++        return nil
++    }
++
++    /// Rewrites one saved server. An address another entry already holds wins over that entry, so the list keeps one entry per address.
++    @discardableResult
++    func updateServer(old: String, name: String, address: String) -> RelayAddressError? {
++        let normalized = RelayAddress.normalize(address)
++        if let error = RelayAddress.validate(normalized) { return error }
++        guard servers.contains(where: { $0.address == old }) else { return addServer(name: name, address: address) }
++        let keepsSelection = selected == old
++        if let other = servers.firstIndex(where: { $0.address == normalized && $0.address != old }) { servers.remove(at: other) }
++        if let i = servers.firstIndex(where: { $0.address == old }) {
++            servers[i] = RelayServer(name: name.trimmingCharacters(in: .whitespacesAndNewlines), address: normalized)
++        }
++        if keepsSelection { selected = normalized }
++        return nil
++    }
++
++    func removeServer(address: String) {
++        servers.removeAll { $0.address == address }
++        if selected == address { selected = servers.first?.address ?? "" }
++    }
++
++    /// The chosen server: the one the environment fixes, else the saved choice, else a valid address that is no longer in the list.
++    var selectedServer: RelayServer? {
++        if let fixed = fixedValue(Keys.server) {   // the environment's address is the one the host will use: show it, and nothing else
++            // exactly the string the host gets: a value the host would not read as written (an ldnr:// prefix, a trailing /) is not tested or shared
++            return RelayAddress.validate(fixed) == nil && RelayAddress.normalize(fixed) == fixed ? RelayServer(name: "", address: fixed) : nil
++        }
++        if let saved = servers.first(where: { $0.address == selected }) { return saved }
++        guard !selected.isEmpty, RelayAddress.validate(selected) == nil else { return nil }
++        return RelayServer(name: "", address: selected)
++    }
++
++    // MARK: invite
++
++    /// Adds and chooses the invite's server, and fills in its room password, which asks again for the plaintext consent. Online play itself is left as it is.
++    /// A rejected invite returns false and changes nothing: DM_LDNR is fixed by the environment, the invite is for another server than a fixed
++    /// DM_LDNR_SERVER, or it has no valid server at all. A fixed DM_LDNR_ROOM_PASSWORD is kept as it is, so only the server part of the invite is used.
++    @discardableResult
++    func applyInvite(_ invite: OnlineInvite) -> Bool {
++        guard !fixedKeys.contains(Keys.ldn) else { return false }
++        guard RelayAddress.validate(invite.server) == nil else { return false }
++        let normalized = RelayAddress.normalize(invite.server)
++        if let fixed = fixedValue(Keys.server), RelayAddress.normalize(fixed) != normalized { return false }
++        if servers.contains(where: { $0.address == normalized }) {
++            selected = normalized   // a server already saved keeps the name its player gave it
++        } else {
++            addServer(name: invite.name, address: normalized)
++        }
++        if fixedKeys.contains(Keys.roomPassword) { return true }   // the password stays the file's, and with it the consent
++        password = RoomPassword.clamp(invite.password)   // set after the server: a new password is not the one that was allowed
++        plaintextConsent = false
++        return true
++    }
++
++    func invite() -> OnlineInvite? {
++        guard let server = selectedServer else { return nil }
++        return OnlineInvite(server: server.address, password: effectivePassword, name: server.name)
++    }
++
++    // MARK: what Play writes
++
++    enum Readiness: Equatable { case off, noServer, needsConsent, ready }
++
++    var readiness: Readiness {
++        if !enabled { return .off }
++        guard selectedServer != nil else { return .noServer }
++        // a password the environment fixes is the file's to allow: the toggle cannot consent for it
++        if fixedValue(Keys.roomPassword) == nil && !password.isEmpty && !effectiveConsent { return .needsConsent }
++        return .ready
++    }
++
++    /// The environment Play writes, as a value per variable (nil to unset it), so the rules can be tested without touching the process. A variable an env
++    /// file set is left out: the environment wins. With DM_LDNR fixed the whole environment is the file's, and nothing is returned. When the password waits
++    /// for its consent every variable that is not fixed is unset: online play does not start, and the password is never written without the consent.
++    func environment() -> [String: String?] {
++        if fixedKeys.contains(Keys.ldn) { return [:] }
++        var out: [String: String?] = [:]
++        // updateValue, not the subscript: a subscript assignment of nil removes the key, and a key that must be unset has to be listed
++        func put(_ key: String, _ value: String?) {
++            guard !fixedKeys.contains(key) else { return }
++            out.updateValue(value, forKey: key)
++        }
++        guard readiness == .ready, let server = selectedServer else {
++            for key in Keys.all { put(key, nil) }   // DM_LDNR unset is off, and the host then uses its defaults
++            return out
++        }
++        put(Keys.ldn, "1")
++        put(Keys.server, server.address)
++        let name = PlayerName.clamp(playerName.isEmpty ? defaultName : playerName)
++        put(Keys.ldnName, name.isEmpty ? nil : name)
++        let password = effectivePassword
++        put(Keys.roomPassword, password.isEmpty ? nil : password)
++        // the toggle consents only for the field's password: a password env.txt fixes is sent only when env.txt allows it too
++        put(Keys.allowPlaintext, fixedValue(Keys.roomPassword) == nil && !password.isEmpty && effectiveConsent ? "1" : nil)
++        return out
++    }
++
++    /// Puts the settings into this process's environment, which the host inherits. The room password is never logged.
++    func apply() {
++        if fixedKeys.contains(Keys.ldn) { fputs("launcher: online play kept from env.txt\n", stderr); return }
++        if !enabled { fputs("launcher: online play off\n", stderr) }
++        if readiness == .needsConsent { fputs("launcher: online play waits for the password consent\n", stderr) }
++        for (key, value) in environment().sorted(by: { $0.key < $1.key }) {
++            if let value {
++                setenv(key, value, 1)
++                fputs("launcher: online \(key)=\(key == Keys.roomPassword ? "<set>" : value)\n", stderr)
++            } else {
++                unsetenv(key)
++                fputs("launcher: online \(key) unset\n", stderr)
++            }
++        }
++    }
++
++    private func storeServers() {
++        guard let data = try? JSONEncoder().encode(servers) else { return }
++        shared.set(data, forKey: Keys.servers)
++    }
++
++    private static func loadServers(_ shared: UserDefaults) -> [RelayServer] {
++        if let data = shared.data(forKey: Keys.servers), let list = try? JSONDecoder().decode([RelayServer].self, from: data) { return list }
++        if let text = shared.string(forKey: Keys.servers), let data = text.data(using: .utf8),
++           let list = try? JSONDecoder().decode([RelayServer].self, from: data) { return list }
++        return []
++    }
++}
++
++/// The result of Test connection: what the server answered, and how long the round trip took.
++struct ProbeResult: Equatable {
++    enum Kind: Equatable { case ok, unreachable, notRelay, oldProtocol }
++    var kind: Kind
++    var latencyMs: Int?
++    var protocolVersion: String?   // "1.2"
++    var serverName: String?
++    var detail: String             // a short reason, for a failure
++}
++
++/// The connection test: HELLO, HELLO_ACK, one PING, one PONG (docs/PROTOCOL.md 1, 3.1, 3.2, 3.3). It sends no password and no game data.
++enum RelayProbe {
++    static let maxPayload = 65536
++    static let version = 1
++
++    /// HELLO: major 1 only, minor 2, no capability bits, this launcher's name.
++    /// The capabilities the game's relay client asks for (LDNR_WIRE_CAPS in dm/host/ldnr/ldnr_protocol.c) and the ones it cannot play without.
++    /// The server answers the AND of both sides, so the test asks for the same set and checks the same bits as the game.
++    static let clientCapabilities: UInt32 = 0x1F
++    static let requiredCapabilities: UInt32 = 0x1E
++
++    static func helloFrame(requestID: UInt32) -> [UInt8] {
++        var payload: [UInt8] = [1, 1, 2]
++        append(&payload, clientCapabilities)
++        append(&payload, "NX2Apple launcher")
++        append(&payload, "1")
++        return frame(type: 0x01, requestID: requestID, payload: payload)
++    }
++
++    /// PING: the sender's unix time in milliseconds; the server echoes it in PONG.
++    static func pingFrame(major: UInt8, requestID: UInt32, timestampMs: UInt64) -> [UInt8] {
++        var payload: [UInt8] = []
++        append(&payload, timestampMs)
++        return frame(type: 0x03, requestID: requestID, payload: payload)
++    }
++
++    /// One frame of the stream, or nil while it is incomplete. `consumed` is how many bytes the frame took.
++    static func parseFrame(_ bytes: [UInt8]) -> (type: UInt8, version: UInt8, requestID: UInt32, payload: [UInt8], consumed: Int)? {
++        guard bytes.count >= 16, hasMagic(bytes) else { return nil }
++        let length = Int(u32(bytes, 8))
++        guard bytes.count >= 16 + length else { return nil }
++        return (bytes[5], bytes[4], u32(bytes, 12), Array(bytes[16..<(16 + length)]), 16 + length)
++    }
++
++    static func hasMagic(_ bytes: [UInt8]) -> Bool {
++        bytes.count >= 4 && bytes[0] == 0x4C && bytes[1] == 0x44 && bytes[2] == 0x4E && bytes[3] == 0x52
++    }
++
++    /// HELLO_ACK's major, minor and server name. A payload too short for its own fields is malformed.
++    /// major, minor, the server's major range and the capabilities come first (8 bytes), then the 16-byte conn_id (docs/PROTOCOL.md 3.1).
++    static func parseHelloAck(_ payload: [UInt8]) -> (major: UInt8, minor: UInt8, capabilities: UInt32, serverName: String)? {
++        guard payload.count >= 34 else { return nil }   // through max_frame and keepalive, after an empty name
++        let length = Int(u16(payload, 24))
++        guard payload.count >= 26 + length + 8 else { return nil }
++        return (payload[0], payload[1], u32(payload, 4), String(decoding: payload[26..<(26 + length)], as: UTF8.self))
++    }
++
++    /// Connects, shakes hands and times one PING. Never throws: every failure is an unreachable result with a short reason.
++    static func run(address: String, timeout: TimeInterval = 5) -> ProbeResult {
++        guard let parts = RelayAddress.split(address) else {
++            return failure(.unreachable, RelayAddress.validate(address)?.message ?? "invalid address")
++        }
++        let deadline = monotonicMs() + Int64(max(0.05, timeout) * 1000)
++        var hints = addrinfo()
++        hints.ai_family = AF_UNSPEC
++        hints.ai_socktype = dmStreamSocket
++        hints.ai_protocol = Int32(IPPROTO_TCP)
++        var list: UnsafeMutablePointer<addrinfo>?
++        let gai = parts.host.withCString { host in String(parts.port).withCString { port in getaddrinfo(host, port, &hints, &list) } }
++        guard gai == 0, let first = list else {
++            let detail = gai == 0 ? "name not found" : String(cString: gai_strerror(gai))
++            return failure(.unreachable, detail)
++        }
++        defer { freeaddrinfo(first) }
++        // A name can answer with several addresses (IPv6 and IPv4): the first one that connects is the relay's.
++        var saved: Int32 = 0
++        var ranOut = false
++        var at: UnsafeMutablePointer<addrinfo>? = first
++        while let address = at {
++            defer { at = address.pointee.ai_next }
++            if monotonicMs() >= deadline { ranOut = true; break }
++            let result = attempt(address, deadline: deadline, saved: &saved, ranOut: &ranOut)
++            if let result { return result }
++        }
++        return failure(.unreachable, ranOut ? "timed out" : describe(saved))
++    }
++
++    /// One address of the name: its handshake result, or nil when the address did not connect and the next one is worth a try.
++    private static func attempt(_ address: UnsafeMutablePointer<addrinfo>, deadline: Int64, saved: inout Int32, ranOut: inout Bool) -> ProbeResult? {
++        let fd = socket(address.pointee.ai_family, address.pointee.ai_socktype, address.pointee.ai_protocol)
++        if fd < 0 { saved = errno; return nil }
++        defer { close(fd) }
++        let flags = fcntl(fd, F_GETFL, 0)
++        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)   // the wait is poll's, so a connect and every read end at the deadline
++        if connect(fd, address.pointee.ai_addr, address.pointee.ai_addrlen) != 0 {
++            let error = errno
++            if error != EINPROGRESS && error != EINTR && error != EALREADY { saved = error; return nil }
++            if !wait(fd, POLLOUT, deadline) { ranOut = true; return nil }
++            var soError: Int32 = 0
++            var size = socklen_t(MemoryLayout<Int32>.size)
++            if getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &size) < 0 { saved = errno; return nil }
++            if soError != 0 { saved = soError; return nil }
++        }
++        #if canImport(Darwin)
++        var one: Int32 = 1
++        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
++        #endif
++        return handshake(fd, deadline: deadline)
++    }
++
++    // MARK: the handshake
++
++    private static func handshake(_ fd: Int32, deadline: Int64) -> ProbeResult {
++        guard sendAll(fd, helloFrame(requestID: 1), deadline: deadline) else { return failure(.unreachable, "timed out") }
++        var buffer: [UInt8] = []
++        var serverName: String?
++        var version: String?
++        let pingID: UInt32 = 2
++        var pingSentAt: Int64 = 0
++        while monotonicMs() < deadline {
++            if buffer.count >= 16 {
++                if !hasMagic(buffer) { return failure(.notRelay, "bad frame") }
++                if u32(buffer, 8) > UInt32(maxPayload) { return failure(.notRelay, "oversized frame") }
++            }
++            if let frame = parseFrame(buffer) {
++                buffer.removeFirst(frame.consumed)
++                switch frame.type {
++                case 0x02:   // HELLO_ACK
++                    guard let ack = parseHelloAck(frame.payload) else { return failure(.notRelay, "bad HELLO_ACK") }
++                    if ack.major != 1 || frame.version != 1 { return failure(.oldProtocol, "protocol \(ack.major).\(ack.minor)") }   // the game speaks major 1 only
++                    if ack.minor < 2 { return failure(.oldProtocol, "protocol 1.\(ack.minor)") }
++                    if ack.capabilities & requiredCapabilities != requiredCapabilities {   // the game would refuse this relay at its handshake
++                        return failure(.oldProtocol, "missing features (capabilities 0x\(String(ack.capabilities, radix: 16)))")
++                    }
++                    serverName = ack.serverName
++                    version = "\(ack.major).\(ack.minor)"
++                    pingSentAt = monotonicMs()
++                    let stamp = UInt64(max(0, Date().timeIntervalSince1970) * 1000)
++                    guard sendAll(fd, pingFrame(major: ack.major, requestID: pingID, timestampMs: stamp), deadline: deadline) else {
++                        return failure(.unreachable, "timed out")
++                    }
++                case 0x04:   // PONG
++                    if pingSentAt != 0 && frame.requestID == pingID {
++                        return ProbeResult(kind: .ok, latencyMs: Int(max(0, monotonicMs() - pingSentAt)), protocolVersion: version,
++                                           serverName: serverName, detail: "")
++                    }
++                case 0x05:   // ERROR
++                    let code = frame.payload.count >= 2 ? u16(frame.payload, 0) : 0
++                    let message = errorMessage(frame.payload)
++                    if code == 17 { return failure(.oldProtocol, message.isEmpty ? "protocol 1.2 required" : message) }
++                    return failure(.notRelay, message.isEmpty ? "server error \(code)" : "\(message) (\(code))")
++                case 0x03:   // a server PING: not this test's business
++                    break
++                default:     // a frame a relay does not send during a handshake
++                    return failure(.notRelay, "unexpected frame \(frame.type)")
++                }
++                continue
++            }
++            let remaining = deadline - monotonicMs()
++            if remaining <= 0 { break }
++            if !wait(fd, POLLIN, deadline) { break }
++            var chunk = [UInt8](repeating: 0, count: 4096)
++            let n = read(fd, &chunk, chunk.count)
++            if n < 0 {
++                if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
++                return failure(.unreachable, describe(errno))
++            }
++            if n == 0 { return failure(.unreachable, "connection closed") }
++            buffer.append(contentsOf: chunk[0..<n])
++            if buffer.count > maxPayload + 16 { return failure(.notRelay, "oversized frame") }   // nothing the test waits for is this long
++        }
++        return failure(.unreachable, "timed out")
++    }
++
++    // MARK: frames and sockets
++
++    private static func frame(type: UInt8, requestID: UInt32, payload: [UInt8]) -> [UInt8] {
++        var out: [UInt8] = [0x4C, 0x44, 0x4E, 0x52, UInt8(version), type, 0, 0]
++        append(&out, UInt32(payload.count))
++        append(&out, requestID)
++        return out + payload
++    }
++
++    private static func append(_ bytes: inout [UInt8], _ value: UInt32) {
++        bytes.append(contentsOf: [UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF), UInt8((value >> 16) & 0xFF), UInt8((value >> 24) & 0xFF)])
++    }
++
++    private static func append(_ bytes: inout [UInt8], _ value: UInt64) {
++        for shift in stride(from: 0, through: 56, by: 8) { bytes.append(UInt8((value >> UInt64(shift)) & 0xFF)) }
++    }
++
++    private static func append(_ bytes: inout [UInt8], _ text: String) {   // str: u16 byte length + UTF-8
++        let utf8 = Array(text.utf8)
++        bytes.append(UInt8(utf8.count & 0xFF))
++        bytes.append(UInt8((utf8.count >> 8) & 0xFF))
++        bytes.append(contentsOf: utf8)
++    }
++
++    private static func u16(_ bytes: [UInt8], _ at: Int) -> UInt16 {
++        UInt16(bytes[at]) | (UInt16(bytes[at + 1]) << 8)
++    }
++
++    private static func u32(_ bytes: [UInt8], _ at: Int) -> UInt32 {
++        UInt32(bytes[at]) | (UInt32(bytes[at + 1]) << 8) | (UInt32(bytes[at + 2]) << 16) | (UInt32(bytes[at + 3]) << 24)
++    }
++
++    private static func errorMessage(_ payload: [UInt8]) -> String {
++        guard payload.count >= 4 else { return "" }
++        let length = Int(u16(payload, 2))
++        guard payload.count >= 4 + length else { return "" }
++        return String(decoding: payload[4..<(4 + length)], as: UTF8.self)
++    }
++
++    private static func wait(_ fd: Int32, _ events: Int32, _ deadline: Int64) -> Bool {
++        while true {
++            let remaining = deadline - monotonicMs()
++            if remaining <= 0 { return false }
++            var item = pollfd(fd: fd, events: Int16(events), revents: 0)
++            let ready = poll(&item, 1, Int32(remaining))
++            if ready > 0 { return true }
++            if ready == 0 { return false }
++            if errno != EINTR { return false }
++        }
++    }
++
++    private static func sendAll(_ fd: Int32, _ bytes: [UInt8], deadline: Int64) -> Bool {
++        var offset = 0
++        while offset < bytes.count {
++            if !wait(fd, POLLOUT, deadline) { return false }
++            let slice = Array(bytes[offset...])
++            #if canImport(Darwin)
++            let n = slice.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
++            #else
++            let n = slice.withUnsafeBytes { send(fd, $0.baseAddress, $0.count, Int32(MSG_NOSIGNAL)) }   // no SIGPIPE: Linux has no SO_NOSIGPIPE
++            #endif
++            if n < 0 {
++                if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
++                return false
++            }
++            offset += n
++        }
++        return true
++    }
++
++    private static func monotonicMs() -> Int64 {
++        var now = timespec()
++        clock_gettime(CLOCK_MONOTONIC, &now)
++        return Int64(now.tv_sec) * 1000 + Int64(now.tv_nsec) / 1_000_000
++    }
++
++    private static func describe(_ error: Int32) -> String {
++        switch error {
++        case 0: return "timed out"
++        case ECONNREFUSED: return "connection refused"
++        case ETIMEDOUT: return "timed out"
++        case EHOSTUNREACH: return "no route to host"
++        case ENETUNREACH: return "network is unreachable"
++        default: return String(cString: strerror(error))
++        }
++    }
++
++    private static func failure(_ kind: ProbeResult.Kind, _ detail: String) -> ProbeResult {
++        ProbeResult(kind: kind, latencyMs: nil, protocolVersion: nil, serverName: nil, detail: detail)
++    }
++}
+diff --git a/dm/ios/Sources/OnlinePlayView.swift b/dm/ios/Sources/OnlinePlayView.swift
+new file mode 100644
+index 0000000..928ea97
+--- /dev/null
++++ b/dm/ios/Sources/OnlinePlayView.swift
+@@ -0,0 +1,474 @@
++// The Online play section of the game launchers (docs/LDN-SETTINGS.md): the toggle, the server menu and its add/edit sheet, Test connection, the player name,
++// the room password with its plaintext consent, and Copy/Paste invite. It is placed inside the iOS launcher's List and the Mac window's Form as Sections;
++// the model (OnlinePlay.swift) does the rest. Values fixed by an env file or the launch environment are shown and locked.
++import Combine
++import Foundation
++import SwiftUI
++#if os(iOS)
++import UIKit
++#elseif os(macOS)
++import AppKit
++#endif
++
++/// The view's state: the model and the connection test, which runs off the main thread and is dropped when the chosen server changes under it.
++final class OnlinePlayState: ObservableObject {
++    let model: OnlinePlayModel
++    @Published var enabled: Bool
++    @Published var servers: [RelayServer]
++    @Published var selected: String
++    @Published var playerName: String
++    @Published var password: String
++    @Published var consent: Bool
++    @Published var probe: ProbeResult?
++    @Published var testing = false
++
++    private var probeToken = 0
++
++    init(_ model: OnlinePlayModel) {
++        self.model = model
++        self.enabled = model.enabled
++        self.servers = model.servers
++        self.selected = model.selected
++        self.playerName = model.playerName
++        self.password = model.password
++        self.consent = model.plaintextConsent
++    }
++
++    func setEnabled(_ v: Bool) {
++        enabled = v
++        model.enabled = v
++        resetProbe()
++    }
++    func setSelected(_ v: String) {
++        selected = v
++        model.selected = v
++        resetProbe()
++    }
++    func setPlayerName(_ v: String) {
++        playerName = v
++        model.playerName = v
++    }
++    func setPassword(_ v: String) {
++        password = v
++        model.password = v
++        consent = model.plaintextConsent
++    }
++    func setConsent(_ v: Bool) {
++        consent = v
++        model.plaintextConsent = v
++    }
++
++    @discardableResult
++    func addServer(name: String, address: String) -> RelayAddressError? {
++        let error = model.addServer(name: name, address: address)
++        servers = model.servers
++        selected = model.selected
++        if error == nil { resetProbe() }
++        return error
++    }
++
++    @discardableResult
++    func updateServer(old: String, name: String, address: String) -> RelayAddressError? {
++        let error = model.updateServer(old: old, name: name, address: address)
++        servers = model.servers
++        selected = model.selected
++        if error == nil { resetProbe() }
++        return error
++    }
++
++    func removeServer(address: String) {
++        model.removeServer(address: address)
++        servers = model.servers
++        selected = model.selected
++        resetProbe()
++    }
++
++    @discardableResult
++    func applyInvite(_ invite: OnlineInvite) -> Bool {
++        guard model.applyInvite(invite) else { return false }
++        servers = model.servers
++        selected = model.selected
++        password = model.password
++        consent = model.plaintextConsent
++        resetProbe()
++        return true
++    }
++
++    var invite: OnlineInvite? { model.invite() }
++
++    /// Test connection: a background queue does the blocking socket work, the result comes back on the main thread. A test that a newer one replaced is dropped.
++    func test() {
++        guard let server = model.selectedServer else { return }
++        probeToken += 1
++        let token = probeToken
++        let address = server.address
++        probe = nil
++        testing = true
++        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
++            let result = RelayProbe.run(address: address)
++            DispatchQueue.main.async {
++                guard let self = self, token == self.probeToken else { return }
++                self.testing = false
++                self.probe = result
++            }
++        }
++    }
++
++    private func resetProbe() {
++        probeToken += 1
++        testing = false
++        probe = nil
++    }
++
++    static var deviceName: String {
++        #if os(iOS)
++        return UIDevice.current.name
++        #elseif os(macOS)
++        return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
++        #else
++        return ProcessInfo.processInfo.hostName
++        #endif
++    }
++}
++
++/// The Online play section of docs/LDN-SETTINGS.md, items 1 to 7.
++struct OnlinePlaySection: View {
++    @ObservedObject var state: OnlinePlayState
++    @State private var sheet: ServerSheet?
++    @State private var note = ""
++
++    /// nil stops the add/edit sheet. `old` is the address the entry had before an edit.
++    private struct ServerSheet: Identifiable {
++        let id = UUID()
++        var old: String?
++        var name: String
++        var address: String
++    }
++
++    private var fixedLDN: String? { state.model.fixedValue("DM_LDNR") }
++    private var fixedServer: String? { state.model.fixedValue("DM_LDNR_SERVER") }
++    private var fixedName: String? { state.model.fixedValue("DM_LDNR_NAME") }
++    private var fixedPassword: String? { state.model.fixedValue("DM_LDNR_ROOM_PASSWORD") }
++    private var fixedConsent: String? { state.model.fixedValue("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD") }
++
++    var body: some View {
++        Section {
++            if let fixedLDN = fixedLDN {
++                LabeledContent(OnlineText.t("Online play", "联机游戏")) {
++                    Text(fixedLDN == "1" ? OnlineText.t("On (env.txt)", "开（env.txt）") : OnlineText.t("Off (env.txt)", "关（env.txt）"))
++                        .foregroundStyle(.secondary)
++                }
++            } else {
++                Toggle(OnlineText.t("Online play", "联机游戏"), isOn: Binding(get: { state.enabled }, set: state.setEnabled))
++            }
++            if fixedLDN == nil && state.enabled {
++                serverRows
++                testRow
++                nameRow
++                passwordRows
++                inviteRows
++            }
++        } footer: {
++            VStack(alignment: .leading, spacing: 8) {
++                if fixedLDN != nil {
++                    Text(OnlineText.t("Online play is set by env.txt. Remove the DM_LDNR lines there to choose it here.",
++                                      "联机游戏由 env.txt 设置。删除其中的 DM_LDNR 行即可在这里选择。"))
++                } else {
++                    Text(OnlineText.t("Local wireless play reaches friends over the internet through a relay server. Everyone picks the same server, and the same room password when one is set.",
++                                      "本地联机通过中继服务器，让朋友之间经互联网连接。每个人选择同一个服务器，设置了房间密码时还要用同一个密码。"))
++                }
++                // 7. the status line during play
++                Text(OnlineText.t("Status during play is in the game's log (lines starting with ldnr).",
++                                  "游戏过程中的状态记录在游戏日志中（以 ldnr 开头的行）。"))
++            }
++        }
++    }
++
++    // 2. Server: the menu of saved servers, Add server…, and Edit and Remove for the chosen one. The sheet sits on this one row, not on the
++    // Section: SwiftUI hands a Section's modifiers to every row, and one tap then presents a sheet per row (the same trap as the document picker).
++    @ViewBuilder private var serverRows: some View {
++        if let fixedServer = fixedServer {
++            LabeledContent(OnlineText.t("Server", "服务器")) {
++                Text("\(fixedServer) \(OnlineText.t("(env.txt)", "(env.txt)"))")   // as the host gets it
++                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
++            }
++        } else {
++            Picker(selection: Binding(get: { state.selected }, set: state.setSelected)) {
++                Text(OnlineText.t("None", "无")).tag("")
++                ForEach(state.servers) { server in
++                    Text(server.name.isEmpty ? server.address : "\(server.name) — \(server.address)").tag(server.address)
++                }
++            } label: {
++                Text(OnlineText.t("Server", "服务器"))
++            }
++            .pickerStyle(.menu)
++            HStack {
++                Button(OnlineText.t("Add server…", "添加服务器…")) {
++                    sheet = ServerSheet(old: nil, name: "", address: "")
++                }
++                Spacer()
++                if let chosen = state.servers.first(where: { $0.address == state.selected }) {
++                    Button(OnlineText.t("Edit", "编辑")) {
++                        sheet = ServerSheet(old: chosen.address, name: chosen.name, address: chosen.address)
++                    }
++                    Button(OnlineText.t("Remove", "移除"), role: .destructive) {
++                        state.removeServer(address: chosen.address)
++                    }
++                }
++            }
++            .buttonStyle(.borderless)   // two buttons in one List row: without it a tap on the row fires both (iOS)
++            .sheet(item: $sheet) { s in
++                ServerEditor(state: state, original: s.old, name: s.name, address: s.address, isNew: s.old == nil)
++            }
++            if state.model.readiness == .noServer {
++                Text(OnlineText.t("Choose a server to play online", "请选择一个服务器以便联机"))
++                    .font(.footnote).foregroundStyle(.orange)
++            }
++        }
++    }
++
++    // 3. Test connection
++    @ViewBuilder private var testRow: some View {
++        Button(state.testing ? OnlineText.t("Testing…", "正在测试…") : OnlineText.t("Test connection", "测试连接")) {
++            state.test()
++        }
++        .disabled(state.model.selectedServer == nil || state.testing)
++        if let result = state.probe {
++            Text(summary(result))
++                .font(.footnote)
++                .foregroundStyle(color(result))
++                .accessibilityLabel(summary(result))
++        }
++    }
++
++    // 4. Player name: the bytes left of the host's 32-byte field, a longer name cut at a character boundary.
++    @ViewBuilder private var nameRow: some View {
++        if let fixedName = fixedName {
++            LabeledContent(OnlineText.t("Player name", "玩家名称")) {
++                Text(fixedName.isEmpty ? OnlineText.t("(empty)", "（空）") : "\(fixedName) \(OnlineText.t("(env.txt)", "(env.txt)"))")
++                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
++            }
++        } else {
++            VStack(alignment: .leading, spacing: 4) {
++                HStack {
++                    Text(OnlineText.t("Player name", "玩家名称"))
++                    Spacer()
++                    Text("\(PlayerName.bytesLeft(state.playerName)) / \(PlayerName.maxBytes)")
++                        .monospacedDigit().font(.footnote).foregroundStyle(.secondary)
++                }
++                TextField(OnlinePlayState.deviceName, text: Binding(get: { state.playerName },
++                                                                    set: { state.setPlayerName(PlayerName.limit($0)) }))
++                    #if os(iOS)
++                    .textInputAutocapitalization(.never)
++                    #endif
++                    .autocorrectionDisabled()
++                if state.playerName.isEmpty {
++                    Text(OnlineText.t("Empty uses the device name.",
++                                      "留空则使用设备名称。"))
++                        .font(.footnote).foregroundStyle(.secondary)
++                }
++            }
++        }
++    }
++
++    // 5. Room password and the plaintext consent
++    @ViewBuilder private var passwordRows: some View {
++        if let fixedPassword = fixedPassword {
++            LabeledContent(OnlineText.t("Room password", "房间密码")) {
++                Text(fixedPassword.isEmpty ? OnlineText.t("None (env.txt)", "无（env.txt）") : OnlineText.t("Set (env.txt)", "已设置（env.txt）"))
++                    .foregroundStyle(.secondary)
++            }
++        } else {
++            VStack(alignment: .leading, spacing: 4) {
++                HStack {
++                    Text(OnlineText.t("Room password", "房间密码"))
++                    Spacer()
++                    Text("\(RoomPassword.bytesLeft(state.password)) / \(RoomPassword.maxBytes)")
++                        .monospacedDigit().font(.footnote).foregroundStyle(.secondary)
++                }
++                SecureField(OnlineText.t("Optional", "可选"), text: Binding(get: { state.password },
++                                                                             set: { state.setPassword(RoomPassword.clamp($0)) }))
++                    #if os(iOS)
++                    .textInputAutocapitalization(.never)
++                    #endif
++                    .autocorrectionDisabled()
++            }
++            if !state.password.isEmpty {
++                Text(OnlineText.t("The relay connection is not encrypted. The password and the game traffic can be read on the network. Use a password only on a trusted network or a VPN, and never one you use elsewhere. The server must allow passwords without TLS.",
++                                  "中继连接未加密，密码和游戏数据可能在网络上被读取。只在可信网络或 VPN 中使用密码，切勿使用在其他地方用过的密码。服务器必须允许无 TLS 的密码。"))
++                    .font(.footnote).foregroundStyle(.secondary)
++                if let fixedConsent = fixedConsent {
++                    LabeledContent(OnlineText.t("Send the password unencrypted", "允许明文发送密码")) {
++                        Text(fixedConsent == "1" ? OnlineText.t("On (env.txt)", "开（env.txt）") : OnlineText.t("Off (env.txt)", "关（env.txt）"))
++                            .foregroundStyle(.secondary)
++                    }
++                } else {
++                    Toggle(OnlineText.t("Send the password unencrypted", "允许明文发送密码"),
++                           isOn: Binding(get: { state.consent }, set: state.setConsent))
++                }
++                // shown exactly when Play would go offline for the missing consent, whether the toggle or env.txt decides it
++                if state.model.readiness == .needsConsent {
++                    Text(OnlineText.t("Online play will not start until you allow the password",
++                                      "在你允许发送密码之前，联机不会开始"))
++                        .font(.footnote).foregroundStyle(.red)
++                }
++            }
++        }
++    }
++
++    // 6. Invite a friend: the text, with the link a client can pick out.
++    @ViewBuilder private var inviteRows: some View {
++        HStack {
++            Button(OnlineText.t("Copy invite", "复制邀请")) { copy() }
++                .disabled(state.invite == nil)
++            Spacer()
++            Button(OnlineText.t("Paste invite", "粘贴邀请")) { paste() }
++        }
++        .buttonStyle(.borderless)
++        if !note.isEmpty {
++            Text(note).font(.footnote).foregroundStyle(.secondary)
++        }
++    }
++
++    private func copy() {
++        guard let invite = state.invite else { return }
++        setClipboard(invite.text())
++        note = OnlineText.t("The invite is on the clipboard.", "邀请已复制到剪贴板。")
++    }
++
++    private func paste() {
++        guard let text = clipboard(), let invite = OnlineInvite.parse(text) else {
++            note = OnlineText.t("The clipboard has no invite", "剪贴板中没有邀请")
++            return
++        }
++        if !state.applyInvite(invite) {
++            // nil means the environment keeps the server (or online play itself), so the invite cannot change it
++            note = OnlineText.t("This invite is for another server, set by env.txt",
++                                "此邀请属于另一个服务器（由 env.txt 设置）")
++            return
++        }
++        note = OnlineText.t("Invite read.", "已读取邀请。")
++    }
++
++    private func summary(_ result: ProbeResult) -> String {
++        switch result.kind {
++        case .ok:
++            var parts = [OnlineText.t("Connected", "已连接")]
++            if let ms = result.latencyMs { parts.append("\(ms) ms") }
++            if let v = result.protocolVersion { parts.append(OnlineText.t("protocol \(v)", "协议 \(v)")) }
++            if let name = result.serverName, !name.isEmpty { parts.append(name) }
++            return parts.joined(separator: " · ")
++        case .unreachable:
++            return OnlineText.t("Not reachable: \(result.detail)", "无法连接：\(result.detail)")
++        case .notRelay:
++            return OnlineText.t("This is not an LDN relay server", "这不是 LDN 中继服务器")
++        case .oldProtocol:
++            return OnlineText.t("The server speaks an older protocol", "服务器使用的是较旧的协议")
++        }
++    }
++
++    private func color(_ result: ProbeResult) -> Color {
++        switch result.kind {
++        case .ok: return .green
++        case .unreachable: return .red
++        case .notRelay, .oldProtocol: return .orange
++        }
++    }
++
++    // MARK: the clipboard
++
++    private func setClipboard(_ text: String) {
++        #if os(iOS)
++        UIPasteboard.general.string = text
++        #elseif os(macOS)
++        let pasteboard = NSPasteboard.general
++        pasteboard.clearContents()
++        pasteboard.setString(text, forType: .string)
++        #endif
++    }
++
++    private func clipboard() -> String? {
++        #if os(iOS)
++        return UIPasteboard.general.string
++        #elseif os(macOS)
++        return NSPasteboard.general.string(forType: .string)
++        #endif
++    }
++}
++
++/// The add and edit sheet: Name and Address, the address checked as it is typed, Save disabled until it passes.
++private struct ServerEditor: View {
++    @ObservedObject var state: OnlinePlayState
++    let original: String?
++    let isNew: Bool
++    @Environment(\.dismiss) private var dismiss
++    @State private var name: String
++    @State private var address: String   // what was typed, not normalized: the error line must not fight the typing
++
++    init(state: OnlinePlayState, original: String?, name: String, address: String, isNew: Bool) {
++        self.state = state
++        self.original = original
++        self.isNew = isNew
++        _name = State(initialValue: name)
++        _address = State(initialValue: address)
++    }
++
++    private var error: RelayAddressError? { RelayAddress.validate(address) }
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 0) {
++            HStack {
++                Button(OnlineText.t("Cancel", "取消")) { dismiss() }
++                Spacer()
++                Text(isNew ? OnlineText.t("Add server", "添加服务器") : OnlineText.t("Edit server", "编辑服务器"))
++                    .font(.headline)
++                Spacer()
++                Button(OnlineText.t("Save", "保存")) { save() }
++                    .disabled(error != nil)
++            }
++            .padding()
++            #if os(macOS)
++            Divider()
++            #endif
++            Form {
++                TextField(OnlineText.t("Name (optional)", "名称（可选）"), text: $name)
++                    #if os(iOS)
++                    .textInputAutocapitalization(.never)
++                    #endif
++                    .autocorrectionDisabled()
++                TextField(OnlineText.t("Address", "地址"), text: $address, prompt: Text("relay.example.com:11470"))
++                    #if os(iOS)
++                    .textInputAutocapitalization(.never)
++                    #endif
++                    .autocorrectionDisabled()
++                    #if os(iOS)
++                    .keyboardType(.URL)
++                    #endif
++                if let error = error {
++                    Text(error.message).font(.footnote).foregroundStyle(.red)
++                } else {
++                    Text(OnlineText.t("host, host:port or [IPv6]:port. A missing port means 11470.",
++                                      "host、host:port 或 [IPv6]:port。省略端口时使用 11470。"))
++                        .font(.footnote).foregroundStyle(.secondary)
++                }
++            }
++            #if os(macOS)
++            .formStyle(.grouped)
++            #endif
++        }
++        #if os(iOS)
++        .presentationDetents([.medium])
++        #endif
++        .frame(minWidth: 320)
++    }
++
++    private func save() {
++        let failure: RelayAddressError?
++        if let original = original {
++            failure = state.updateServer(old: original, name: name, address: address)
++        } else {
++            failure = state.addServer(name: name, address: address)
++        }
++        if failure == nil { dismiss() }
++    }
++}
+diff --git a/dm/ios/project.yml b/dm/ios/project.yml
+index ed0010a..fc95f5c 100644
+--- a/dm/ios/project.yml
++++ b/dm/ios/project.yml
+@@ -34,6 +34,7 @@ targets:
+         CFBundleShortVersionString: $(MARKETING_VERSION)
+         UILaunchStoryboardName: ""
+         UIFileSharingEnabled: true          # Documents (log.txt, saves) visible in the Files app
++        NSLocalNetworkUsageDescription: "Online play connects to the relay server you choose, which can be on your local network."   # the LDN relay client and the launcher's Test connection (docs/LDN-SETTINGS.md)
+         LSSupportsOpeningDocumentsInPlace: true
+         UISupportedInterfaceOrientations:
+           - UIInterfaceOrientationLandscapeRight
+diff --git a/dm/ios/tests/launcher_layout_check.swift b/dm/ios/tests/launcher_layout_check.swift
+index 3562502..4d87ac1 100644
+--- a/dm/ios/tests/launcher_layout_check.swift
++++ b/dm/ios/tests/launcher_layout_check.swift
+@@ -9,7 +9,8 @@ func checkLauncherLayout(_ model: LauncherModel, defaults: UserDefaults) -> Int
+     func measure(_ advanced: Bool, width: CGFloat) -> CGFloat {
+         defaults.set(advanced, forKey: "window.advanced")
+         var extra: CGFloat?
+-        let view = NSHostingView(rootView: LauncherView(m: model, done: { _ in }, fit: { extra = $0 }).defaultAppStorage(defaults))
++        let online = OnlinePlayState(OnlinePlayModel(game: defaults, shared: defaults, environment: [:], defaultName: "test"))
++        let view = NSHostingView(rootView: LauncherView(m: model, online: online, done: { _ in }, fit: { extra = $0 }).defaultAppStorage(defaults))
+         view.sizingOptions = []
+         // SwiftUI reports the Form's scroll geometry on a later pass, an estimate first and the measured rows a few ms after it, later still on a slow runner (issue #445): run the
+         // loop until the report meets the step's expectation and has held for 0.2 s; after 5 s the check sees whatever was reported last
+diff --git a/dm/ios/tests/online_play_check.swift b/dm/ios/tests/online_play_check.swift
+new file mode 100644
+index 0000000..b01d432
+--- /dev/null
++++ b/dm/ios/tests/online_play_check.swift
+@@ -0,0 +1,720 @@
++// The online play model (OnlinePlay.swift), run by test_online_play.py: address validation and splitting, name truncation, the invite round trip,
++// persistence through a private UserDefaults suite, the environment Play writes for every combination, and the connection test's frames and
++// behaviour against a fake relay on loopback. Compiles with OnlinePlay.swift alone (-parse-as-library), on macOS or Linux.
++import Foundation
++#if canImport(Darwin)
++import Darwin
++#else
++import Glibc
++#endif
++
++#if canImport(Darwin)
++let streamSocketType: Int32 = SOCK_STREAM
++#else
++let streamSocketType: Int32 = Int32(SOCK_STREAM.rawValue)
++#endif
++
++// MARK: a fake relay
++
++/// A listening socket on 127.0.0.1, answered by a thread with `serve` per connection. The test owns its lifetime: stop() stops it.
++final class FakeRelay {
++    let fd: Int32
++    let port: UInt16
++    private let serve: (Int32) -> Void
++    private var thread: Thread?
++    private var stopped = false
++
++    /// Binds to an ephemeral port; `serve` runs on a thread per accepted connection. A connection that `serve` ignores is closed when the test ends.
++    init?(_ serve: @escaping (Int32) -> Void) {
++        self.serve = serve
++        let fd = socket(AF_INET, streamSocketType, 0)
++        if fd < 0 { return nil }
++        var one: Int32 = 1
++        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
++        var address = sockaddr_in()
++        address.sin_family = sa_family_t(AF_INET)
++        address.sin_port = 0
++        address.sin_addr.s_addr = inet_addr("127.0.0.1")
++        let bound = withUnsafePointer(to: &address) { p in
++            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
++        }
++        if bound != 0 || listen(fd, 8) != 0 { close(fd); return nil }
++        var size = socklen_t(MemoryLayout<sockaddr_in>.size)
++        var assigned = sockaddr_in()
++        _ = withUnsafeMutablePointer(to: &assigned) { p in
++            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &size) }
++        }
++        self.fd = fd
++        self.port = UInt16(bigEndian: assigned.sin_port)
++        let t = Thread { [weak self] in self?.acceptLoop() }
++        t.start()
++        thread = t
++    }
++
++    var address: String { "127.0.0.1:\(port)" }
++
++    private func acceptLoop() {
++        while !stopped {
++            let client = accept(fd, nil, nil)
++            if client < 0 { return }   // the listener is closed
++            let handle = serve
++            let t = Thread { handle(client); close(client) }
++            t.start()
++        }
++    }
++
++    /// Stops the listener: accept returns and the thread ends. An accepted connection is closed by its own handler.
++    func stop() {
++        stopped = true
++        shutdown(fd, Int32(SHUT_RDWR))
++        close(fd)
++    }
++}
++
++// MARK: frames over a socket
++
++func readExact(_ fd: Int32, _ count: Int) -> [UInt8]? {
++    var out: [UInt8] = []
++    while out.count < count {
++        var chunk = [UInt8](repeating: 0, count: count - out.count)
++        let n = read(fd, &chunk, chunk.count)
++        if n <= 0 { return nil }
++        out.append(contentsOf: chunk[0..<n])
++    }
++    return out
++}
++
++/// The header and payload of one client frame, or nil when the client went away.
++func readFrame(_ fd: Int32) -> (type: UInt8, requestID: UInt32, payload: [UInt8])? {
++    guard let header = readExact(fd, 16) else { return nil }
++    let length = Int(header[8]) | Int(header[9]) << 8 | Int(header[10]) << 16 | Int(header[11]) << 24
++    let requestID = UInt32(header[12]) | UInt32(header[13]) << 8 | UInt32(header[14]) << 16 | UInt32(header[15]) << 24
++    guard let payload = length > 0 ? readExact(fd, length) : [] else { return nil }
++    return (header[5], requestID, payload)
++}
++
++func makeFrame(_ type: UInt8, requestID: UInt32, payload: [UInt8], version: UInt8 = 1) -> [UInt8] {
++    var out: [UInt8] = [0x4C, 0x44, 0x4E, 0x52, version, type, 0, 0]
++    let n = UInt32(payload.count)
++    out += [UInt8(n & 0xFF), UInt8((n >> 8) & 0xFF), UInt8((n >> 16) & 0xFF), UInt8((n >> 24) & 0xFF)]
++    out += [UInt8(requestID & 0xFF), UInt8((requestID >> 8) & 0xFF), UInt8((requestID >> 16) & 0xFF), UInt8((requestID >> 24) & 0xFF)]
++    return out + payload
++}
++
++func helloAck(requestID: UInt32, major: UInt8 = 1, minor: UInt8 = 2, capabilities: UInt8 = 0x1F, name: String = "test relay") -> [UInt8] {
++    var payload: [UInt8] = [major, minor, 1, 1]
++    payload += [capabilities, 0, 0, 0]   // capabilities, the AND of both sides
++    payload += [UInt8](repeating: 7, count: 16)   // conn_id
++    let utf8 = Array(name.utf8)
++    payload += [UInt8(utf8.count & 0xFF), UInt8((utf8.count >> 8) & 0xFF)] + utf8
++    payload += [0x00, 0x00, 0x01, 0x00]   // max_frame 65536
++    payload += [0x98, 0x3A, 0, 0]         // keepalive 15000 ms
++    return makeFrame(0x02, requestID: requestID, payload: payload)
++}
++
++func errorFrame(requestID: UInt32, code: UInt16, message: String) -> [UInt8] {
++    let utf8 = Array(message.utf8)
++    var payload: [UInt8] = [UInt8(code & 0xFF), UInt8((code >> 8) & 0xFF), UInt8(utf8.count & 0xFF), UInt8((utf8.count >> 8) & 0xFF)]
++    payload += utf8
++    return makeFrame(0x05, requestID: requestID, payload: payload)
++}
++
++func writeAll(_ fd: Int32, _ bytes: [UInt8]) {
++    _ = bytes.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
++}
++
++/// Reads the PING and answers it, for a relay that completed the handshake.
++func answerPing(_ fd: Int32) {
++    guard let ping = readFrame(fd), ping.type == 0x03 else { return }
++    writeAll(fd, makeFrame(0x04, requestID: ping.requestID, payload: ping.payload))
++}
++
++// MARK: the checks
++
++@main struct OnlinePlayCheck {
++    static var failed = 0
++    static func check(_ ok: Bool, _ what: String) {
++        print((ok ? "PASS " : "FAIL ") + what)
++        if !ok { failed += 1 }
++    }
++
++    static func main() {
++        OnlineText.chineseOverride = nil
++        print("system language Chinese: \(OnlineText.chinese)")   // informational: the rest of the checks pin English, and the invite check pins Chinese
++        OnlineText.chineseOverride = false
++        addresses()
++        names()
++        passwords()
++        invites()
++        persistence()
++        serverList()
++        environments()
++        applyToProcess()
++        launchEnvironment()
++        frames()
++        probes()
++        print("online play: \(failed) failed")
++        exit(failed == 0 ? 0 : 1)
++    }
++
++    // MARK: addresses
++
++    static func addresses() {
++        for good in ["relay.example.com", "relay.example.com:11470", "1.2.3.4:11470", "[::1]:9", "[::1]", "::1", "2001:db8::1",
++                     "host:1", "host:65535", "a:b:c", "ldnr://x:1/"] {
++            check(RelayAddress.validate(good) == nil, "valid address \(good)")
++        }
++        let bad: [(String, RelayAddressError)] = [
++            ("", .empty), ("   ", .empty), ("host:0", .badPort), ("host:65536", .badPort), ("host:abc", .badPort),
++            ("host:", .badPort), ("ho st", .invalidCharacters), ("http://x/y", .invalidCharacters),
++            ("host:1/path", .invalidCharacters), ("user@host:1", .invalidCharacters), ("host?x", .invalidCharacters),
++            ("host#x", .invalidCharacters), ("[]", .badBrackets), ("[::1", .badBrackets), ("[zz]:1", .badBrackets),
++            ("[::1]x", .badBrackets), ("[::1]:", .badPort), ("[::1]:0", .badPort), ("[::1]:70000", .badPort),
++            (String(repeating: "a", count: 254), .tooLong), (":" , .empty),
++        ]
++        for (text, want) in bad {
++            check(RelayAddress.validate(text) == want, "invalid address \"\(text)\" -> \(want)")
++        }
++        check(RelayAddress.normalize("  ldnr://x:1/ ") == "x:1" && RelayAddress.normalize("LDNR://X:1") == "X:1", "normalize trims, strips the scheme and one slash")
++        check(RelayAddress.normalize("x:1//") == "x:1/", "normalize strips one trailing slash only")
++        check(RelayAddress.validate(String(repeating: "a", count: 253)) == nil, "a 253-byte host is accepted")
++        let s1 = RelayAddress.split("relay.example.com")
++        check(s1?.host == "relay.example.com" && s1?.port == 11470, "a bare host takes port 11470")
++        let s2 = RelayAddress.split("host:9")
++        check(s2?.host == "host" && s2?.port == 9, "host:port splits")
++        let s3 = RelayAddress.split("[::1]:9")
++        check(s3?.host == "::1" && s3?.port == 9, "[IPv6]:port splits")
++        let s4 = RelayAddress.split("[::1]")
++        check(s4?.host == "::1" && s4?.port == 11470, "[IPv6] takes the default port")
++        let s5 = RelayAddress.split("::1")
++        check(s5?.host == "::1" && s5?.port == 11470, "a bare IPv6 literal is the host")
++        check(RelayAddress.split("a:b:c")?.host == "a:b:c", "a bare string with two colons is an IPv6-style host")
++        check(RelayAddress.split("host:0") == nil, "an invalid address does not split")
++    }
++
++    // MARK: names
++
++    static func names() {
++        check(PlayerName.maxBytes == 32, "the name field is 32 bytes")
++        let han = String(repeating: "汉", count: 11)   // 33 bytes
++        check(PlayerName.clamp(han) == String(repeating: "汉", count: 10), "33 bytes of Chinese cut to 10 characters, never inside one")
++        check(PlayerName.bytesLeft(han) == 0 && PlayerName.bytesLeft(String(repeating: "汉", count: 10)) == 2, "bytes left of the 32-byte field")
++        // an emoji with a skin tone is one Character and several scalars: 4 + 4 bytes
++        let emoji = "👍🏽"   // thumb up + skin tone modifier
++        let twelve = String(repeating: emoji, count: 4)   // 32 bytes
++        check(PlayerName.clamp(twelve) == twelve, "a multi-scalar character that fits stays whole")
++        check(PlayerName.clamp(twelve + "x") == twelve, "the character that would overflow is dropped whole")
++        check(PlayerName.clamp("  Bob  ") == "Bob", "the name is trimmed")
++        check(PlayerName.bytesLeft("") == 32, "an empty name leaves the whole field")
++        // 5. what the field holds while it is typed: cut, never trimmed, so a space is not removed at once
++        check(PlayerName.limit("  Bob  ") == "  Bob  ", "limit keeps the spaces while typing")
++        check(PlayerName.limit("Bo b") == "Bo b", "a space inside the name survives typing")
++        check(PlayerName.limit(String(repeating: "汉", count: 11)) == String(repeating: "汉", count: 10),
++              "limit cuts at 32 bytes, never inside a character")
++        check(PlayerName.limit(String(repeating: " ", count: 40)) == String(repeating: " ", count: 32),
++              "limit counts the whitespace toward the field")
++        check(PlayerName.clamp(PlayerName.limit("  Bob  ")) == "Bob", "what is written is still trimmed and cut")
++    }
++
++    // MARK: the room password
++
++    static func passwords() {
++        check(RoomPassword.maxBytes == 64, "the room password field is 64 bytes")
++        check(RoomPassword.clamp(String(repeating: "a", count: 70)) == String(repeating: "a", count: 64),
++              "a long password is cut to 64 bytes")
++        check(RoomPassword.bytesLeft(String(repeating: "a", count: 60)) == 4, "bytes left of the 64-byte field")
++        check(RoomPassword.clamp(String(repeating: "汉", count: 22)) == String(repeating: "汉", count: 21),
++              "a Chinese password is cut at a character boundary")
++        check(RoomPassword.clamp("  two words  ") == "  two words  ", "spaces are part of a password and are kept")
++        let emoji = "👍🏽"   // 8 bytes, one Character
++        check(RoomPassword.clamp(String(repeating: emoji, count: 16)) == String(repeating: emoji, count: 8),
++              "a multi-scalar character is kept whole")
++        check(RoomPassword.bytesLeft("") == 64, "an empty password leaves the whole field")
++    }
++
++    // MARK: invites
++
++    static func invites() {
++        let invite = OnlineInvite(server: "relay.example.com:11470", password: "p&=?#汉 room", name: "Zelda Den")
++        let parsed = OnlineInvite.parse(invite.text())
++        check(parsed == invite, "an invite round-trips through its text, with &=?# and Chinese in the password")
++        let chat = "hey, join me tonight\n\(invite.link())\nsee you at 8"
++        check(OnlineInvite.parse(chat) == invite, "the link is found in surrounding chat text")
++        check(OnlineInvite.parse("no invite here") == nil, "text without a link is no invite")
++        check(OnlineInvite.parse("nx2apple-ldn://join?server=ho%20st") == nil, "an invalid server is no invite")
++        check(OnlineInvite.parse("nx2apple-ldn://join") == nil, "a link without a server is no invite")
++        let plain = OnlineInvite(server: "host:9", password: "", name: "")
++        check(!plain.text().contains("password=") && !plain.text().contains("name="), "an empty password and name are left out of the link")
++        check(OnlineInvite.parse(plain.text()) == plain, "an invite without a password or name round-trips")
++        check(plain.text().hasPrefix("Online play"), "the text has an English label line")
++        OnlineText.chineseOverride = true
++        check(invite.text().contains("房间密码"), "the Chinese text names the room password")
++        OnlineText.chineseOverride = false
++        check(RelayAddressError.empty.message == "Enter a server address", "the error message is in the chosen language")
++        OnlineText.chineseOverride = true
++        check(RelayAddressError.empty.message == "请输入服务器地址", "the Chinese error message")
++        OnlineText.chineseOverride = false
++        check(invite.text().contains("ldnr://") == false && invite.text().contains("nx2apple-ldn://join?server="), "the text carries the join link")
++    }
++
++    // MARK: persistence
++
++    static func suite() -> String { "nx2apple.test." + UUID().uuidString }
++
++    static func persistence() {
++        let name = suite()
++        let defaults = UserDefaults(suiteName: name)!
++        defer { defaults.removePersistentDomain(forName: name) }
++        let m = OnlinePlayModel(game: defaults, shared: defaults, environment: [:], defaultName: "iPhone")
++        m.enabled = true
++        m.playerName = "Ana"
++        m.addServer(name: "Home", address: " relay.example.com:11470 ")
++        m.password = "secret"
++        m.plaintextConsent = true
++        let again = OnlinePlayModel(game: UserDefaults(suiteName: name)!, shared: UserDefaults(suiteName: name)!, environment: [:], defaultName: "iPhone")
++        check(again.enabled && again.playerName == "Ana" && again.password == "secret" && again.plaintextConsent,
++              "the settings are stored as they are changed")
++        check(again.servers == [RelayServer(name: "Home", address: "relay.example.com:11470")], "the server list is stored")
++        check(again.selected == "relay.example.com:11470", "the chosen server is stored")
++        // the split of the two suites: whether this game plays online is the game's, everything else is shared (on the Mac by every game app)
++        let gameOnly = suite(), sharedSuite = suite()
++        let gameDefaults = UserDefaults(suiteName: gameOnly)!, sharedDefaults = UserDefaults(suiteName: sharedSuite)!
++        defer { gameDefaults.removePersistentDomain(forName: gameOnly); sharedDefaults.removePersistentDomain(forName: sharedSuite) }
++        let split = OnlinePlayModel(game: gameDefaults, shared: sharedDefaults, environment: [:], defaultName: "iPhone")
++        split.enabled = true
++        split.playerName = "Ana"
++        split.password = "shared"
++        split.addServer(name: "S", address: "shared.example.com")
++        check(gameDefaults.bool(forKey: "online.enabled") && !gameDefaults.bool(forKey: "online.plaintextConsent")
++              && gameDefaults.string(forKey: "online.name") == nil, "the toggle is the game's own setting")
++        let fromShared = OnlinePlayModel(game: UserDefaults(suiteName: gameOnly)!, shared: UserDefaults(suiteName: sharedSuite)!, environment: [:], defaultName: "iPhone")
++        check(fromShared.playerName == "Ana" && fromShared.password == "shared"
++              && fromShared.servers.map(\.address) == ["shared.example.com"] && fromShared.selected == "shared.example.com",
++              "the name, the password and the servers are shared")
++        // a game that never turned online play on reads the sharing game's off state, not a stored true
++        let sharing = OnlinePlayModel(game: UserDefaults(suiteName: gameOnly)!, shared: UserDefaults(suiteName: sharedSuite)!, environment: [:], defaultName: "iPhone")
++        check(sharing.enabled && fromShared.enabled, "the game's own toggle is read back")
++        again.password = "other"
++        check(!again.plaintextConsent, "a different password resets the plaintext consent")
++        again.plaintextConsent = true
++        again.password = ""
++        check(!again.plaintextConsent, "clearing the password clears the consent")
++        let fresh = UserDefaults(suiteName: suite())!
++        let empty = OnlinePlayModel(game: fresh, shared: fresh, environment: [:], defaultName: "iPhone")
++        check(!empty.enabled && empty.servers.isEmpty && empty.selected.isEmpty && empty.password.isEmpty && !empty.plaintextConsent,
++              "a new suite starts with online play off and nothing saved")
++    }
++
++    // MARK: the server list
++
++    static func model(_ environment: [String: String] = [:]) -> OnlinePlayModel {
++        let name = suite()
++        let d = UserDefaults(suiteName: name)!
++        d.removePersistentDomain(forName: name)   // a fresh suite: nothing saved
++        return OnlinePlayModel(game: d, shared: d, environment: environment, defaultName: "iPhone")
++    }
++
++    static func serverList() {
++        let m = model()
++        check(m.addServer(name: "One", address: "a.example.com:11470") == nil, "a server is added")
++        check(m.selected == "a.example.com:11470", "an added server is chosen")
++        check(m.addServer(name: "Bad", address: "ho st") == .invalidCharacters, "an invalid address is refused")
++        check(m.addServer(name: "Again", address: "ldnr://a.example.com:11470/") == nil && m.servers.count == 1,
++              "the same address is not added twice")
++        check(m.servers.first?.name == "Again", "adding an existing address updates its name")
++        _ = m.addServer(name: "Two", address: "b.example.com")
++        check(m.servers.map(\.address) == ["a.example.com:11470", "b.example.com"], "the list keeps its order")
++        check(m.selected == "b.example.com" && m.selectedServer?.address == "b.example.com", "the newest server is chosen")
++        check(m.updateServer(old: "b.example.com", name: "Bee", address: "c.example.com:11470") == nil, "a server is edited")
++        check(m.servers.map(\.address) == ["a.example.com:11470", "c.example.com:11470"] && m.selected == "c.example.com:11470",
++              "an edited address is chosen again")
++        check(m.servers.last?.name == "Bee", "the edited name is kept")
++        check(m.updateServer(old: "c.example.com:11470", name: "", address: "x y") == .invalidCharacters, "an invalid edit is refused")
++        check(m.servers.last?.address == "c.example.com:11470", "a refused edit changes nothing")
++        m.removeServer(address: "c.example.com:11470")
++        check(m.selected == "a.example.com:11470" && m.selectedServer?.address == "a.example.com:11470",
++              "removing the chosen server chooses the first one left")
++        m.removeServer(address: "a.example.com:11470")
++        check(m.selected.isEmpty && m.selectedServer == nil && m.servers.isEmpty, "the last server removed leaves no choice")
++        let chosen = model()
++        _ = chosen.addServer(name: "", address: "kept.example.com")
++        _ = chosen.addServer(name: "", address: "other.example.com")
++        chosen.selected = "other.example.com"
++        chosen.removeServer(address: "kept.example.com")
++        check(chosen.selected == "other.example.com", "removing another server keeps the chosen one")
++        let fixed = model(["DM_LDNR_SERVER": "env.example.com:9"])
++        check(fixed.selectedServer?.address == "env.example.com:9", "an address fixed by the environment is the chosen server")
++
++        // a pasted invite adds and chooses its server, fills in the password, asks again for the consent and leaves the toggle alone
++        let invited = model()
++        invited.plaintextConsent = true
++        invited.applyInvite(OnlineInvite(server: "ldnr://friend.example.com/", password: "pw", name: "Friend"))
++        check(invited.servers == [RelayServer(name: "Friend", address: "friend.example.com")], "an invite adds its server")
++        check(invited.selected == "friend.example.com" && invited.selectedServer?.address == "friend.example.com", "an invite chooses its server")
++        check(invited.password == "pw" && !invited.plaintextConsent, "an invite fills in the password and asks again for the consent")
++        check(!invited.enabled, "an invite does not turn online play on")
++        invited.enabled = true
++        invited.applyInvite(OnlineInvite(server: "friend.example.com", password: "other", name: ""))
++        check(invited.servers == [RelayServer(name: "Friend", address: "friend.example.com")],
++              "an invite for a saved server keeps the name its player gave it")
++        let mine = model()
++        _ = mine.addServer(name: "", address: "shared.example.com")
++        check(mine.invite() == OnlineInvite(server: "shared.example.com", password: "", name: ""), "the invite carries the chosen server")
++        check(model().invite() == nil, "no chosen server, no invite")
++
++        // 3. an invite cannot move a fixed server or a fixed DM_LDNR, and it keeps a fixed password
++        let fixedServerInvite = model(["DM_LDNR_SERVER": "env.example.com:9"])
++        check(!fixedServerInvite.applyInvite(OnlineInvite(server: "friend.example.com", password: "pw", name: "")),
++              "an invite for another server is refused when env.txt fixes the server")
++        check(fixedServerInvite.servers.isEmpty && fixedServerInvite.selected.isEmpty && fixedServerInvite.password.isEmpty,
++              "a refused invite changes nothing")
++        check(fixedServerInvite.applyInvite(OnlineInvite(server: "ldnr://env.example.com:9/", password: "pw", name: "")),
++              "an invite for the fixed server itself is accepted")
++        check(fixedServerInvite.password == "pw" && fixedServerInvite.selected == "env.example.com:9",
++              "the fixed server's invite fills in the password")
++
++        let fixedLDNInvite = model(["DM_LDNR": "1"])
++        check(!fixedLDNInvite.applyInvite(OnlineInvite(server: "friend.example.com", password: "pw", name: "")),
++              "an invite changes nothing when env.txt fixes DM_LDNR")
++        check(fixedLDNInvite.servers.isEmpty && fixedLDNInvite.password.isEmpty, "the refused invite with a fixed DM_LDNR changes nothing")
++
++        let fixedPasswordInvite = model(["DM_LDNR_ROOM_PASSWORD": "filepw"])
++        check(fixedPasswordInvite.applyInvite(OnlineInvite(server: "friend.example.com", password: "invited", name: "")),
++              "an invite is accepted when only the password is fixed")
++        check(fixedPasswordInvite.selected == "friend.example.com" && fixedPasswordInvite.password.isEmpty,
++              "an invite does not change a fixed password")
++
++        let clampedInvite = model()
++        check(clampedInvite.applyInvite(OnlineInvite(server: "friend.example.com", password: String(repeating: "汉", count: 30), name: "")),
++              "an invite with a long password is accepted")
++        check(clampedInvite.password == String(repeating: "汉", count: 21),
++              "an invite's password is cut to 64 bytes at a character boundary")
++    }
++
++    // MARK: the environment
++
++    static let badKey = "DM_LDNR_SERVER"
++
++    static func environments() {
++        let off = model()
++        _ = off.addServer(name: "", address: "relay.example.com")
++        off.enabled = false
++        check(off.environment().values.allSatisfy { $0 == nil } && off.environment().count == 5,
++              "off: every variable is unset")
++        check(off.readiness == .off, "off: the section says so")
++
++        let noServer = model()
++        noServer.enabled = true
++        check(noServer.environment()[badKey]! == nil && noServer.environment().count == 5, "on without a server: every variable is unset")
++        check(noServer.readiness == .noServer, "on without a server: choose a server")
++
++        let on = model()
++        on.enabled = true
++        _ = on.addServer(name: "", address: "ldnr://relay.example.com/")
++        let env = on.environment()
++        check(env["DM_LDNR"]! == "1", "on: DM_LDNR=1")
++        check(env["DM_LDNR_SERVER"]! == "relay.example.com", "on: the chosen address, normalized")
++        check(env["DM_LDNR_NAME"]! == "iPhone", "an empty player name falls back to the device name")
++        check(env["DM_LDNR_ROOM_PASSWORD"]! == nil && env["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"]! == nil, "no password: no password and no consent")
++        check(on.readiness == .ready, "on with a server, no password: ready")
++
++        on.playerName = "Player One"
++        check(on.environment()["DM_LDNR_NAME"]! == "Player One", "the player name is written")
++        on.playerName = ""
++        let noName = OnlinePlayModel(game: on.game, shared: on.shared, environment: [:], defaultName: "")
++        noName.enabled = true
++        _ = noName.addServer(name: "", address: "relay.example.com")
++        check(noName.environment()["DM_LDNR_NAME"]! == nil, "an empty name and no device name leaves the name unset")
++
++        let withPassword = model()
++        withPassword.enabled = true
++        _ = withPassword.addServer(name: "", address: "relay.example.com")
++        withPassword.password = "pw"
++        check(withPassword.environment()["DM_LDNR_ROOM_PASSWORD"]! == nil, "without consent the password is not written")
++        check(withPassword.environment()["DM_LDNR"]! == nil && withPassword.environment().count == 5,
++              "without consent every variable is unset, so online play does not start")
++        check(withPassword.readiness == .needsConsent, "without consent the section says online play will not start")
++        withPassword.plaintextConsent = true
++        check(withPassword.environment()["DM_LDNR_ROOM_PASSWORD"]! == "pw", "with consent the password is written")
++        check(withPassword.environment()["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"]! == "1", "with consent the password is allowed")
++        check(withPassword.readiness == .ready, "with consent and a password: ready")
++
++        // 1. the consent that counts: an env.txt value decides when the variable is fixed, else the toggle
++        let fileConsent = model(["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD": "1"])
++        fileConsent.enabled = true
++        _ = fileConsent.addServer(name: "", address: "relay.example.com")
++        fileConsent.password = "pw"
++        check(fileConsent.effectiveConsent && fileConsent.readiness == .ready,
++              "env.txt's DM_LDNR_ALLOW_PLAINTEXT_PASSWORD=1 counts as consent, without the toggle")
++        check(fileConsent.environment()["DM_LDNR_ROOM_PASSWORD"]! == "pw",
++              "with env.txt's consent the password is written")
++        check(!fileConsent.environment().keys.contains("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"),
++              "a consent fixed by env.txt is left to the file")
++
++        let fileRefusal = model(["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD": "0"])
++        fileRefusal.enabled = true
++        _ = fileRefusal.addServer(name: "", address: "relay.example.com")
++        fileRefusal.password = "pw"
++        fileRefusal.plaintextConsent = true   // the toggle cannot consent for the file
++        check(!fileRefusal.effectiveConsent && fileRefusal.readiness == .needsConsent,
++              "env.txt's consent=0 waits for consent even with the toggle on")
++        let refusalEnv = fileRefusal.environment()
++        check(refusalEnv.values.allSatisfy { $0 == nil } && refusalEnv["DM_LDNR"]! == nil && refusalEnv["DM_LDNR_ROOM_PASSWORD"]! == nil,
++              "waiting for consent: every variable it may write is unset, so the password is not written")
++
++        // 1. and 2. a password fixed by env.txt is the one that counts, and it is never waiting for the toggle's consent
++        let fixedPassword = model(["DM_LDNR_ROOM_PASSWORD": "filepw"])
++        fixedPassword.enabled = true
++        _ = fixedPassword.addServer(name: "", address: "relay.example.com")
++        fixedPassword.password = "typed"
++        check(fixedPassword.effectivePassword == "filepw", "the password fixed by env.txt is the one that counts")
++        check(fixedPassword.readiness == .ready, "a fixed password is never waiting for the toggle's consent")
++        check(!fixedPassword.environment().keys.contains("DM_LDNR_ROOM_PASSWORD"), "a fixed password is left to the file")
++        check(fixedPassword.invite() == OnlineInvite(server: "relay.example.com", password: "filepw", name: ""),
++              "the invite carries the fixed password")
++
++        // the toggle's consent was for the field's password: it does not allow a password env.txt fixes later
++        let carried = model(["DM_LDNR_ROOM_PASSWORD": "filepw"])
++        carried.enabled = true
++        _ = carried.addServer(name: "", address: "relay.example.com")
++        carried.password = "typed"
++        carried.plaintextConsent = true
++        let carriedEnv = carried.environment()
++        check(carriedEnv.keys.contains("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD") && carriedEnv["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"]! == nil,
++              "a fixed password is not allowed by the toggle: only env.txt can allow it")
++        let fileAllows = model(["DM_LDNR_ROOM_PASSWORD": "filepw", "DM_LDNR_ALLOW_PLAINTEXT_PASSWORD": "1"])
++        fileAllows.enabled = true
++        _ = fileAllows.addServer(name: "", address: "relay.example.com")
++        check(!fileAllows.environment().keys.contains("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"), "env.txt's own consent is left to the file")
++
++        // a fixed server is tested and shared exactly as the host gets it
++        let rawFixed = model(["DM_LDNR_SERVER": "ldnr://relay.example.com/"])
++        check(rawFixed.selectedServer == nil && rawFixed.invite() == nil,
++              "a fixed address the host would not read as written is neither tested nor shared")
++
++        // 2. an invite carries the fixed server and the fixed password
++        let fixedBoth = model(["DM_LDNR_SERVER": "env.example.com:9", "DM_LDNR_ROOM_PASSWORD": "filepw"])
++        fixedBoth.password = "typed"
++        check(fixedBoth.invite() == OnlineInvite(server: "env.example.com:9", password: "filepw", name: ""),
++              "an invite carries the fixed server and the fixed password")
++
++        let fixedAll = model(["DM_LDNR": "0", "DM_LDNR_SERVER": "x.example.com", "DM_LDNR_NAME": "N",
++                              "DM_LDNR_ROOM_PASSWORD": "p", "DM_LDNR_ALLOW_PLAINTEXT_PASSWORD": "1"])
++        fixedAll.enabled = true
++        _ = fixedAll.addServer(name: "", address: "relay.example.com")
++        check(fixedAll.environment().isEmpty, "a fixed DM_LDNR leaves the whole environment to the file")
++        check(fixedAll.fixedKeys.count == 5 && fixedAll.fixedValue("DM_LDNR") == "0", "every fixed variable is listed with its value")
++
++        let fixedServer = model(["DM_LDNR_SERVER": "env.example.com:9"])
++        fixedServer.enabled = true
++        _ = fixedServer.addServer(name: "", address: "relay.example.com")
++        let envFixed = fixedServer.environment()
++        check(envFixed["DM_LDNR_SERVER"] == nil && !envFixed.keys.contains("DM_LDNR_SERVER"), "a fixed server is left out of the environment")
++        check(envFixed["DM_LDNR"]! == "1" && envFixed.count == 4, "the other variables are still written")
++
++        let fixedName = model(["DM_LDNR_NAME": "From File"])
++        fixedName.enabled = true
++        _ = fixedName.addServer(name: "", address: "relay.example.com")
++        fixedName.playerName = "Typed"
++        check(!fixedName.environment().keys.contains("DM_LDNR_NAME") && fixedName.fixedValue("DM_LDNR_NAME") == "From File",
++              "a fixed player name is kept")
++    }
++
++    static func applyToProcess() {
++        let m = model()
++        m.enabled = true
++        _ = m.addServer(name: "", address: "relay.example.com:9")
++        m.playerName = "Ana"
++        m.password = "topsecret"
++        m.plaintextConsent = true
++        for key in ["DM_LDNR", "DM_LDNR_SERVER", "DM_LDNR_NAME", "DM_LDNR_ROOM_PASSWORD", "DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"] {
++            unsetenv(key)
++        }
++        m.apply()
++        check(getenvString("DM_LDNR") == "1" && getenvString("DM_LDNR_SERVER") == "relay.example.com:9", "apply sets DM_LDNR and the server")
++        check(getenvString("DM_LDNR_NAME") == "Ana" && getenvString("DM_LDNR_ROOM_PASSWORD") == "topsecret", "apply sets the name and password")
++        check(getenvString("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD") == "1", "apply sets the plaintext consent")
++        // 1. without the consent apply writes nothing, and says why
++        m.plaintextConsent = false
++        m.apply()
++        check(getenvString("DM_LDNR") == nil && getenvString("DM_LDNR_ROOM_PASSWORD") == nil,
++              "apply unsets every variable when the password waits for consent")
++        check(stderrLog { m.apply() }.contains("launcher: online play waits for the password consent"),
++              "apply says that online play waits for the password consent")
++        m.plaintextConsent = true
++        m.enabled = false
++        m.apply()
++        check(getenvString("DM_LDNR") == nil && getenvString("DM_LDNR_SERVER") == nil && getenvString("DM_LDNR_ROOM_PASSWORD") == nil,
++              "apply unsets every variable when online play is off")
++        m.enabled = true
++        m.apply()
++        setenv("DM_LDNR", "0", 1)   // the file wins
++        let fixed = OnlinePlayModel(game: m.game, shared: m.shared, environment: ["DM_LDNR": "0"], defaultName: "iPhone")
++        fixed.apply()
++        check(getenvString("DM_LDNR") == "0" && getenvString("DM_LDNR_SERVER") != nil, "a fixed DM_LDNR is not touched, and nothing else is either")
++        unsetenv("DM_LDNR")
++    }
++
++    // MARK: the launch environment
++
++    /// 6. A launcher shown again in the same process (Play pressed before the game data exists) must not take the DM_LDNR* values its own apply()
++    /// wrote for an env file's. standard() reads a snapshot taken once, before any apply().
++    static func launchEnvironment() {
++        for key in ["DM_LDNR", "DM_LDNR_SERVER", "DM_LDNR_NAME", "DM_LDNR_ROOM_PASSWORD", "DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"] {
++            unsetenv(key)
++        }
++        let snapshot = OnlinePlayModel.launchEnvironmentSnapshot   // taken now: nothing called standard() before this point
++        setenv("DM_LDNR", "1", 1)
++        setenv("DM_LDNR_SERVER", "probe.example.com:9", 1)
++        defer { unsetenv("DM_LDNR"); unsetenv("DM_LDNR_SERVER") }
++        let standard = OnlinePlayModel.standard(defaultName: "iPhone")
++        check(standard.fixedValue("DM_LDNR") == nil && standard.fixedValue("DM_LDNR_SERVER") == nil,
++              "a model from standard() does not take the launcher's own DM_LDNR for env.txt's")
++        check(OnlinePlayModel.launchEnvironmentSnapshot == snapshot, "the launch environment is read once")
++    }
++
++    // MARK: the frames
++
++    static func frames() {
++        // HELLO: 16-byte header + major_min, major_max, minor, capabilities u32, "NX2Apple launcher" (17 bytes), "1"
++        let expected: [UInt8] = [0x4C, 0x44, 0x4E, 0x52, 1, 0x01, 0, 0,
++                                 29, 0, 0, 0,   // payload length: 3 + 4 + 2 + 17 + 2 + 1
++                                 1, 0, 0, 0,    // request id
++                                 1, 1, 2, 0x1F, 0, 0, 0,   // the game client's capabilities
++                                 17, 0] + Array("NX2Apple launcher".utf8) + [1, 0] + Array("1".utf8)
++        check(RelayProbe.helloFrame(requestID: 1) == expected, "the HELLO frame, byte for byte")
++        let ping = RelayProbe.pingFrame(major: 1, requestID: 7, timestampMs: 0x0102030405060708)
++        let expectedPing: [UInt8] = [0x4C, 0x44, 0x4E, 0x52, 1, 0x03, 0, 0, 8, 0, 0, 0, 7, 0, 0, 0,
++                                     8, 7, 6, 5, 4, 3, 2, 1]
++        check(ping == expectedPing, "the PING frame, byte for byte, little-endian")
++        let hello = RelayProbe.helloFrame(requestID: 42)
++        check(RelayProbe.parseFrame(Array(hello.prefix(15))) == nil, "a frame cut short does not parse")
++        check(RelayProbe.parseFrame(Array(hello.prefix(20))) == nil, "a frame without its whole payload does not parse")
++        if let parsed = RelayProbe.parseFrame(hello) {
++            check(parsed.type == 0x01 && parsed.version == 1 && parsed.requestID == 42 && parsed.consumed == hello.count,
++                  "a whole frame parses")
++        } else {
++            check(false, "a whole frame parses")
++        }
++        let ack = helloAck(requestID: 42)
++        check(RelayProbe.parseFrame(Array(ack.dropFirst(16))) == nil, "a payload without its header does not parse")
++        let ackPayload = Array(helloAck(requestID: 1).dropFirst(16))
++        let decoded = RelayProbe.parseHelloAck(ackPayload)
++        check(decoded?.major == 1 && decoded?.minor == 2 && decoded?.capabilities == 0x1F && decoded?.serverName == "test relay", "HELLO_ACK decodes")
++        check(RelayProbe.parseHelloAck(Array(ackPayload.prefix(10))) == nil, "a short HELLO_ACK does not decode")
++    }
++
++    // MARK: the connection test
++
++    static func probes() {
++        // (a) a good relay
++        if let relay = FakeRelay({ fd in
++            guard let hello = readFrame(fd), hello.type == 0x01 else { return }
++            writeAll(fd, helloAck(requestID: hello.requestID))
++            answerPing(fd)
++        }) {
++            let result = RelayProbe.run(address: relay.address, timeout: 5)
++            check(result.kind == .ok, "a relay that answers HELLO and PONG is ready")
++            check(result.protocolVersion == "1.2" && result.serverName == "test relay", "the version and the server name are read")
++            check(result.latencyMs != nil, "the PING round trip is timed")
++            relay.stop()
++        } else {
++            check(false, "a fake relay can be started")
++        }
++        // (b) VERSION_UNSUPPORTED
++        if let relay = FakeRelay({ fd in
++            guard let hello = readFrame(fd) else { return }
++            writeAll(fd, errorFrame(requestID: hello.requestID, code: 17, message: "protocol 1.2 required"))
++        }) {
++            let result = RelayProbe.run(address: relay.address, timeout: 5)
++            check(result.kind == .oldProtocol, "VERSION_UNSUPPORTED (17) is an older protocol")
++            relay.stop()
++        }
++        // (c) an old minor
++        if let relay = FakeRelay({ fd in
++            guard let hello = readFrame(fd) else { return }
++            writeAll(fd, helloAck(requestID: hello.requestID, minor: 1))
++        }) {
++            check(RelayProbe.run(address: relay.address, timeout: 5).kind == .oldProtocol, "a HELLO_ACK minor below 2 is an older protocol")
++            relay.stop()
++        }
++        // (c2) a relay without the features the game needs: the game refuses it, so the test does too
++        if let relay = FakeRelay({ fd in
++            guard let hello = readFrame(fd) else { return }
++            writeAll(fd, helloAck(requestID: hello.requestID, capabilities: 0x01))
++        }) {
++            check(RelayProbe.run(address: relay.address, timeout: 5).kind == .oldProtocol, "a HELLO_ACK without capabilities 0x1e is refused, as the game does")
++            relay.stop()
++        }
++        // (c3) another protocol major: the game speaks major 1 only
++        if let relay = FakeRelay({ fd in
++            guard let hello = readFrame(fd) else { return }
++            writeAll(fd, helloAck(requestID: hello.requestID, major: 2))
++            answerPing(fd)
++        }) {
++            check(RelayProbe.run(address: relay.address, timeout: 5).kind == .oldProtocol, "a HELLO_ACK for major 2 is refused, as the game does")
++            relay.stop()
++        }
++        // (d) not a relay
++        if let relay = FakeRelay({ fd in
++            _ = readExact(fd, 16)
++            writeAll(fd, Array("HTTP/1.1 400 Bad Request\r\n\r\n".utf8))
++        }) {
++            check(RelayProbe.run(address: relay.address, timeout: 5).kind == .notRelay, "HTTP for a HELLO is not an LDN relay server")
++            relay.stop()
++        }
++        // (e) silence until the deadline
++        if let relay = FakeRelay({ fd in
++            _ = readExact(fd, 16)
++            Thread.sleep(forTimeInterval: 4)   // holds the connection open, answers nothing
++        }) {
++            let started = Date()
++            let result = RelayProbe.run(address: relay.address, timeout: 1)
++            let elapsed = Date().timeIntervalSince(started)
++            check(result.kind == .unreachable, "a silent relay is not reachable")
++            check(elapsed < 3, "the test gives up at its deadline (\(String(format: "%.1f", elapsed)) s)")
++            relay.stop()
++        }
++        // (f) a closed port
++        if let relay = FakeRelay({ _ in }) {
++            let address = relay.address
++            relay.stop()
++            check(RelayProbe.run(address: address, timeout: 2).kind == .unreachable, "a closed port is not reachable")
++        }
++        // (g) a name that does not resolve. A label longer than DNS allows cannot resolve anywhere, not even through a resolver that answers every name.
++        let nonexistent = RelayProbe.run(address: String(repeating: "a", count: 64) + ".invalid:1", timeout: 2)
++        check(nonexistent.kind == .unreachable, "a name that does not resolve is not reachable")
++        // the same name this suite usually runs with, the reserved .invalid TLD: always an answer or a failure, never a relay
++        check(RelayProbe.run(address: "nonexistent.invalid:1", timeout: 2).kind != .ok, "the reserved .invalid name never reaches a relay")
++        // an address the field would refuse
++        check(RelayProbe.run(address: "ho st", timeout: 2).kind == .unreachable, "an invalid address is not reachable")
++        // a server that answers a PING it did not send first, before the handshake: an O(n) prefix of a large payload must not end the test early
++        if let relay = FakeRelay({ fd in
++            _ = readExact(fd, 16)
++            var payload = [UInt8](repeating: 0, count: 65536)   // at the announced frame limit
++            payload[0] = 0x01
++            writeAll(fd, makeFrame(0x03, requestID: 0, payload: payload))
++        }) {
++            let result = RelayProbe.run(address: relay.address, timeout: 1)
++            check(result.kind == .notRelay || result.kind == .unreachable, "a 64 KiB server PING is parsed, then the deadline ends the test")
++            relay.stop()
++        }
++    }
++}
++
++func getenvString(_ key: String) -> String? {
++    getenv(key).map { String(cString: $0) }
++}
++
++/// What a block writes to stderr (the launcher log), captured through a temporary file and put back afterwards.
++func stderrLog(_ body: () -> Void) -> String {
++    let path = NSTemporaryDirectory() + "online-play-stderr-\(UUID().uuidString)"
++    let saved = dup(2)
++    freopen(path, "w", stderr)
++    body()
++    fflush(stderr)
++    if saved >= 0 { dup2(saved, 2); close(saved) }
++    let log = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
++    try? FileManager.default.removeItem(atPath: path)
++    return log
++}
+diff --git a/dm/ios/tests/test_launcher_storage.py b/dm/ios/tests/test_launcher_storage.py
+index cf6a94e..2b1481f 100644
+--- a/dm/ios/tests/test_launcher_storage.py
++++ b/dm/ios/tests/test_launcher_storage.py
+@@ -27,7 +27,8 @@ class LauncherStorageTests(unittest.TestCase):
+                     (tmp / 'launcher_mac.json').write_text(json.dumps(settings.build('01007EF00011E000', tmp / 'patched', tmp / 'control.nacp')))
+             exe = tmp / 'launcher_storage_check'
+             compile_result = subprocess.run(['xcrun', '-sdk', 'macosx', 'swiftc', '-swift-version', '5', '-parse-as-library', '-module-cache-path', str(tmp / 'module-cache'),
+-                            '-o', str(exe), str(REPO / 'dm/ios/Sources/LauncherSettings.swift'), str(REPO / 'dm/ios/Sources/LauncherRow.swift'), str(REPO / 'dm/mac/Launcher.swift'),
++                            '-o', str(exe), str(REPO / 'dm/ios/Sources/LauncherSettings.swift'), str(REPO / 'dm/ios/Sources/LauncherRow.swift'),
++                            str(REPO / 'dm/ios/Sources/OnlinePlay.swift'), str(REPO / 'dm/ios/Sources/OnlinePlayView.swift'), str(REPO / 'dm/mac/Launcher.swift'),
+                             str(Path(__file__).with_name('launcher_layout_check.swift')), str(Path(__file__).with_name('launcher_storage_check.swift'))], capture_output=True, text=True, timeout=300)
+             self.assertEqual(compile_result.returncode, 0, compile_result.stdout + compile_result.stderr)
+             r = subprocess.run([str(exe), str(tmp / 'launcher.json'), str(tmp / 'launcher_mac.json')], capture_output=True, text=True, timeout=60)
+diff --git a/dm/ios/tests/test_online_play.py b/dm/ios/tests/test_online_play.py
+new file mode 100644
+index 0000000..29b7b4c
+--- /dev/null
++++ b/dm/ios/tests/test_online_play.py
+@@ -0,0 +1,48 @@
++"""Compile and run the online play model (dm/ios/Sources/OnlinePlay.swift) with its checks; no simulator or UI required. Runs on macOS with Xcode and on
++Linux when a Swift toolchain is installed."""
++from pathlib import Path
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++REPO = Path(__file__).resolve().parents[3]
++SOURCES = REPO / 'dm/ios/Sources/OnlinePlay.swift'
++CHECK = Path(__file__).with_name('online_play_check.swift')
++SWIFT_DIRS = ('/opt/swift/usr/bin',)
++
++
++def swiftc():
++    """The Swift compiler this machine has: Xcode's on macOS, else one on PATH (then /opt/swift/usr/bin, where a PM-installed toolchain lives)."""
++    if shutil.which('xcrun'):
++        r = subprocess.run(['xcrun', '-sdk', 'macosx', '--find', 'swiftc'], capture_output=True, text=True)
++        if r.returncode == 0 and r.stdout.strip():
++            return ['xcrun', '-sdk', 'macosx', 'swiftc']
++    found = shutil.which('swiftc')
++    if found:
++        return [found]
++    for d in SWIFT_DIRS:
++        candidate = Path(d) / 'swiftc'
++        if candidate.is_file() and os.access(candidate, os.X_OK):
++            return [str(candidate)]
++    return None
++
++
++@unittest.skipUnless(swiftc(), 'needs a Swift toolchain (Xcode, or swiftc on PATH)')
++class OnlinePlayTests(unittest.TestCase):
++    def test_online_play_checks(self):
++        compiler = swiftc()
++        with tempfile.TemporaryDirectory() as tmp:
++            tmp = Path(tmp)
++            exe = tmp / 'online_play_check'
++            compile_result = subprocess.run(compiler + ['-swift-version', '5', '-parse-as-library', '-module-cache-path', str(tmp / 'module-cache'),
++                                                        '-o', str(exe), str(SOURCES), str(CHECK)], capture_output=True, text=True, timeout=300)
++            self.assertEqual(compile_result.returncode, 0, compile_result.stdout + compile_result.stderr)
++            r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
++            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
++            self.assertIn('online play: 0 failed', r.stdout)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/dm/mac/Launcher.swift b/dm/mac/Launcher.swift
+index 07247a0..3b0195f 100644
+--- a/dm/mac/Launcher.swift
++++ b/dm/mac/Launcher.swift
+@@ -1,6 +1,7 @@
+ // Mac app launcher: the settings window shown before the game starts, in the launcher's own process (launcher.c calls dm_mac_launcher before it starts the host). Its settings come from the
+ // app's Resources/dm/launcher.json (dm/games/settings.py with SETTINGS_PLATFORM=mac); the model and the rows are the iOS launcher's (dm/ios/Sources/LauncherSettings.swift, LauncherRow.swift),
+-// and so is the store: launcher.<VAR> in the app's preferences, which launcher.c reads when the window is not shown (docs/frontends.md, Saved choices). Basic settings (level basic) come
++// and so is the store: launcher.<VAR> in the app's preferences, which launcher.c reads when the window is not shown (docs/frontends.md, Saved choices). The Online play section is the iOS
++// launcher's too (OnlinePlay.swift, OnlinePlayView.swift). Basic settings (level basic) come
+ // first, the others under Advanced settings, each in the list's sections. Play puts the settings into this process's environment, which the host inherits; Quit and closing the window end the
+ // app without the game. "Show this window at launch" off: no window unless Option is held at launch, and launcher.c applies the saved choices. The window never takes focus by itself: an app
+ // opened in the background (open -g) keeps its window behind until the player switches to it
+@@ -11,6 +12,7 @@ private func info(_ key: String) -> String? { Bundle.main.object(forInfoDictiona
+ 
+ struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
++    @ObservedObject var online: OnlinePlayState
+     let done: (Bool) -> Void
+     let fit: (CGFloat) -> Void
+     @AppStorage("window.show") private var show = true
+@@ -29,6 +31,7 @@ struct LauncherView: View {
+             .padding([.horizontal, .top], 20)
+             Form {
+                 settingSections(basic: true)
++                OnlinePlaySection(state: online)
+                 CloudSavesSection()
+                 Section {
+                     DisclosureGroup("Advanced settings", isExpanded: $advanced) {}
+@@ -119,10 +122,11 @@ struct CloudSavesSection: View {
+ 
+ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
+     let model: LauncherModel
++    let online: OnlinePlayState
+     var window: NSWindow?
+     var play = false
+ 
+-    init(_ model: LauncherModel) { self.model = model }
++    init(_ model: LauncherModel, _ online: OnlinePlayState) { self.model = model; self.online = online }
+ 
+     func applicationDidFinishLaunching(_ n: Notification) {
+         let name = info("CFBundleName") ?? "Game"
+@@ -137,7 +141,7 @@ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate
+         if let screen = w.screen ?? NSScreen.main {
+             w.setFrameTopLeftPoint(NSPoint(x: screen.visibleFrame.midX - w.frame.width / 2, y: screen.visibleFrame.maxY))
+         }
+-        let host = NSHostingView(rootView: LauncherView(m: model, done: { [weak self] in self?.finish($0) }, fit: { [weak self] in self?.fit($0) }))
++        let host = NSHostingView(rootView: LauncherView(m: model, online: online, done: { [weak self] in self?.finish($0) }, fit: { [weak self] in self?.fit($0) }))
+         host.sizingOptions = []   // the Form's measured scroll content owns the height, including after collapse
+         w.contentView = host
+         host.layoutSubtreeIfNeeded()
+@@ -174,17 +178,23 @@ enum LauncherWindowLayout {
+     }
+ }
+ 
+-// 1: Play (the window's settings are in the environment), 0: the player quit, 2: no window (no launcher.json, or "Show this window at launch" off): launcher.c applies the saved choices
++// 1: Play (the window's settings are in the environment), 0: the player quit, 2: no window (no launcher.json, or "Show this window at launch" off): launcher.c applies the saved choices and calls dm_mac_online_apply
+ @_cdecl("dm_mac_launcher")
+ public func dmMacLauncher() -> Int32 {
+-    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else { return 2 }
+-    guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return 2 }
++    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else {
++        return 2
++    }
++    guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else {
++        fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr)
++        return 2
++    }
+     if (UserDefaults.standard.object(forKey: "window.show") as? Bool) == false && !NSEvent.modifierFlags.contains(.option) {
+         fputs("launcher: settings window off (hold Option at launch to show it)\n", stderr)
+         return 2
+     }
+     let model = LauncherModel(file.settings)
+-    let app = NSApplication.shared, launcher = Launcher(model)
++    let online = OnlinePlayState(OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName))
++    let app = NSApplication.shared, launcher = Launcher(model, online)
+     app.setActivationPolicy(.regular)
+     app.delegate = launcher
+     fputs("launcher: \(file.settings.count) settings shown\n", stderr)
+@@ -192,5 +202,12 @@ public func dmMacLauncher() -> Int32 {
+     app.setActivationPolicy(.prohibited)   // the host is the game's app from here on
+     guard launcher.play else { fputs("launcher: quit without starting the game\n", stderr); return 0 }
+     model.apply()
++    online.model.apply()
+     return 1
+ }
++
++// The saved Online play settings for the paths without a window (DM_LAUNCHER=0, --no-launcher): launcher.c calls this in its shown == 2 branch, next to saved_choices
++@_cdecl("dm_mac_online_apply")
++public func dmMacOnlineApply() {
++    OnlinePlayModel.applySaved(defaultName: OnlinePlayState.deviceName)
++}
+diff --git a/dm/mac/launcher.c b/dm/mac/launcher.c
+index aafb831..fc282b5 100644
+--- a/dm/mac/launcher.c
++++ b/dm/mac/launcher.c
+@@ -30,6 +30,7 @@
+ 
+ extern char **environ;
+ int dm_mac_launcher(void);   // Launcher.swift: 1 = Play (the settings are in the environment), 0 = the player quit, 2 = no window (apply the saved choices here)
++void dm_mac_online_apply(void);   // Launcher.swift: the saved Online play settings into the environment, for the no-window path (dm_mac_launcher does it for Play)
+ static pid_t g_child;
+ static char *g_file_keys, *g_launch_keys;   // the variables the env files set, and the settings the launch environment set (DM_ENV_FILE_KEYS, DM_ENV_LAUNCH_KEYS)
+ 
+@@ -278,7 +279,7 @@ int main(int argc, char **argv) {
+     if (!window) fprintf(stderr, "launcher: no settings window (DM_LAUNCHER=0 or --no-launcher)\n");
+     int shown = window ? dm_mac_launcher() : 2;
+     if (!shown) return 0;   // Quit: no game
+-    if (shown == 2) saved_choices();
++    if (shown == 2) { saved_choices(); dm_mac_online_apply(); }   // no window: the shared settings here, Online play from the same saved preferences
+     cloud_saves_folder();
+     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
+     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);
+diff --git a/dm/mac/pack_app.py b/dm/mac/pack_app.py
+index 48f2ac9..1109a26 100755
+--- a/dm/mac/pack_app.py
++++ b/dm/mac/pack_app.py
+@@ -80,8 +80,9 @@ def min_os(host):   # the host's deployment target (LC_BUILD_VERSION minos): the
+     return m.group(1) if m else '14.0'
+ 
+ 
+-def swift_sources():   # the settings window, with the iOS launcher's model and rows
+-    return [HERE / 'Launcher.swift', HERE.parent / 'ios/Sources/LauncherSettings.swift', HERE.parent / 'ios/Sources/LauncherRow.swift']
++def swift_sources():   # the settings window, with the iOS launcher's model, rows and online play section
++    return [HERE / 'Launcher.swift', HERE.parent / 'ios/Sources/LauncherSettings.swift', HERE.parent / 'ios/Sources/LauncherRow.swift',
++            HERE.parent / 'ios/Sources/OnlinePlay.swift', HERE.parent / 'ios/Sources/OnlinePlayView.swift']
+ 
+ 
+ def build_launcher(out, minos, clang, swiftc, sdk):   # launcher.c's main and the host's cloud-save code (its send after the host exits), linked by swiftc with the settings window (no Swift main: -parse-as-library)
+diff --git a/dm/tools/tests/test_nsp_mac_app.py b/dm/tools/tests/test_nsp_mac_app.py
+index 958926b..8717a3a 100644
+--- a/dm/tools/tests/test_nsp_mac_app.py
++++ b/dm/tools/tests/test_nsp_mac_app.py
+@@ -119,6 +119,7 @@ class PackReuse(unittest.TestCase):
+             'env.txt': b'DM_TEST=1', 'split.tsv': b'split', 'icon.jpg': b'jpeg', 'source/launcher.c': b'launcher',
+             'host/romfs_image.h': b'validator', 'host/save_sync.c': b'sync', 'host/save_sync.h': b'sync api', 'tools/romfs.py': b'reader',
+             'source/Launcher.swift': b'window', 'ios/Sources/LauncherSettings.swift': b'model', 'ios/Sources/LauncherRow.swift': b'rows',
++            'ios/Sources/OnlinePlay.swift': b'online play', 'ios/Sources/OnlinePlayView.swift': b'online play rows',
+         }
+         for n in pack_app.TABLES: files['profile/' + n] = n.encode()
+         for n, content in files.items(): (t / n).write_bytes(content)
+@@ -197,7 +198,8 @@ class PackReuse(unittest.TestCase):
+         names = ['dmhost', 'patched/main.patched.bin', 'patched/main.fixups.tsv', 'patched/main.gates.tsv', 'patched/main.cuts.tsv',
+                  'patched/main.obs.tsv', 'patched/nro.tsv', 'msl/k.metallib', 'msl/k.json', 'msl/inputs.tsv', 'font/nintendo_ext.ttf',
+                  'pso/gpu.mtl4a', 'pso/prebuilt.tsv', 'pso/rest_pairs.tsv', 'pso/archive.tsv', 'env.txt', 'icon.jpg', 'source/launcher.c',
+-                 'source/Launcher.swift', 'ios/Sources/LauncherSettings.swift', 'ios/Sources/LauncherRow.swift',   # the settings window's sources
++                 'source/Launcher.swift', 'ios/Sources/LauncherSettings.swift', 'ios/Sources/LauncherRow.swift',
++                 'ios/Sources/OnlinePlay.swift', 'ios/Sources/OnlinePlayView.swift',   # the settings window's sources
+                  'host/save_sync.c', 'host/save_sync.h']   # the cloud-save code the launcher links (its send after the host exits)
+         names += ['profile/' + n for n in pack_app.TABLES]
+         for name in names:
+@@ -258,7 +260,8 @@ class PackReuse(unittest.TestCase):
+         self.assertIn(c[c.index('-o') + 1], s)   # launcher.c's object, with its main
+         sync = next(c for c in self.commands if Path(c[0]).name == 'clang' and '-o' in c and c[-1].endswith('save_sync.c'))
+         self.assertIn(sync[sync.index('-o') + 1], s)   # save_sync.c's object: the launcher sends the save once the host has exited
+-        self.assertEqual([Path(x).name for x in s if x.endswith('.swift')], ['Launcher.swift', 'LauncherSettings.swift', 'LauncherRow.swift'])
++        self.assertEqual([Path(x).name for x in s if x.endswith('.swift')],
++                         ['Launcher.swift', 'LauncherSettings.swift', 'LauncherRow.swift', 'OnlinePlay.swift', 'OnlinePlayView.swift'])
+ 
+     def test_selected_file_modes_and_file_additions_and_removals_invalidate(self):
+         self.pack()
+@@ -315,7 +318,8 @@ class PackReuse(unittest.TestCase):
+     def test_missing_selected_inputs_fail_before_reuse_or_partial_creation(self):
+         self.pack()
+         for name in ('dmhost', 'patched/main.fixups.tsv', 'msl/k.metallib', 'romfs/marker', 'pso/prebuilt.tsv', 'env.txt', 'icon.jpg',
+-                     'font', 'aoc', 'profile', 'bin/clang', 'bin/swiftc', 'sdk', 'bin/codesign', 'source/launcher.c', 'source/Launcher.swift', 'ios/Sources/LauncherRow.swift'):
++                     'font', 'aoc', 'profile', 'bin/clang', 'bin/swiftc', 'sdk', 'bin/codesign', 'source/launcher.c', 'source/Launcher.swift', 'ios/Sources/LauncherRow.swift',
++                     'ios/Sources/OnlinePlay.swift', 'ios/Sources/OnlinePlayView.swift'):
+             with self.subTest(name=name):
+                 p = self.tmp / name; hidden = p.with_name(p.name + '.hidden'); p.rename(hidden)
+                 try:
+diff --git a/docs/LDN-RELAY.md b/docs/LDN-RELAY.md
+index d0185bb..a2e05c5 100644
+--- a/docs/LDN-RELAY.md
++++ b/docs/LDN-RELAY.md
+@@ -6,6 +6,8 @@ symbol lookup and all offline behavior are unchanged.
+ 
+ ## Configure
+ 
++Players normally use the Online play section of the game's settings screen ([LDN-SETTINGS.md](LDN-SETTINGS.md)). The variables below are what that section sets, and a variable set in env.txt wins.
++
+ Set these in the NX2Apple environment before launching the game:
+ 
+ | Variable | Meaning |
+diff --git a/docs/LDN-SETTINGS.md b/docs/LDN-SETTINGS.md
+new file mode 100644
+index 0000000..ccc4c49
+--- /dev/null
++++ b/docs/LDN-SETTINGS.md
+@@ -0,0 +1,73 @@
++# Online play settings (LDN relay)
++
++This page designs the in-app settings for [LDN relay multiplayer](LDN-RELAY.md). Players on iPhone and Mac turn online play on, pick a relay server, set a player name and an optional room password, test the connection and share an invite with friends. Nobody has to set an environment variable.
++
++## Goals
++
++- Online play works on iPhone, where environment variables cannot be set, and on Mac, without a terminal.
++- Friends join by pasting one invite, and switch servers with one tap.
++- Off by default. With online play off nothing changes: no variable is set and the host behaves exactly as before.
++- An isolated module. The host still reads only the `DM_LDNR*` variables (LDN-RELAY.md, Configure), so the relay client and its tests are unchanged. The launchers gain one section and a few hook lines.
++
++## Mechanism
++
++Both game launchers already work the same way: the settings screen runs before the game starts and puts the player's choices into the process environment, which the host reads (iOS `dm/ios/Sources/Launcher.swift`, Mac `dm/mac/Launcher.swift`, both on the model in `LauncherSettings.swift`). Online play uses the same path.
++
++- `dm/ios/Sources/OnlinePlay.swift` holds the model, the validation, the invite format, the connection test and the environment it writes. It needs only Foundation (POSIX sockets for the test), so the same file builds for iOS, for the Mac launcher and for the tests.
++- `dm/ios/Sources/OnlinePlayView.swift` is the SwiftUI section, with small `#if os(iOS)` / `os(macOS)` branches (the device name, the clipboard).
++- Play calls `OnlinePlayModel.apply()`, which sets or clears `DM_LDNR`, `DM_LDNR_SERVER`, `DM_LDNR_NAME`, `DM_LDNR_ROOM_PASSWORD` and `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD`. When the screen is not shown (iOS `DM_LAUNCHER=0`, Mac "Show this window at launch" off, Mac `DM_LAUNCHER=0` or `--no-launcher`) the saved settings apply in the same way, unless `DM_SAVED_CHOICES=0` ignores them as it ignores the other saved choices.
++- **The environment wins.** A `DM_LDNR*` variable set by an env file (`Documents/env.txt`, the bundle's `dm/env.txt`, the Mac app's `env.txt`) or by the launch environment is never replaced. The section shows that value and marks it as set by env.txt. Scripts and front ends that use the variables keep working.
++- `DM_LDNR_LOG` stays an environment-only diagnostic switch.
++
++## Where settings live
++
++| Setting | iPhone | Mac |
++| --- | --- | --- |
++| Online play on or off | this game's app | this game's app |
++| Saved servers, chosen server, player name, room password, plaintext consent | this game's app | shared by every game app (`com.nx2apple.online` preferences) |
++
++On iPhone every game is its own app and cannot read another app's settings without an App Group entitlement, which a sideloaded build may not have. The invite closes that gap: paste the same invite into each game. On Mac the game apps are not sandboxed, so the connection details are set once for all games, and each game only decides whether it plays online.
++
++The room password is stored in the app's preferences (UserDefaults), not the Keychain. A room password is meant to be shared in an invite, and Copy invite has to read it back, so it is not kept as a secret of the device.
++
++Keys: `online.enabled` (Bool, per game), `online.servers` (JSON array of `{"name", "address"}`), `online.server` (the chosen address), `online.name`, `online.password`, `online.plaintextConsent` (Bool).
++
++## The Online play section
++
++The section sits on the settings screen below the game's own settings. On Mac it is part of the basic settings, above Cloud saves. Every string has English and Simplified Chinese text, picked from the system language.
++
++1. **Online play** toggle (联机游戏). Footer: "Local wireless play reaches friends over the internet through a relay server. Everyone picks the same server, and the same room password when one is set." When off, the rest of the section is hidden.
++2. **Server** (服务器): a menu of the saved servers, shown as name and address. Below it **Add server…** (添加服务器), and for the chosen server **Edit** and **Remove**. The add and edit sheet has Name (optional) and Address (`host`, `host:port`, `[IPv6]:port`, placeholder `relay.example.com:11470`). Validation is live: an empty host, spaces, a scheme or a path, or a port outside 1 to 65535 shows a red line under the field and disables Save. A missing port means 11470, as in the client. A pasted `ldnr://` prefix is removed.
++3. **Test connection** (测试连接): connects to the chosen server with a 5 second limit, sends HELLO, reads HELLO_ACK, sends one PING and times the PONG. The result line is one of
++   - green: "Connected · 38 ms · protocol 1.2 · <server name>"
++   - "Not reachable: <reason>" (no route, refused, timed out, name not found)
++   - "This is not an LDN relay server"
++   - "The server speaks an older protocol" (ERROR VERSION_UNSUPPORTED, a HELLO_ACK minor below 2, or a HELLO_ACK without the capabilities the game needs, 0x1e of the 0x1f it asks for)
++   The test never runs by itself. It uses no game data and sends no password. A server name that needs a DNS lookup can take longer than the 5 second socket timeout, because the lookup itself has no time limit. A server fixed by an env file is tested exactly as the host gets it, so a value the host would not read as written (an `ldnr://` prefix, a trailing `/`) is not tested or shared. On iPhone the first connection to a relay on the local network asks for the Local Network permission (`NSLocalNetworkUsageDescription` in `dm/ios/project.yml`).
++4. **Player name** (玩家名称): a text field. Empty uses the device name (on iPhone the system name, often just "iPhone", so the placeholder suggests setting one). The counter shows the bytes left of the native 32-byte field. Longer names are cut at a character boundary, never inside a character.
++5. **Room password** (房间密码), optional: a secure field. A room password keeps strangers on the same server out of your room. It is cut at a character boundary to the host's 64-byte passphrase field, and the counter shows the bytes left of 64. When it is set, a warning appears: "The relay connection is not encrypted. The password and the game traffic can be read on the network. Use a password only on a trusted network or a VPN, and never one you use elsewhere. The server must allow passwords without TLS." With it the toggle **Send the password unencrypted** (允许明文发送密码). Without that consent online play does not start: Play writes no `DM_LDNR*` variable, the log says that it waits for the password consent, and the section shows "Online play will not start until you allow the password" in red. Clearing the password clears the consent. A `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD` set by an env file counts as consent, and its value decides in place of the toggle. A password fixed by an env file is left to the file, so it never waits for the app's consent, and the toggle never allows it. Only the file's own `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD=1` does.
++6. **Invite a friend** (邀请好友): **Copy invite** copies a short text with the server and, when one is set, the room password, and a link of the form `nx2apple-ldn://join?server=<address>&password=<password>&name=<server name>`. The invite carries the effective server and password, so a server or password fixed by an env file is the one friends get. **Paste invite** reads the clipboard, adds the server to the list when it is new, chooses it, fills in the password and asks again for the plaintext consent. When `DM_LDNR_SERVER` is fixed, a pasted invite for another server is refused and the section says so. Anything that is not an invite shows "The clipboard has no invite".
++7. A footer under the section: "Status during play is in the game's log (lines starting with ldnr)."
++
++When online play is on but no valid server is chosen, Play still starts the game offline and the section says "Choose a server to play online".
++
++## Flows
++
++**Host a game with friends.** Start the relay (`docker compose up -d` in ldn-relay-server, TCP port 11470 open to the internet). Open the game, turn on Online play, Add server with the public address, Test connection, optionally set a room password and allow it, then Copy invite and send it to friends. Play, then create a room in the game's local wireless menu.
++
++**Join a friend.** Copy the invite from the chat. Open the game, turn on Online play, Paste invite, Test connection, Play, then search for rooms in the game's local wireless menu.
++
++**Switch servers.** Pick another server in the Server menu (or paste a new invite). The next Play uses it. Changing the server needs the game to restart, because the host reads the settings once when the relay starts.
++
++**iPhone and Mac together.** Both use the same server and room password. The same invite text works on both.
++
++## Not in this version
++
++- An in-game status indicator. The host has no overlay for this yet, so the status stays in the log. A later version can show it in the HUD.
++- QR codes and a camera scanner. The invite text travels through any chat app.
++- A per-game server on Mac. The section is designed so a per-game override can be added later without moving the keys.
++- An encrypted transport. See the transport note in LDN-RELAY.md.
++
++## Tests
++
++`dm/ios/tests/test_online_play.py` compiles `OnlinePlay.swift` with `dm/ios/tests/online_play_check.swift` and runs it: address validation, name truncation, invite round trip and parsing, the environment written for every combination (off, on, no server, password with and without consent, values set by env.txt), persistence through a private `UserDefaults` suite, the HELLO and PING frames byte for byte, and the connection test against a fake relay on loopback (a good HELLO_ACK, VERSION_UNSUPPORTED, garbage, silence until the timeout, a closed port). It runs on Mac with Xcode, and on Linux when a Swift toolchain is installed. `test_launcher_storage.py` builds the Mac launcher with the new files, so the view is compiled too.
+diff --git a/docs/development.md b/docs/development.md
+index 7b7fa3a..dfa8c49 100644
+--- a/docs/development.md
++++ b/docs/development.md
+@@ -516,7 +516,7 @@ The bundle holds what the IPA holds, with the Mac's shader libraries:
+ ```
+ <game name>.app/Contents/
+   Info.plist                 name, version, bundle ID, the profile's app_category; DMTitleID, DMRomfsMarker, DMLanguage, DMModuleFiles and DMSettings for the launcher
+-  MacOS/nxnative             the launcher (dm/mac/launcher.c, linked by pack_app.py with swiftc and its settings window: dm/mac/Launcher.swift, LauncherSettings.swift and LauncherRow.swift)
++  MacOS/nxnative             the launcher (dm/mac/launcher.c, linked by pack_app.py with swiftc and its settings window: dm/mac/Launcher.swift and the iOS launcher's LauncherSettings.swift, LauncherRow.swift, OnlinePlay.swift and OnlinePlayView.swift)
+   MacOS/dmhost               the Mac host built for the profile
+   Resources/romfs.img        the packed version's RomFS image
+   Resources/msl/b-<chain>/   the Mac shader libraries, reflection JSON and runtime TSV tables (vk/ or gl/ for a Vulkan or GL game)
+diff --git a/docs/settings.md b/docs/settings.md
+index 0f992d4..fd3d6e3 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -7,6 +7,7 @@ The screen before the game starts shows the settings the game supports. A settin
+ - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff)
+ - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+ - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
++- [Online play](#online-play)
+ - [TV](#tv)
+ - [Settings in a file](#settings-in-a-file)
+ 
+@@ -207,6 +208,10 @@ A save that is replaced, on the device or in iCloud Drive, is kept first, beside
+ 
+ iCloud Drive takes a moment to carry a file from one device to the other. Quit the game on one device and give it a few seconds before you start it on the other. Without a connection the game plays on with the save it has and sends it later. The game log says what came in and what went out (lines starting with `save sync:`).
+ 
++## Online play
++
++**Online play** at the bottom of the screen lets local wireless games reach friends over the internet through an LDN relay server. Turn it on, add the server everyone uses (Add server…), test the connection, and send an invite with **Copy invite**. A friend pastes it with **Paste invite**, and the same server and room password are filled in. A room password is optional and unencrypted, so use one only on a trusted network. The settings are off by default, and on the Mac the servers and the password are shared by every game app while each game decides whether it plays online. The whole design, the invite link and the variables the section sets (`DM_LDNR*`, which an `env.txt` still wins over) are in [Online play settings](LDN-SETTINGS.md) and [LDN relay multiplayer](LDN-RELAY.md).
++
+ ## TV
+ 
+ Connect a TV or monitor by cable, or start Screen Mirroring to an Apple TV or AirPlay TV. The game fills it in 16:9 at up to 1080p and switches to **Docked**; the iPhone or iPad keeps the controls. Disconnect to bring the game back to the device in its earlier mode. AirPlay adds some delay; a cable has almost none.
