@@ -10,7 +10,7 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
 
 ---
  dm/host/Makefile                |    2 +-
- dm/host/hle_ldnr.c              |  984 +++++++++
+ dm/host/hle_ldnr.c              |  989 +++++++++
  dm/host/ldnr/ldnr.c             |  989 +++++++++
  dm/host/ldnr/ldnr.h             |  131 ++
  dm/host/ldnr/ldnr_client.c      |  640 ++++++
@@ -36,7 +36,7 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
  dm/host/ldnr/tests/t_vnet.c     | 3328 +++++++++++++++++++++++++++++++
  dm/host/loader.c                |   16 +-
  docs/LDN-RELAY.md               |   96 +
- 27 files changed, 14716 insertions(+), 5 deletions(-)
+ 27 files changed, 14721 insertions(+), 5 deletions(-)
  create mode 100644 dm/host/hle_ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.h
@@ -78,10 +78,10 @@ index 978fee0..3038a23 100644
  	rm -rf gen dmhost dmhost_* *.dSYM
 diff --git a/dm/host/hle_ldnr.c b/dm/host/hle_ldnr.c
 new file mode 100644
-index 0000000..ca2f5d6
+index 0000000..4156272
 --- /dev/null
 +++ b/dm/host/hle_ldnr.c
-@@ -0,0 +1,984 @@
+@@ -0,0 +1,989 @@
 +// Optional nn::ldn / nn::socket takeover for relay play. The separate swldnr
 +// section keeps force_init's upstream duplicate check and accounting unchanged.
 +#ifdef LDNR_GLUE_SYNTAX_TEST
@@ -981,6 +981,10 @@ index 0000000..ca2f5d6
 +// byte-count calls must keep the pointer-width ssize_t — the guest reads
 +// x0 whole, and a narrower return would not sign-extend -1 — while the
 +// fixed-width calls keep their s32, void or Result.
++// The pins exist only to type-check, so they are never referenced.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wunused-const-variable"
++#pragma GCC diagnostic ignored "-Wunused-variable"
 +static ssize_t (*const ldnr_sig_sendto_old)(int, const void *, unsigned long, int, const void *, unsigned) = lr_sendto_old;
 +static ssize_t (*const ldnr_sig_sendto_new)(int, const void *, unsigned long, int, const void *, unsigned) = lr_sendto_new;
 +static ssize_t (*const ldnr_sig_sendto_c)(int, const void *, unsigned long, int, const void *, unsigned) = lr_sendto_c;
@@ -1056,6 +1060,7 @@ index 0000000..ca2f5d6
 +static int (*const ldnr_sig_resolver_set)(const void *) = lr_resolver_set;
 +static int (*const ldnr_sig_ns_resolver_get)(void *, int) = lr_ns_resolver_get;
 +static int (*const ldnr_sig_ns_resolver_set)(const void *) = lr_ns_resolver_set;
++#pragma GCC diagnostic pop
 +#endif
 +
 +// Unity build: the host Makefile picks up hle_ldnr.c without any upstream
