@@ -25,11 +25,11 @@ Issue: veildawn/NX2Apple (owner request, in-app online play settings for the LDN
 
 ---
  dm/ios/Sources/Launcher.swift            |  24 +-
- dm/ios/Sources/OnlinePlay.swift          | 682 ++++++++++++++++++++++
+ dm/ios/Sources/OnlinePlay.swift          | 693 ++++++++++++++++++++++
  dm/ios/Sources/OnlinePlayView.swift      | 474 +++++++++++++++
  dm/ios/project.yml                       |   1 +
  dm/ios/tests/launcher_layout_check.swift |   3 +-
- dm/ios/tests/online_play_check.swift     | 711 +++++++++++++++++++++++
+ dm/ios/tests/online_play_check.swift     | 720 +++++++++++++++++++++++
  dm/ios/tests/test_launcher_storage.py    |   3 +-
  dm/ios/tests/test_online_play.py         |  48 ++
  dm/mac/Launcher.swift                    |  31 +-
@@ -40,7 +40,7 @@ Issue: veildawn/NX2Apple (owner request, in-app online play settings for the LDN
  docs/LDN-SETTINGS.md                     |  73 +++
  docs/development.md                      |   2 +-
  docs/settings.md                         |   5 +
- 16 files changed, 2057 insertions(+), 20 deletions(-)
+ 16 files changed, 2077 insertions(+), 20 deletions(-)
  create mode 100644 dm/ios/Sources/OnlinePlay.swift
  create mode 100644 dm/ios/Sources/OnlinePlayView.swift
  create mode 100644 dm/ios/tests/online_play_check.swift
@@ -48,7 +48,7 @@ Issue: veildawn/NX2Apple (owner request, in-app online play settings for the LDN
  create mode 100644 docs/LDN-SETTINGS.md
 
 diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
-index f20e403..ffea257 100644
+index f20e403..d0f2913 100644
 --- a/dm/ios/Sources/Launcher.swift
 +++ b/dm/ios/Sources/Launcher.swift
 @@ -153,6 +153,7 @@ private struct DocumentPicker: UIViewControllerRepresentable {
@@ -75,18 +75,18 @@ index f20e403..ffea257 100644
 -    guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
 -    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); LauncherModel(file.settings).applySaved(); return false }
 +    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else {
-+        OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName).apply()   // the online settings apply on every path to the game
++        OnlinePlayModel.applySaved(defaultName: OnlinePlayState.deviceName)   // the online settings apply on every path to the game
 +        return false
 +    }
 +    guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else {
 +        fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr)
-+        OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName).apply()
++        OnlinePlayModel.applySaved(defaultName: OnlinePlayState.deviceName)
 +        return false
 +    }
 +    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" {
 +        fputs("launcher: off (DM_LAUNCHER=0)\n", stderr)
 +        LauncherModel(file.settings).applySaved()
-+        OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName).apply()
++        OnlinePlayModel.applySaved(defaultName: OnlinePlayState.deviceName)
 +        return false
 +    }
      let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
@@ -104,10 +104,10 @@ index f20e403..ffea257 100644
      let h = UIHostingController(rootView: view)
 diff --git a/dm/ios/Sources/OnlinePlay.swift b/dm/ios/Sources/OnlinePlay.swift
 new file mode 100644
-index 0000000..9fbbe05
+index 0000000..c246f71
 --- /dev/null
 +++ b/dm/ios/Sources/OnlinePlay.swift
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,693 @@
 +// Online play: the LDN relay settings the game launchers collect and write into the environment the host reads (docs/LDN-SETTINGS.md). Foundation only
 +// (POSIX sockets for the connection test come from Darwin or Glibc), so the same file builds for the iPhone app, for the Mac launcher and for the regression
 +// tests. The host still reads only the DM_LDNR* variables: nothing here changes the relay client.
@@ -364,6 +364,16 @@ index 0000000..9fbbe05
 +        let shared = UserDefaults.standard
 +        #endif
 +        return OnlinePlayModel(game: .standard, shared: shared, environment: launchEnvironmentSnapshot, defaultName: defaultName)
++    }
++
++    /// The saved settings for a start without the settings screen (DM_LAUNCHER=0, no launcher.json, the Mac window off). DM_SAVED_CHOICES=0 ignores them
++    /// as it ignores the other saved choices: nothing is written, the host starts offline unless the environment itself turns online play on.
++    static func applySaved(defaultName: String) {
++        if launchEnvironmentSnapshot["DM_SAVED_CHOICES"] == "0" {
++            fputs("launcher: saved online play ignored (DM_SAVED_CHOICES=0)\n", stderr)
++            return
++        }
++        standard(defaultName: defaultName).apply()
 +    }
 +
 +    /// The environment this process started with, read once the first time a launcher makes a model. A launcher shown again in the same process
@@ -655,6 +665,7 @@ index 0000000..9fbbe05
 +                switch frame.type {
 +                case 0x02:   // HELLO_ACK
 +                    guard let ack = parseHelloAck(frame.payload) else { return failure(.notRelay, "bad HELLO_ACK") }
++                    if ack.major != 1 || frame.version != 1 { return failure(.oldProtocol, "protocol \(ack.major).\(ack.minor)") }   // the game speaks major 1 only
 +                    if ack.minor < 2 { return failure(.oldProtocol, "protocol 1.\(ack.minor)") }
 +                    if ack.capabilities & requiredCapabilities != requiredCapabilities {   // the game would refuse this relay at its handshake
 +                        return failure(.oldProtocol, "missing features (capabilities 0x\(String(ack.capabilities, radix: 16)))")
@@ -1298,10 +1309,10 @@ index 3562502..4d87ac1 100644
          // loop until the report meets the step's expectation and has held for 0.2 s; after 5 s the check sees whatever was reported last
 diff --git a/dm/ios/tests/online_play_check.swift b/dm/ios/tests/online_play_check.swift
 new file mode 100644
-index 0000000..a42482b
+index 0000000..b01d432
 --- /dev/null
 +++ b/dm/ios/tests/online_play_check.swift
-@@ -0,0 +1,711 @@
+@@ -0,0 +1,720 @@
 +// The online play model (OnlinePlay.swift), run by test_online_play.py: address validation and splitting, name truncation, the invite round trip,
 +// persistence through a private UserDefaults suite, the environment Play writes for every combination, and the connection test's frames and
 +// behaviour against a fake relay on loopback. Compiles with OnlinePlay.swift alone (-parse-as-library), on macOS or Linux.
@@ -1950,6 +1961,15 @@ index 0000000..a42482b
 +            check(RelayProbe.run(address: relay.address, timeout: 5).kind == .oldProtocol, "a HELLO_ACK without capabilities 0x1e is refused, as the game does")
 +            relay.stop()
 +        }
++        // (c3) another protocol major: the game speaks major 1 only
++        if let relay = FakeRelay({ fd in
++            guard let hello = readFrame(fd) else { return }
++            writeAll(fd, helloAck(requestID: hello.requestID, major: 2))
++            answerPing(fd)
++        }) {
++            check(RelayProbe.run(address: relay.address, timeout: 5).kind == .oldProtocol, "a HELLO_ACK for major 2 is refused, as the game does")
++            relay.stop()
++        }
 +        // (d) not a relay
 +        if let relay = FakeRelay({ fd in
 +            _ = readExact(fd, 16)
@@ -2082,7 +2102,7 @@ index 0000000..29b7b4c
 +if __name__ == '__main__':
 +    unittest.main()
 diff --git a/dm/mac/Launcher.swift b/dm/mac/Launcher.swift
-index 07247a0..b43330f 100644
+index 07247a0..3b0195f 100644
 --- a/dm/mac/Launcher.swift
 +++ b/dm/mac/Launcher.swift
 @@ -1,6 +1,7 @@
@@ -2171,7 +2191,7 @@ index 07247a0..b43330f 100644
 +// The saved Online play settings for the paths without a window (DM_LAUNCHER=0, --no-launcher): launcher.c calls this in its shown == 2 branch, next to saved_choices
 +@_cdecl("dm_mac_online_apply")
 +public func dmMacOnlineApply() {
-+    OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName).apply()
++    OnlinePlayModel.applySaved(defaultName: OnlinePlayState.deviceName)
 +}
 diff --git a/dm/mac/launcher.c b/dm/mac/launcher.c
 index aafb831..fc282b5 100644
@@ -2267,7 +2287,7 @@ index d0185bb..a2e05c5 100644
  | Variable | Meaning |
 diff --git a/docs/LDN-SETTINGS.md b/docs/LDN-SETTINGS.md
 new file mode 100644
-index 0000000..225cc5f
+index 0000000..ccc4c49
 --- /dev/null
 +++ b/docs/LDN-SETTINGS.md
 @@ -0,0 +1,73 @@
@@ -2288,7 +2308,7 @@ index 0000000..225cc5f
 +
 +- `dm/ios/Sources/OnlinePlay.swift` holds the model, the validation, the invite format, the connection test and the environment it writes. It needs only Foundation (POSIX sockets for the test), so the same file builds for iOS, for the Mac launcher and for the tests.
 +- `dm/ios/Sources/OnlinePlayView.swift` is the SwiftUI section, with small `#if os(iOS)` / `os(macOS)` branches (the device name, the clipboard).
-+- Play calls `OnlinePlayModel.apply()`, which sets or clears `DM_LDNR`, `DM_LDNR_SERVER`, `DM_LDNR_NAME`, `DM_LDNR_ROOM_PASSWORD` and `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD`. When the screen is not shown (iOS `DM_LAUNCHER=0`, Mac "Show this window at launch" off) the saved settings apply in the same way.
++- Play calls `OnlinePlayModel.apply()`, which sets or clears `DM_LDNR`, `DM_LDNR_SERVER`, `DM_LDNR_NAME`, `DM_LDNR_ROOM_PASSWORD` and `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD`. When the screen is not shown (iOS `DM_LAUNCHER=0`, Mac "Show this window at launch" off, Mac `DM_LAUNCHER=0` or `--no-launcher`) the saved settings apply in the same way, unless `DM_SAVED_CHOICES=0` ignores them as it ignores the other saved choices.
 +- **The environment wins.** A `DM_LDNR*` variable set by an env file (`Documents/env.txt`, the bundle's `dm/env.txt`, the Mac app's `env.txt`) or by the launch environment is never replaced. The section shows that value and marks it as set by env.txt. Scripts and front ends that use the variables keep working.
 +- `DM_LDNR_LOG` stays an environment-only diagnostic switch.
 +
