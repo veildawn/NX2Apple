@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: veildawn <40253459+veildawn@users.noreply.github.com>
-Date: Sun, 1 Nov 2026 14:15:11 +0800
+Date: Sun, 1 Nov 2026 15:06:22 +0800
 Subject: [PATCH] LDN relay client: nn::ldn over an LDN relay server (opt-in,
  DM_LDNR=1)
 
@@ -10,33 +10,33 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
 
 ---
  dm/host/Makefile                |    2 +-
- dm/host/hle_ldnr.c              |  895 ++++++++++
- dm/host/ldnr/ldnr.c             |  976 +++++++++++
+ dm/host/hle_ldnr.c              |  895 +++++++++
+ dm/host/ldnr/ldnr.c             |  989 ++++++++++
  dm/host/ldnr/ldnr.h             |  131 ++
- dm/host/ldnr/ldnr_client.c      |  642 ++++++++
+ dm/host/ldnr/ldnr_client.c      |  640 +++++++
  dm/host/ldnr/ldnr_hook.h        |   13 +
- dm/host/ldnr/ldnr_internal.h    |  229 +++
- dm/host/ldnr/ldnr_native.c      |  622 +++++++
- dm/host/ldnr/ldnr_native.h      |  203 +++
- dm/host/ldnr/ldnr_protocol.c    |  645 ++++++++
- dm/host/ldnr/ldnr_protocol.h    |  159 ++
+ dm/host/ldnr/ldnr_internal.h    |  246 +++
+ dm/host/ldnr/ldnr_native.c      |  622 ++++++
+ dm/host/ldnr/ldnr_native.h      |  203 ++
+ dm/host/ldnr/ldnr_protocol.c    |  645 +++++++
+ dm/host/ldnr/ldnr_protocol.h    |  163 ++
  dm/host/ldnr/ldnr_tcp.c         |  534 ++++++
  dm/host/ldnr/ldnr_transport.h   |   44 +
- dm/host/ldnr/ldnr_vnet.c        | 1496 +++++++++++++++++
- dm/host/ldnr/ldnr_vnet.h        |   20 +
+ dm/host/ldnr/ldnr_vnet.c        | 1586 ++++++++++++++++
+ dm/host/ldnr/ldnr_vnet.h        |   24 +
  dm/host/ldnr/tests/.gitignore   |    1 +
  dm/host/ldnr/tests/Makefile     |   60 +
  dm/host/ldnr/tests/shim/hle.h   |   38 +
- dm/host/ldnr/tests/t_glue.c     |  572 +++++++
- dm/host/ldnr/tests/t_ldnr_e2e.c |  198 +++
+ dm/host/ldnr/tests/t_glue.c     |  572 ++++++
+ dm/host/ldnr/tests/t_ldnr_e2e.c |  198 ++
  dm/host/ldnr/tests/t_native.c   |  340 ++++
- dm/host/ldnr/tests/t_protocol.c | 1101 +++++++++++++
- dm/host/ldnr/tests/t_state.c    | 1420 ++++++++++++++++
+ dm/host/ldnr/tests/t_protocol.c | 1101 +++++++++++
+ dm/host/ldnr/tests/t_state.c    | 1652 ++++++++++++++++
  dm/host/ldnr/tests/t_tcp.c      |  442 +++++
- dm/host/ldnr/tests/t_vnet.c     | 2744 +++++++++++++++++++++++++++++++
+ dm/host/ldnr/tests/t_vnet.c     | 3160 +++++++++++++++++++++++++++++++
  dm/host/loader.c                |   16 +-
  docs/LDN-RELAY.md               |   91 +
- 27 files changed, 13629 insertions(+), 5 deletions(-)
+ 27 files changed, 14403 insertions(+), 5 deletions(-)
  create mode 100644 dm/host/hle_ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.h
@@ -979,10 +979,10 @@ index 0000000..fcfe23d
 +#include "ldnr/ldnr.c"
 diff --git a/dm/host/ldnr/ldnr.c b/dm/host/ldnr/ldnr.c
 new file mode 100644
-index 0000000..3ff4d5a
+index 0000000..858d6aa
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr.c
-@@ -0,0 +1,976 @@
+@@ -0,0 +1,989 @@
 +// LDN service state and the public lifecycle API. Relay I/O and virtual
 +// sockets are separate so illegal transitions can be tested without a server.
 +#include "ldnr_internal.h"
@@ -1403,6 +1403,10 @@ index 0000000..3ff4d5a
 +    if (message) {
 +        message->network_info = network;
 +        message->has_network_info = 1;
++        // The room ends for the data plane before its removal goes out: a
++        // frame that was prepared for it must not reach the room that a
++        // later create or connect joins.
++        ldnr_vnet_membership_leave(l);
 +        destroyed = ldnr_client_request(l, LDNR_MSG_DESTROY_ACK, LDNR_MSG_DESTROY_ACK, id,
 +                                        message, NULL, NULL, l->config.connect_timeout_ms) == 0;
 +        ldnr_message_delete(message);
@@ -1649,6 +1653,10 @@ index 0000000..3ff4d5a
 +    if (private_config) l->network_config = *private_config;
 +    l->network_config.intent_id.local_communication_id =
 +        ldnr_communication_id(l, l->network_config.intent_id.local_communication_id);
++    // The version the request will carry is staged before it goes out: the
++    // acknowledgement publishes the complete configuration under the core
++    // lock, so an event consumer can never observe it as zero.
++    l->staged_connect_version = (int16_t)version;
 +    uint64_t id = ldnr_find_network_id(l, info);
 +    if (info && !id) {
 +        // A game may reconnect from a saved NetworkInfo after a new scan. The
@@ -1722,6 +1730,11 @@ index 0000000..3ff4d5a
 +    pthread_mutex_lock(&l->mutex);
 +    if (destroy) { message->network_info = l->network; message->has_network_info = 1; }
 +    pthread_mutex_unlock(&l->mutex);
++    // The membership ends for the data plane before the leave goes out: a
++    // frame that was prepared for this room must not reach the room that a
++    // later create or connect joins. The lock is released again before the
++    // reply is awaited, so a stalled reply cannot stall the socket layer.
++    ldnr_vnet_membership_leave(l);
 +    int result = ldnr_client_request(l, type, type,
 +                                     id, message, NULL, NULL, l->config.connect_timeout_ms);
 +    ldnr_message_delete(message);
@@ -2098,10 +2111,10 @@ index 0000000..d82f463
 +                    const void *data, size_t size);
 diff --git a/dm/host/ldnr/ldnr_client.c b/dm/host/ldnr/ldnr_client.c
 new file mode 100644
-index 0000000..678d00a
+index 0000000..ef8a4c0
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_client.c
-@@ -0,0 +1,642 @@
+@@ -0,0 +1,640 @@
 +// Relay connection, request/reply matching, and the background receive loop.
 +// The codec only turns frames into ldnr_message; this file owns no wire rules.
 +#include "ldnr_internal.h"
@@ -2446,21 +2459,15 @@ index 0000000..678d00a
 +}
 +
 +static void ldnr_unexpected_disconnect(ldnr *l, uint32_t reason) {
-+    if (l->state == LDNR_STATE_STATION_CONNECTED) {
-+        l->disconnect_reason = (int)reason;
-+        l->has_network = l->has_network_config = l->has_security = 0;
-+        l->ipv4 = 0;
-+        ldnr_vnet_network_down(l);
-+        // The state change already signals the event: a second signal would
-+        // wake the guest twice for one change.
-+        ldnr_state_set(l, LDNR_STATE_STATION_OPEN);
-+    } else if (l->state == LDNR_STATE_AP_CREATED) {
-+        l->disconnect_reason = (int)reason;
-+        l->has_network = l->has_network_config = l->has_security = 0;
-+        l->ipv4 = 0;
-+        ldnr_vnet_network_down(l);
-+        ldnr_state_set(l, LDNR_STATE_AP_OPEN);
-+    }
++    // The membership ended without the guest asking for it: it goes through
++    // the same complete retirement as every other loss, so the correlation
++    // table of its proxied opens is released with it instead of blocking
++    // the opens of the membership that comes later. The state change that
++    // retirement publishes already signals the event: a second signal
++    // would wake the guest twice for one change.
++    if (l->state == LDNR_STATE_STATION_CONNECTED || l->state == LDNR_STATE_AP_CREATED ||
++        l->has_network)
++        ldnr_membership_retire(l, (int)reason);
 +}
 +
 +// The node set of the room changed: the guest is told which kind of change
@@ -2538,6 +2545,10 @@ index 0000000..678d00a
 +                    joined.intent_id = message->network_info.network_id.intent_id;
 +                    joined.channel = message->network_info.common.channel;
 +                    joined.node_count_max = message->network_info.node_count_max;
++                    // The connect staged the version it asked for before the
++                    // request went out: the published configuration is
++                    // complete in the same step as the connected state.
++                    joined.local_communication_version = l->staged_connect_version;
 +                    if (ldnr_apply_network(l, message, &joined)) message->status = LDNR_EINVAL;
 +                    else { l->disconnect_reason = 0; ldnr_state_set(l, LDNR_STATE_STATION_CONNECTED); }
 +                }
@@ -2765,10 +2776,10 @@ index 0000000..b613bcd
 +#endif
 diff --git a/dm/host/ldnr/ldnr_internal.h b/dm/host/ldnr/ldnr_internal.h
 new file mode 100644
-index 0000000..057c602
+index 0000000..92fe93e
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_internal.h
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,246 @@
 +// Private shared state for the unity build and the standalone test build.
 +#pragma once
 +#include "ldnr.h"
@@ -2867,6 +2878,13 @@ index 0000000..057c602
 +    uint32_t local_address, subnet_mask;
 +    ldnr_vsock sockets[LDNR_MAX_SOCKETS];
 +    uint64_t socket_generation;        // identity counter of the sockets
++    // The membership epoch of the socket layer: it moves on every transition
++    // (a membership applied, lost or left), so a frame that was prepared for
++    // one room is caught at the transmit boundary instead of reaching the
++    // next one. Read while preparing under the socket mutex, read again at
++    // the transmit boundary under the stream send lock; advanced with both
++    // held, in that order.
++    uint64_t membership_generation;
 +    int failed;                        // the relay is gone: every wait ends
 +    void *wait_ctx;
 +    void (*native_wait)(void *, int);
@@ -2911,6 +2929,10 @@ index 0000000..057c602
 +    uint64_t scan_ids[LDNR_MAX_NETWORKS];
 +    uint8_t scan_sessions[LDNR_MAX_NETWORKS][16];
 +    int scan_count;
++    // The local communication version of the connect request in flight: it
++    // is staged before the request goes out, so the acknowledgement can
++    // publish a complete configuration in one step under the core lock.
++    int16_t staged_connect_version;
 +    uint64_t next_request_id, pending_request;
 +    _Atomic uint64_t connection_id_seq;
 +    // The proxied TCP opens that wait for their answer: the relay refuses
@@ -2985,6 +3007,12 @@ index 0000000..057c602
 +// is retired when the reset cannot be sent.
 +void ldnr_vnet_stream_fail(ldnr *l, uint64_t connection_id);
 +void ldnr_vnet_network_down(ldnr *l);
++// The guest asked to leave the room: the membership generation moves before
++// the leave request goes out, so a frame that was prepared for this room is
++// either fully ahead of the leave or dropped at its transmit boundary. The
++// caller holds no socket lock and it is released again before the reply is
++// awaited: a stalled reply must not stall the socket layer.
++void ldnr_vnet_membership_leave(ldnr *l);
 +// Every socket wait ends at once: the relay is gone or the context is
 +// closing, so no caller may stay blocked.
 +void ldnr_vnet_cancel(ldnr *l);
@@ -4488,10 +4516,10 @@ index 0000000..9c9ea55
 +}
 diff --git a/dm/host/ldnr/ldnr_protocol.h b/dm/host/ldnr/ldnr_protocol.h
 new file mode 100644
-index 0000000..4330789
+index 0000000..cf46534
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_protocol.h
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,163 @@
 +// Protocol-neutral messages exchanged between the codec and the LDN core.
 +// The wire representation lives only in ldnr_protocol.c.
 +#pragma once
@@ -4505,6 +4533,10 @@ index 0000000..4330789
 +
 +// The fixed frame header: magic, version, type, flags, payload size, request.
 +#define LDNR_WIRE_HEADER 16
++// The PROXY_DATA payload fields before the payload blob: the two addresses,
++// the two ports, the protocol byte, the connection id and the blob length
++// (4 + 2 + 4 + 2 + 1 + 4 + 2).
++#define LDNR_PROXY_DATA_OVERHEAD 19
 +
 +// The relay protocol this client speaks. The header carries the negotiated
 +// major; the minor is announced in the HELLO and comes back in the HELLO_ACK.
@@ -5243,10 +5275,10 @@ index 0000000..f158534
 +int ldnr_tcp_test_connecting_fd(const ldnr_transport *transport);
 diff --git a/dm/host/ldnr/ldnr_vnet.c b/dm/host/ldnr/ldnr_vnet.c
 new file mode 100644
-index 0000000..63ffecc
+index 0000000..1e5086f
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_vnet.c
-@@ -0,0 +1,1496 @@
+@@ -0,0 +1,1586 @@
 +// Virtual BSD sockets on the LDN subnet. No host socket descriptor escapes:
 +// readiness and datagram queues are entirely under this layer's control.
 +#include "ldnr_internal.h"
@@ -5330,6 +5362,10 @@ index 0000000..63ffecc
 +static pthread_cond_t ldnr_retired_condition = PTHREAD_COND_INITIALIZER;
 +static int ldnr_retired_watching;
 +
++// Test hook only: the next sweeper spawn is forced to fail, the way a
++// resource exhaustion would make pthread_create fail.
++int ldnr_test_sweeper_create_fails;
++
 +static void *ldnr_retired_main(void *unused);
 +
 +// The stream is half closed: the peer's direction stays open until its own
@@ -5346,9 +5382,16 @@ index 0000000..63ffecc
 +        // runs, and woken so it learns the earliest deadline.
 +        if (!ldnr_retired_watching) {
 +            pthread_t thread;
-+            if (!pthread_create(&thread, NULL, ldnr_retired_main, NULL)) {
++            if (!ldnr_test_sweeper_create_fails &&
++                !pthread_create(&thread, NULL, ldnr_retired_main, NULL)) {
 +                ldnr_retired_watching = 1;
 +                pthread_detach(thread);
++            } else {
++                // The linger cannot run without its sweeper: the record is
++                // dropped again, so the caller retires the stream with its
++                // fallback reset instead of leaving it half-open forever.
++                ldnr_retired[i].owner = NULL;
++                return 0;
 +            }
 +        }
 +        pthread_cond_signal(&ldnr_retired_condition);
@@ -5454,6 +5497,9 @@ index 0000000..63ffecc
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) ldnr_socket_clear(&l->vnet.sockets[i]);
 +    ldnr_retired_purge(l);
++    // The membership is gone: a frame that was prepared for it must not
++    // reach the room that comes next.
++    l->vnet.membership_generation++;
 +    l->vnet.local_address = 0;
 +    l->vnet.failed = 0;
 +    pthread_cond_broadcast(&l->vnet.condition);
@@ -5483,7 +5529,13 @@ index 0000000..63ffecc
 +}
 +
 +void ldnr_vnet_set_address(ldnr *l, uint32_t address, uint32_t mask) {
++    // The membership that is applied belongs to a new generation: a frame
++    // that was prepared for the room before it can never reach this one.
++    // The stream send lock keeps the step ordered against a transmit that
++    // is still in flight.
++    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
++    l->vnet.membership_generation++;
 +    l->vnet.local_address = address;
 +    if (mask) l->vnet.subnet_mask = mask;
 +    // A membership that was just applied opens the socket layer again: the
@@ -5493,6 +5545,15 @@ index 0000000..63ffecc
 +    l->vnet.failed = 0;
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    pthread_mutex_unlock(&l->vnet.mutex);
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
++}
++
++void ldnr_vnet_membership_leave(ldnr *l) {
++    pthread_mutex_lock(&ldnr_stream_send_lock);
++    pthread_mutex_lock(&l->vnet.mutex);
++    l->vnet.membership_generation++;
++    pthread_mutex_unlock(&l->vnet.mutex);
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
 +}
 +
 +static ldnr_vsock *ldnr_socket_at(ldnr *l, int fd) {
@@ -5653,6 +5714,22 @@ index 0000000..63ffecc
 +    return result;
 +}
 +
++// Sends a prepared room-scoped frame and releases it. The membership that
++// prepared it is revalidated inside the stream send step: a leave or a loss
++// that ran in between moved the generation, and the frame is dropped here
++// instead of reaching the room that replaced it.
++static int ldnr_vnet_transmit_room(ldnr *l, ldnr_message_type type,
++                                   ldnr_message *message, uint64_t generation) {
++    if (!message) return ldnr_fail(LDNR_ENOBUFS);
++    pthread_mutex_lock(&ldnr_stream_send_lock);
++    int result = generation == l->vnet.membership_generation
++        ? ldnr_client_send(l, type, 0, message, NULL)
++        : ldnr_fail(LDNR_ENETDOWN);
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
++    ldnr_message_delete(message);
++    return result;
++}
++
 +ssize_t ldnr_sendto(ldnr *l, int fd, const void *data, size_t size, int flags,
 +                    const ldnr_sockaddr *destination) {
 +    (void)flags;
@@ -5671,10 +5748,14 @@ index 0000000..63ffecc
 +        return ldnr_fail(LDNR_ENETDOWN);
 +    }
 +    int result = s->bound ? 0 : ldnr_bind_locked(l, s, NULL);
++    // The membership that prepared the datagram is pinned for the transmit
++    // boundary: a leave or a rejoin in between must not let it reach a room
++    // it was never addressed to.
++    uint64_t generation = l->vnet.membership_generation;
 +    ldnr_message *message = result ? NULL :
 +        ldnr_vnet_prepare_udp(l, s, destination, data, size);
 +    pthread_mutex_unlock(&l->vnet.mutex);
-+    if (!result) result = ldnr_vnet_transmit(l, LDNR_MSG_UDP, message);
++    if (!result) result = ldnr_vnet_transmit_room(l, LDNR_MSG_UDP, message, generation);
 +    else ldnr_message_delete(message);
 +    return result ? -1 : (ssize_t)size;
 +}
@@ -5950,6 +6031,10 @@ index 0000000..63ffecc
 +        s = ldnr_socket_of(l, fd, generation);
 +        if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
 +    }
++    // The reading direction is closed: the end of the stream is reported
++    // consistently. Payload that still arrives is dropped at the door, so
++    // the queue stays empty and the answer stays the end of the stream.
++    if (s->shut_read) { pthread_mutex_unlock(&l->vnet.mutex); return 0; }
 +    int error = s->connect_error ? s->connect_error : s->remote_error;
 +    if (error && !s->head) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(error); }
 +    if (!s->head) { pthread_mutex_unlock(&l->vnet.mutex); return 0; }
@@ -5984,9 +6069,10 @@ index 0000000..63ffecc
 +        if (!s->connected) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_ENOTCONN); }
 +        int remote_error = s->remote_error;
 +        if (remote_error) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(remote_error); }
++        uint64_t generation = l->vnet.membership_generation;
 +        ldnr_message *message = ldnr_vnet_prepare_udp(l, s, &peer, data, size);
 +        pthread_mutex_unlock(&l->vnet.mutex);
-+        int result = ldnr_vnet_transmit(l, LDNR_MSG_UDP, message);
++        int result = ldnr_vnet_transmit_room(l, LDNR_MSG_UDP, message, generation);
 +        return result ? -1 : (ssize_t)size;
 +    }
 +    if (!s->connected || s->shut_write || s->remote_error || s->stream_failed) {
@@ -5999,10 +6085,18 @@ index 0000000..63ffecc
 +    // the rest of the buffer must not go to that other stream.
 +    uint64_t generation = s->generation;
 +    pthread_mutex_unlock(&l->vnet.mutex);
++    // A PROXY_DATA frame carries its fields before the payload blob: a
++    // negotiated frame limit below the chunk size moves the split point
++    // with it, or the relay refuses the frame.
++    size_t chunk_max = LDNR_TCP_CHUNK;
++    uint32_t frame_limit = atomic_load(&l->max_frame);
++    if (frame_limit > LDNR_PROXY_DATA_OVERHEAD &&
++        (size_t)(frame_limit - LDNR_PROXY_DATA_OVERHEAD) < chunk_max)
++        chunk_max = frame_limit - LDNR_PROXY_DATA_OVERHEAD;
 +    size_t sent = 0;
 +    while (sent < size) {
 +        size_t chunk = size - sent;
-+        if (chunk > LDNR_TCP_CHUNK) chunk = LDNR_TCP_CHUNK;
++        if (chunk > chunk_max) chunk = chunk_max;
 +        // The check and the write of a chunk are one step, serialized with
 +        // every close and shutdown of the stream: a FIN or a RST can never
 +        // reach the wire before the data that was allowed to go out. The
@@ -6014,7 +6108,7 @@ index 0000000..63ffecc
 +        if (!s) {
 +            pthread_mutex_unlock(&l->vnet.mutex);
 +            pthread_mutex_unlock(&ldnr_stream_send_lock);
-+            return sent ? (ssize_t)sent : -1;
++            return sent ? (ssize_t)sent : ldnr_fail(LDNR_EBADF);
 +        }
 +        // A close, a shutdown or a peer reset since the last chunk ends the
 +        // stream: another chunk would go out after the FIN or be discarded
@@ -6258,13 +6352,22 @@ index 0000000..63ffecc
 +        accepted->peer.port = message->proxy.source_port;
 +        accepted->connection_id = message->proxy.connection_id;
 +    }
++    // The membership that received the open is pinned for the answer: a
++    // transition in between must not let the reply, the queued child or a
++    // retire reset reach the room that replaced it.
++    uint64_t membership = l->vnet.membership_generation;
 +    pthread_mutex_unlock(&l->vnet.mutex);
 +    ldnr_message *reply = ldnr_message_new();
-+    int sent = -1;
++    int sent = -1, same_room = 1;
 +    if (reply) {
 +        reply->proxy = message->proxy;
 +        reply->status = accepted ? 0 : LDNR_ECONNREFUSED;
-+        sent = ldnr_client_send(l, LDNR_MSG_PROXY_CONNECT_ACK, 0, reply, NULL);
++        // The generation check and the write are one stream send step, so a
++        // membership transition can never slip between them.
++        pthread_mutex_lock(&ldnr_stream_send_lock);
++        same_room = membership == l->vnet.membership_generation;
++        sent = same_room ? ldnr_client_send(l, LDNR_MSG_PROXY_CONNECT_ACK, 0, reply, NULL) : 0;
++        pthread_mutex_unlock(&ldnr_stream_send_lock);
 +        ldnr_message_delete(reply);
 +    }
 +    // The reply is required by the protocol: a session that cannot carry it
@@ -6274,9 +6377,10 @@ index 0000000..63ffecc
 +    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    uint32_t source_address = l->vnet.local_address;
++    same_room = membership == l->vnet.membership_generation;
 +    // The child is published only when its acceptance went out and the
 +    // listener that queued it is still alive and still has room.
-+    int publish = !sent && listener->used && listener->listening &&
++    int publish = !sent && same_room && listener->used && listener->listening &&
 +        listener->generation == listener_generation &&
 +        listener->accept_count < listener->backlog;
 +    if (publish) {
@@ -6291,9 +6395,10 @@ index 0000000..63ffecc
 +        ldnr_socket_clear(accepted);
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
-+    if (!sent && !publish) {
++    if (!sent && !publish && same_room) {
 +        // The relay admitted the stream but nothing waits for it here:
-+        // retire it instead of leaving it on the relay.
++        // retire it instead of leaving it on the relay. A room that was
++        // replaced gets no reset: its id belongs to another membership.
 +        ldnr_send_stream_reset(l, message->proxy.connection_id, source_address);
 +    }
 +    pthread_mutex_unlock(&ldnr_stream_send_lock);
@@ -6323,7 +6428,11 @@ index 0000000..63ffecc
 +    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_stream_by_connection(l, message, 0, 1);
-+    if (s && s->connected) {
++    // The reading direction is closed: the segment is dropped at the door,
++    // the way a socket that was shut for reading drops what still arrives.
++    // The sending direction is untouched, so the peer's traffic is simply
++    // discarded instead of being queued or answered with a reset.
++    if (s && s->connected && !s->shut_read) {
 +        int result = ldnr_packet_queue(l, s, &s->peer, message->proxy.data,
 +                                       message->proxy.size, 1);
 +        if (result == LDNR_STREAM_RESET) {
@@ -6512,11 +6621,24 @@ index 0000000..63ffecc
 +        // dropped the same way: they belonged to it too.
 +        s->connection_id = 0;
 +        s->connected = 0;
++        // The queued children were never handed to the application: they
++        // are freed with the membership instead of leaking their slots and
++        // their packet queues. A child that was already accepted keeps its
++        // terminal descriptor like every other socket.
++        for (int n = 0; n < s->accept_count; n++) {
++            int child_fd = s->accept_fds[(s->accept_head + n) % LDNR_ACCEPT_MAX];
++            ldnr_vsock *child = ldnr_socket_at(l, child_fd);
++            if (child) ldnr_socket_clear(child);
++        }
 +        s->accept_count = 0;
++        s->accept_head = 0;
 +    }
 +    // The retired streams belonged to the membership that is gone: their
 +    // records are dropped so no reset escapes into a later one.
 +    ldnr_retired_purge(l);
++    // The membership is gone: a frame that was prepared for it must not
++    // reach the room that comes next.
++    l->vnet.membership_generation++;
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    pthread_mutex_unlock(&l->vnet.mutex);
 +    pthread_mutex_unlock(&ldnr_stream_send_lock);
@@ -6745,10 +6867,10 @@ index 0000000..63ffecc
 +}
 diff --git a/dm/host/ldnr/ldnr_vnet.h b/dm/host/ldnr/ldnr_vnet.h
 new file mode 100644
-index 0000000..896b555
+index 0000000..5684348
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_vnet.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,24 @@
 +// The socket layer's internal entry points, shared with the vnet tests: the
 +// full internal state lives in ldnr_internal.h, which these declarations
 +// match.
@@ -6769,6 +6891,10 @@ index 0000000..896b555
 +// ends.
 +void ldnr_vnet_network_down(ldnr *l);
 +void ldnr_vnet_cancel(ldnr *l);
++
++// Test hook only: the next sweeper spawn is forced to fail, the way a
++// resource exhaustion would make pthread_create fail.
++extern int ldnr_test_sweeper_create_fails;
 diff --git a/dm/host/ldnr/tests/.gitignore b/dm/host/ldnr/tests/.gitignore
 new file mode 100644
 index 0000000..567609b
@@ -9123,10 +9249,10 @@ index 0000000..862a9ac
 +}
 diff --git a/dm/host/ldnr/tests/t_state.c b/dm/host/ldnr/tests/t_state.c
 new file mode 100644
-index 0000000..eb05412
+index 0000000..75c879a
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_state.c
-@@ -0,0 +1,1420 @@
+@@ -0,0 +1,1652 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
@@ -10529,6 +10655,236 @@ index 0000000..eb05412
 +    free((void *)api);
 +}
 +
++// The connecting thread is parked inside the wait of its request: its wait
++// returns with the connected state already published, but the requester
++// cannot run any of its own post-reply work while it is held there.
++typedef struct {
++    ldnr *core;
++    int changes;                // the state changes the callback counted
++    int hold;                   // park the wait-exit that sees the connect
++    int held;                   // that wait is parked
++    int release;                // let the parked waiter through
++    pthread_mutex_t mutex;
++    pthread_cond_t condition;
++} test_hold;
++
++static void test_hold_changed(void *ctx)
++{
++    test_hold *hold = ctx;
++    pthread_mutex_lock(&hold->mutex);
++    hold->changes++;
++    pthread_cond_broadcast(&hold->condition);
++    pthread_mutex_unlock(&hold->mutex);
++}
++
++// The native wait callback runs on the requester's own thread: the exit
++// call (entering=0) happens after the reply was dispatched — the published
++// state is already visible — and before the request returns, so the
++// requester's post-reply work cannot have run yet.
++static void test_hold_native_wait(void *ctx, int entering)
++{
++    test_hold *hold = ctx;
++    if (entering || !hold->hold) return;
++    if (!hold->core || hold->core->state != LDNR_STATE_STATION_CONNECTED) return;
++    pthread_mutex_lock(&hold->mutex);
++    hold->held = 1;
++    pthread_cond_broadcast(&hold->condition);
++    while (!hold->release)
++        pthread_cond_wait(&hold->condition, &hold->mutex);
++    hold->held = 0;
++    hold->release = 0;
++    hold->hold = 0;
++    pthread_mutex_unlock(&hold->mutex);
++}
++
++static void test_wait_for_held(test_hold *hold)
++{
++    struct timespec deadline;
++    CHECK(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
++    deadline.tv_sec += 2;
++    pthread_mutex_lock(&hold->mutex);
++    while (!hold->held) {
++        int result = pthread_cond_timedwait(&hold->condition, &hold->mutex,
++                                            &deadline);
++        CHECK(result != ETIMEDOUT);
++    }
++    pthread_mutex_unlock(&hold->mutex);
++}
++
++typedef struct {
++    ldnr *context;
++    ldnr_network_info info;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    int version;
++    int result;
++} test_connector;
++
++static void *test_connector_thread(void *argument)
++{
++    test_connector *connector = argument;
++    connector->result = ldnr_connect_network(connector->context, &connector->info,
++        NULL, &connector->security, &connector->user, NULL, 0, connector->version);
++    return NULL;
++}
++
++// The connected state is published with the complete configuration: while
++// the connecting thread is still inside its request, an event consumer can
++// already read the version the request asked for.
++static void test_connect_publishes_the_requested_version(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_hold hold;
++    ldnr_config config;
++    test_connector connector;
++    pthread_t connector_thread;
++    ldnr_network_config actual_network;
++    ldnr *context = NULL;
++
++    memset(&hold, 0, sizeof(hold));
++    pthread_mutex_init(&hold.mutex, NULL);
++    pthread_cond_init(&hold.condition, NULL);
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.callback_ctx = &hold;
++    config.state_changed = test_hold_changed;
++    config.native_wait = test_hold_native_wait;
++    config.connect_timeout_ms = 2000;
++    CHECK(ldnr_create(&config, &context) == 0);
++    hold.core = context;
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_station(context) == 0);
++
++    hold.hold = 1;
++    memset(&connector, 0, sizeof(connector));
++    connector.context = context;
++    connector.info = test_network_info();
++    memset(&connector.security, 0, sizeof(connector.security));
++    memset(&connector.user, 0, sizeof(connector.user));
++    connector.version = 0x1234;
++    connector.result = -1;
++    CHECK(pthread_create(&connector_thread, NULL, test_connector_thread, &connector) == 0);
++
++    // The requester is held inside the wait of its connect request: the
++    // acknowledgement was dispatched and the connected state published,
++    // but the requester cannot run its post-reply work from there. The
++    // configuration an event consumer would read is the one that was
++    // published with the state — it must already be complete.
++    test_wait_for_held(&hold);
++    CHECK(context->state == LDNR_STATE_STATION_CONNECTED);
++    CHECK(context->has_network_config == 1);
++    CHECK(context->network_config.local_communication_version == 0x1234);
++    CHECK(context->network_config.channel == connector.info.common.channel);
++    CHECK(connector.result == -1);   // the connect has not returned yet
++
++    pthread_mutex_lock(&hold.mutex);
++    hold.release = 1;
++    pthread_cond_broadcast(&hold.condition);
++    pthread_mutex_unlock(&hold.mutex);
++    CHECK(pthread_join(connector_thread, NULL) == 0);
++    CHECK(connector.result == 0);
++    CHECK(ldnr_get_network_config(context, &actual_network) == 0);
++    CHECK(actual_network.local_communication_version == 0x1234);
++
++    ldnr_destroy(context);
++    free((void *)api);
++    pthread_mutex_destroy(&hold.mutex);
++    pthread_cond_destroy(&hold.condition);
++}
++
++// A membership that is lost without the guest asking for it releases the
++// opens that waited for their answer: closing the old descriptors and
++// rejoining never leaves the table full for the next room.
++static void test_kick_releases_pending_opens(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_changes changes;
++    ldnr_config config;
++    ldnr_network_config network;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    ldnr_network_info info = test_network_info();
++    ldnr_sockaddr destination;
++    ldnr *context = NULL;
++    int socket;
++    int expected_changes;
++
++    // The relay never answers the opens: each stays in the correlation
++    // table until something releases it.
++    transport->silent_proxy = 1;
++    memset(&changes, 0, sizeof(changes));
++    pthread_mutex_init(&changes.mutex, NULL);
++    pthread_cond_init(&changes.condition, NULL);
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.callback_ctx = &changes;
++    config.state_changed = test_state_changed;
++    config.server = "relay.test:11470";
++    config.connect_timeout_ms = 200;
++    memset(&security, 0, sizeof(security));
++    memset(&user, 0, sizeof(user));
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_station(context) == 0);
++    expected_changes = test_change_count(&changes);
++
++    memset(&destination, 0, sizeof(destination));
++    destination.address = ldnr_ipv4(192, 168, 44, 10);
++    destination.port = ldnr_htons(40002);
++
++    // Three memberships in a row are kicked: each loses the opens that were
++    // still waiting, so the next room starts with an empty table.
++    for (int cycle = 0; cycle < 3; cycle++) {
++        CHECK(ldnr_connect_network(context, &info, NULL, &security, &user, NULL, 0, 0) == 0);
++        expected_changes++;
++        socket = ldnr_socket(context, 2, 1, 6);
++        CHECK(socket >= 0);
++        CHECK(ldnr_connect_socket(context, socket, &destination, 20) == -1);
++        CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++        CHECK(test_proxy_open_count(context) == 1);
++        // The relay kicks the station: the membership is lost without the
++        // guest asking, and the opens it held are released with it.
++        test_push_disconnect(transport, 4);
++        test_wait_for_changes(&changes, expected_changes + 1);
++        expected_changes++;
++        CHECK(ldnr_get_state(context) == TEST_STATE_STATION_OPEN);
++        CHECK(test_proxy_open_count(context) == 0);
++        // The old descriptor is closed after the loss: the entries it held
++        // are gone either way, so nothing blocks the opens of the next room.
++        CHECK(ldnr_close_socket(context, socket) == 0);
++        CHECK(test_proxy_open_count(context) == 0);
++    }
++
++    // A host that loses its own room the same way: the created membership
++    // is retired and the opens that waited are released too.
++    CHECK(ldnr_close_station(context) == 0);
++    expected_changes++;
++    CHECK(ldnr_open_access_point(context) == 0);
++    expected_changes++;
++    memset(&network, 0, sizeof(network));
++    network.node_count_max = 4;
++    CHECK(ldnr_create_network(context, &network, &security, &user, NULL, NULL, 0) == 0);
++    expected_changes++;
++    socket = ldnr_socket(context, 2, 1, 6);
++    CHECK(socket >= 0);
++    CHECK(ldnr_connect_socket(context, socket, &destination, 20) == -1);
++    CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++    CHECK(test_proxy_open_count(context) == 1);
++    test_push_disconnect(transport, 4);
++    test_wait_for_changes(&changes, expected_changes + 1);
++    CHECK(ldnr_get_state(context) == TEST_STATE_AP_OPEN);
++    CHECK(test_proxy_open_count(context) == 0);
++    CHECK(ldnr_close_socket(context, socket) == 0);
++    CHECK(test_proxy_open_count(context) == 0);
++
++    ldnr_destroy(context);
++    free((void *)api);
++    pthread_mutex_destroy(&changes.mutex);
++    pthread_cond_destroy(&changes.condition);
++}
++
 +int main(void)
 +{
 +    test_create_arguments();
@@ -10544,6 +10900,8 @@ index 0000000..eb05412
 +    test_proxy_opens_are_released();
 +    test_event_consumer_reads_network_config();
 +    test_inbound_proxy_disconnect_releases_correlation();
++    test_connect_publishes_the_requested_version();
++    test_kick_releases_pending_opens();
 +    puts("PASS");
 +    return 0;
 +}
@@ -10997,10 +11355,10 @@ index 0000000..583b703
 +}
 diff --git a/dm/host/ldnr/tests/t_vnet.c b/dm/host/ldnr/tests/t_vnet.c
 new file mode 100644
-index 0000000..45e72e5
+index 0000000..6199552
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_vnet.c
-@@ -0,0 +1,2744 @@
+@@ -0,0 +1,3160 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
@@ -11066,9 +11424,14 @@ index 0000000..45e72e5
 +    uint32_t proxy_ack_status;
 +    int auto_proxy_ack;
 +    uint8_t node_id;            // the node id the relay assigned to us
++    uint32_t max_frame;         // the frame limit the handshake announces
 +    unsigned sent_count[LDNR_MSG_ERROR + 1];
++    unsigned sent_seq;          // the wire position of the frames
++    unsigned seq_of[LDNR_MSG_ERROR + 1]; // the wire position of each kind
 +    ldnr_message last;
 +    uint64_t last_open_id;      // the connection id of the last PROXY_CONNECT
++    size_t data_sizes[16];      // the payload sizes of the last PROXY_DATA
++    int data_size_count;
 +    int block_data;             // a PROXY_DATA send waits here
 +    int data_blocked;           // a send is waiting for the test
 +    int block_reply;            // a PROXY_CONNECT_ACK send waits here
@@ -11079,6 +11442,12 @@ index 0000000..45e72e5
 +    int delay_open;             // park the Nth PROXY_CONNECT before it is recorded
 +    int open_delayed;           // that send is parked
 +    int release_open;           // let the parked send through
++    int delay_udp;              // park the Nth UDP datagram before it is recorded
++    int udp_delayed;            // that datagram is parked
++    int release_udp;            // let the parked datagram through
++    int delay_disconnect;       // park the Nth PROXY_DISCONNECT before it is recorded
++    int disconnect_delayed;     // that close is parked
++    int release_disconnect;     // let the parked close through
 +} test_transport;
 +
 +typedef struct {
@@ -11268,7 +11637,7 @@ index 0000000..45e72e5
 +        test_u64(&writer, 0);
 +        test_u64(&writer, 0);
 +        test_u16(&writer, 0);
-+        test_u32(&writer, 0);
++        test_u32(&writer, transport->max_frame);
 +        test_u32(&writer, 0);
 +        test_finish(&writer, 0x02, (uint32_t)request->request_id);
 +        break;
@@ -11471,7 +11840,35 @@ index 0000000..45e72e5
 +        transport->open_delayed = 0;
 +        transport->release_open = 0;
 +    }
++    if (request.type == LDNR_MSG_UDP && transport->delay_udp &&
++        --transport->delay_udp == 0) {
++        // The datagram is parked before it is recorded: a leave that runs
++        // now must queue behind it, or the datagram must never leave.
++        transport->udp_delayed = 1;
++        pthread_cond_broadcast(&transport->condition);
++        while (!transport->release_udp)
++            pthread_cond_wait(&transport->condition, &transport->mutex);
++        transport->udp_delayed = 0;
++        transport->release_udp = 0;
++    }
++    if (request.type == LDNR_MSG_PROXY_DISCONNECT && transport->delay_disconnect &&
++        --transport->delay_disconnect == 0) {
++        // The close is parked inside the transport with the socket already
++        // cleared and the stream send step held: what runs against the dead
++        // descriptor now is what the send boundary itself sees.
++        transport->disconnect_delayed = 1;
++        pthread_cond_broadcast(&transport->condition);
++        while (!transport->release_disconnect)
++            pthread_cond_wait(&transport->condition, &transport->mutex);
++        transport->disconnect_delayed = 0;
++        transport->release_disconnect = 0;
++    }
 +    transport->sent_count[request.type]++;
++    transport->seq_of[request.type] = ++transport->sent_seq;
++    if (request.type == LDNR_MSG_PROXY_DATA &&
++        transport->data_size_count < (int)(sizeof transport->data_sizes /
++                                           sizeof transport->data_sizes[0]))
++        transport->data_sizes[transport->data_size_count++] = request.proxy.size;
 +    // The payload of the previous frame belongs to the transport.
 +    free(transport->last.proxy.data);
 +    transport->last = request;
@@ -11618,6 +12015,16 @@ index 0000000..45e72e5
 +    count = transport->sent_count[type];
 +    pthread_mutex_unlock(&transport->mutex);
 +    return count;
++}
++
++// The wire position of the last frame of a kind: two frames can be ordered.
++static unsigned test_sent_seq(test_transport *transport, ldnr_message_type type)
++{
++    unsigned seq;
++    pthread_mutex_lock(&transport->mutex);
++    seq = transport->seq_of[type];
++    pthread_mutex_unlock(&transport->mutex);
++    return seq;
 +}
 +
 +static void test_last_message(test_transport *transport, ldnr_message_type type,
@@ -13717,8 +14124,370 @@ index 0000000..45e72e5
 +    test_destroy_context(context, api);
 +}
 +
++typedef struct {
++    ldnr *context;
++    int fd;
++    const void *data;
++    size_t size;
++    ldnr_sockaddr destination;
++    ssize_t result;
++} test_sendtor;
++
++static void *test_sendto_thread(void *argument)
++{
++    test_sendtor *sendtor = argument;
++    sendtor->result = ldnr_sendto(sendtor->context, sendtor->fd, sendtor->data,
++                                sendtor->size, 0, &sendtor->destination);
++    return NULL;
++}
++
++typedef struct {
++    ldnr *context;
++    int result;
++} test_leaver;
++
++static void *test_disconnect_thread(void *argument)
++{
++    test_leaver *leaver = argument;
++    leaver->result = ldnr_disconnect(leaver->context);
++    return NULL;
++}
++
++// A datagram that was prepared for the room must never reach the room that
++// replaces it: the membership transition and the in-flight datagram are
++// serialized, so the wire sees it either before the leave or not at all.
++static void test_udp_never_reaches_the_new_room(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_network_info info;
++    ldnr_security_config security;
++    ldnr_sockaddr address;
++    test_sendtor sendtor;
++    test_leaver leaver;
++    pthread_t send_thread;
++    pthread_t leave_thread;
++    unsigned udp_seq;
++    unsigned leave_seq;
++    int fd;
++    int fresh;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    fd = ldnr_socket(context, 2, 2, 17);
++    CHECK(fd >= 0);
++    address.address = ldnr_ipv4(192, 168, 44, 10);
++    address.port = ldnr_htons(TEST_UDP_PORT);
++    CHECK(ldnr_bind(context, fd, &address) == 0);
++
++    // The datagram is parked inside the transport before it reaches the
++    // wire: the disconnect that runs in parallel must queue behind it, the
++    // datagram may not follow the leave into the next room.
++    test_set_flag(transport, &transport->delay_udp, 1);
++    memset(&sendtor, 0, sizeof(sendtor));
++    sendtor.context = context;
++    sendtor.fd = fd;
++    sendtor.data = "parked";
++    sendtor.size = 6;
++    sendtor.destination.address = ldnr_ipv4(192, 168, 44, 20);
++    sendtor.destination.port = ldnr_htons(5000);
++    CHECK(pthread_create(&send_thread, NULL, test_sendto_thread, &sendtor) == 0);
++    test_wait_for_flag(transport, &transport->udp_delayed);
++
++    memset(&leaver, 0, sizeof(leaver));
++    leaver.context = context;
++    leaver.result = -1;
++    CHECK(pthread_create(&leave_thread, NULL, test_disconnect_thread, &leaver) == 0);
++    test_sleep_ms(60);
++    // The leave waits behind the datagram that is still in flight: nothing
++    // for the old room may follow the datagram, and the datagram may not
++    // follow the leave into the room that replaces it.
++    CHECK(test_sent_count(transport, LDNR_MSG_DISCONNECTED) == 0);
++    CHECK(test_sent_count(transport, LDNR_MSG_UDP) == 0);
++    test_set_flag(transport, &transport->release_udp, 1);
++    CHECK(pthread_join(send_thread, NULL) == 0);
++    CHECK(sendtor.result == 6);
++    CHECK(pthread_join(leave_thread, NULL) == 0);
++    CHECK(leaver.result == 0);
++
++    // The datagram went out while this client was still in the room it was
++    // prepared for: its frame precedes the leave on the wire.
++    CHECK(test_sent_count(transport, LDNR_MSG_UDP) == 1);
++    CHECK(test_sent_count(transport, LDNR_MSG_DISCONNECTED) == 1);
++    udp_seq = test_sent_seq(transport, LDNR_MSG_UDP);
++    leave_seq = test_sent_seq(transport, LDNR_MSG_DISCONNECTED);
++    CHECK(udp_seq != 0 && leave_seq != 0);
++    CHECK(udp_seq < leave_seq);
++
++    // The room it was prepared for is gone: the next membership works on
++    // fresh descriptors, and nothing of the old datagram appears there.
++    info = test_network_info();
++    memset(&security, 0, sizeof(security));
++    CHECK(ldnr_connect_network(context, &info, NULL, &security, NULL, NULL, 0, 0) == 0);
++    fresh = ldnr_socket(context, 2, 2, 17);
++    CHECK(fresh >= 0);
++    CHECK(ldnr_sendto(context, fresh, "new", 3, 0, &sendtor.destination) == 3);
++    CHECK(test_sent_count(transport, LDNR_MSG_UDP) == 2);
++    CHECK(test_sent_seq(transport, LDNR_MSG_UDP) > leave_seq);
++    CHECK(ldnr_close_socket(context, fresh) == 0);
++    test_destroy_context(context, api);
++}
++
++// A network-down drops the children that wait in a listener's accept queue:
++// they belonged to the lost membership, so their slots and their packet
++// queues are freed instead of leaking as descriptors that were never
++// handed out.
++static void test_network_down_reclaims_queued_children(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr address;
++    ldnr_message incoming;
++    int listener;
++    int held;
++    int first;
++    int second;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    listener = ldnr_socket(context, 2, 1, 6);
++    CHECK(listener >= 0);
++    address.address = ldnr_ipv4(192, 168, 44, 10);
++    address.port = ldnr_htons(TEST_LISTEN_PORT);
++    CHECK(ldnr_bind(context, listener, &address) == 0);
++    CHECK(ldnr_listen(context, listener, 4) == 0);
++
++    // Two streams are answered and queued, but the application never
++    // accepted them: they hold their slots.
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_CONNECT;
++    incoming.proxy.connection_id = UINT64_C(0x23456789);
++    incoming.proxy.source_address = ldnr_ipv4(192, 168, 44, 30);
++    incoming.proxy.source_port = ldnr_htons(8000);
++    incoming.proxy.destination_address = ldnr_ipv4(192, 168, 44, 10);
++    incoming.proxy.destination_port = ldnr_htons(TEST_LISTEN_PORT);
++    test_push_message(transport, &incoming);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_CONNECT_ACK,
++                       test_sent_count(transport, LDNR_MSG_PROXY_CONNECT_ACK) + 1);
++    incoming.proxy.connection_id = UINT64_C(0x2345678a);
++    incoming.proxy.source_port = ldnr_htons(8001);
++    test_push_message(transport, &incoming);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_CONNECT_ACK,
++                       test_sent_count(transport, LDNR_MSG_PROXY_CONNECT_ACK) + 1);
++    held = ldnr_socket(context, 2, 2, 17);
++    CHECK(held == listener + 3);
++    CHECK(ldnr_close_socket(context, held) == 0);
++
++    ldnr_vnet_network_down(context);
++
++    // The queued children were never handed out: their slots came back.
++    first = ldnr_socket(context, 2, 2, 17);
++    second = ldnr_socket(context, 2, 2, 17);
++    CHECK(first == listener + 1);
++    CHECK(second == listener + 2);
++    CHECK(ldnr_close_socket(context, first) == 0);
++    CHECK(ldnr_close_socket(context, second) == 0);
++    CHECK(ldnr_close_socket(context, listener) == 0);
++    test_destroy_context(context, api);
++}
++
++// A read shutdown closes only the reading direction: what the peer still
++// sends is dropped at the door, the queue never grows into a reset, and
++// the stream keeps writing. The reads answer the end of the stream
++// consistently.
++static void test_shut_read_discards_incoming(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    ldnr_message sent;
++    ldnr_message incoming;
++    uint64_t connection_id;
++    unsigned disconnects;
++    int client;
++    char buffer[64];
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    connection_id = sent.proxy.connection_id;
++
++    CHECK(ldnr_shutdown(context, client, 0) == 0);   // SHUT_RD
++    CHECK(ldnr_recv(context, client, buffer, sizeof buffer, 0, 0) == 0);
++
++    // The peer keeps sending: every segment is dropped at the door and the
++    // read still reports the end of the stream.
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_DATA;
++    incoming.proxy.connection_id = connection_id;
++    incoming.proxy.source_address = peer.address;
++    incoming.proxy.source_port = peer.port;
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++    for (int i = 0; i < 80; i++) {
++        test_set_payload(&incoming, "more", 4);
++        test_push_message_slow(transport, &incoming);
++        free(incoming.proxy.data);
++        incoming.proxy.data = NULL;
++    }
++    test_sleep_ms(60);
++    // A queue that grew under the shutdown would have overflowed into a
++    // reset by now: nothing was sent and the stream is not failed.
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects);
++    CHECK(ldnr_recv(context, client, buffer, sizeof buffer, 0, 0) == 0);
++
++    // The sending direction keeps working.
++    CHECK(ldnr_send(context, client, "y", 1, 0) == 1);
++    test_last_message(transport, LDNR_MSG_PROXY_DATA, &sent);
++    CHECK(sent.proxy.connection_id == connection_id);
++    CHECK(sent.proxy.size == 1 && memcmp(sent.proxy.data, "y", 1) == 0);
++
++    CHECK(ldnr_close_socket(context, client) == 0);
++    test_destroy_context(context, api);
++}
++
++// A relay that accepts smaller frames than the chunk size still carries the
++// whole send: the split follows the negotiated limit, minus the fields of
++// the PROXY_DATA payload itself.
++static void test_send_respects_the_frame_limit(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    static uint8_t payload[3000];
++    int client;
++
++    // The handshake announces a 1024-byte payload limit: the PROXY_DATA
++    // fields take 19 of them, so a frame carries 1005 bytes of payload.
++    transport->max_frame = 1024;
++    memset(payload, 0x5a, sizeof(payload));
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
++
++    transport->data_size_count = 0;
++    CHECK(ldnr_send(context, client, payload, sizeof payload, 0) ==
++          (ssize_t)sizeof payload);
++    // 1005 + 1005 + 990 = 3000: no frame asks for more than the limit.
++    CHECK(transport->data_size_count == 3);
++    CHECK(transport->data_sizes[0] == 1005);
++    CHECK(transport->data_sizes[1] == 1005);
++    CHECK(transport->data_sizes[2] == 990);
++    CHECK(ldnr_close_socket(context, client) == 0);
++    test_destroy_context(context, api);
++}
++
++// A sweeper that cannot be started retires the stream with the fallback
++// reset of the close instead of leaving it half-open on the relay. This
++// runs as the first test so that no sweeper can already be watching.
++static void test_sweeper_failure_sends_reset(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    ldnr_message sent;
++    uint64_t connection_id;
++    int client;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    connection_id = sent.proxy.connection_id;
++
++    // The sweeper's spawn fails the way a resource exhaustion would.
++    ldnr_test_sweeper_create_fails = 1;
++    CHECK(ldnr_close_socket(context, client) == 0);
++    ldnr_test_sweeper_create_fails = 0;
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.proxy.connection_id == connection_id);
++    // The linger could not run: the stream is retired with the reset that
++    // replaces it, not with the FIN of the orderly close.
++    CHECK(sent.status == 1);
++
++    test_destroy_context(context, api);
++}
++
++// A socket that dies before its first chunk reports the loss with the
++// descriptor error: no byte is counted as sent and no frame of the dead
++// stream goes out.
++static void test_send_reports_the_lost_socket(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    ldnr_message sent;
++    test_closer closer;
++    pthread_t close_thread;
++    unsigned data_frames;
++    int client;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
++
++    // The close is parked inside the transport with the socket already
++    // cleared: a send on the dead descriptor sees what the send boundary
++    // sees and fails with the descriptor error, not a partial count.
++    test_set_flag(transport, &transport->delay_disconnect, 1);
++    memset(&closer, 0, sizeof(closer));
++    closer.context = context;
++    closer.fd = client;
++    closer.result = -1;
++    CHECK(pthread_create(&close_thread, NULL, test_close_thread, &closer) == 0);
++    test_wait_for_flag(transport, &transport->disconnect_delayed);
++
++    data_frames = test_sent_count(transport, LDNR_MSG_PROXY_DATA);
++    CHECK(ldnr_send(context, client, "x", 1, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_EBADF);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DATA) == data_frames);
++
++    test_set_flag(transport, &transport->release_disconnect, 1);
++    CHECK(pthread_join(close_thread, NULL) == 0);
++    CHECK(closer.result == 0);
++    // The orderly close went out as a FIN once it was let through.
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.status == 0);
++    test_destroy_context(context, api);
++}
++
 +int main(void)
 +{
++    test_sweeper_failure_sends_reset();
 +    test_offline_and_fd_limit();
 +    test_udp();
 +    test_tcp();
@@ -13733,6 +14502,11 @@ index 0000000..45e72e5
 +    test_poll_cancellation_ends();
 +    test_rejoin_keeps_old_descriptors_terminal();
 +    test_listener_close_reclaims_queued_children();
++    test_network_down_reclaims_queued_children();
++    test_udp_never_reaches_the_new_room();
++    test_shut_read_discards_incoming();
++    test_send_respects_the_frame_limit();
++    test_send_reports_the_lost_socket();
 +    test_data_never_follows_the_fin();
 +    test_send_stops_at_shutdown_and_reset();
 +    test_accept_waits_for_the_reply();
