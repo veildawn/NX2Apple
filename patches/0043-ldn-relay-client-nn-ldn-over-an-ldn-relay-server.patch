@@ -22,7 +22,7 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
  dm/host/ldnr/ldnr_protocol.h    |  163 ++
  dm/host/ldnr/ldnr_tcp.c         |  534 ++++++
  dm/host/ldnr/ldnr_transport.h   |   44 +
- dm/host/ldnr/ldnr_vnet.c        | 1586 ++++++++++++++++
+ dm/host/ldnr/ldnr_vnet.c        | 1587 ++++++++++++++++
  dm/host/ldnr/ldnr_vnet.h        |   24 +
  dm/host/ldnr/tests/.gitignore   |    1 +
  dm/host/ldnr/tests/Makefile     |   60 +
@@ -33,10 +33,10 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
  dm/host/ldnr/tests/t_protocol.c | 1101 +++++++++++
  dm/host/ldnr/tests/t_state.c    | 1652 ++++++++++++++++
  dm/host/ldnr/tests/t_tcp.c      |  442 +++++
- dm/host/ldnr/tests/t_vnet.c     | 3160 +++++++++++++++++++++++++++++++
+ dm/host/ldnr/tests/t_vnet.c     | 3172 +++++++++++++++++++++++++++++++
  dm/host/loader.c                |   16 +-
  docs/LDN-RELAY.md               |   91 +
- 27 files changed, 14403 insertions(+), 5 deletions(-)
+ 27 files changed, 14416 insertions(+), 5 deletions(-)
  create mode 100644 dm/host/hle_ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.h
@@ -5275,10 +5275,10 @@ index 0000000..f158534
 +int ldnr_tcp_test_connecting_fd(const ldnr_transport *transport);
 diff --git a/dm/host/ldnr/ldnr_vnet.c b/dm/host/ldnr/ldnr_vnet.c
 new file mode 100644
-index 0000000..1e5086f
+index 0000000..a8457b1
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_vnet.c
-@@ -0,0 +1,1586 @@
+@@ -0,0 +1,1587 @@
 +// Virtual BSD sockets on the LDN subnet. No host socket descriptor escapes:
 +// readiness and datagram queues are entirely under this layer's control.
 +#include "ldnr_internal.h"
@@ -6067,6 +6067,7 @@ index 0000000..1e5086f
 +        if (size > LDNR_UDP_MTU) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EMSGSIZE); }
 +        ldnr_sockaddr peer = s->peer;
 +        if (!s->connected) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_ENOTCONN); }
++        if (s->shut_write) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EPIPE); }
 +        int remote_error = s->remote_error;
 +        if (remote_error) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(remote_error); }
 +        uint64_t generation = l->vnet.membership_generation;
@@ -11355,10 +11356,10 @@ index 0000000..583b703
 +}
 diff --git a/dm/host/ldnr/tests/t_vnet.c b/dm/host/ldnr/tests/t_vnet.c
 new file mode 100644
-index 0000000..6199552
+index 0000000..25f0c5c
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_vnet.c
-@@ -0,0 +1,3160 @@
+@@ -0,0 +1,3172 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
@@ -12282,6 +12283,18 @@ index 0000000..6199552
 +    CHECK(ldnr_recvfrom(context, fd, buffer, sizeof(buffer), 0, &source, 0) == 4);
 +    CHECK(memcmp(buffer, "b-in", 4) == 0);
 +    CHECK(source.address == ldnr_ipv4(192, 168, 44, 30));
++
++    /* A connected datagram socket shut for writing must refuse send() just
++     * like sendto(): no UDP frame may leave after SHUT_WR. */
++    {
++        unsigned frames = test_sent_count(transport, LDNR_MSG_UDP);
++        CHECK(ldnr_shutdown(context, other, 1) == 0);
++        CHECK(ldnr_send(context, other, "late", 4, 0) == -1);
++        CHECK(ldnr_last_errno() == TEST_EPIPE);
++        CHECK(ldnr_sendto(context, other, "late", 4, 0, &peer) == -1);
++        CHECK(ldnr_last_errno() == TEST_EPIPE);
++        CHECK(test_sent_count(transport, LDNR_MSG_UDP) == frames);
++    }
 +
 +    CHECK(ldnr_close_socket(context, ephemeral) == 0);
 +    CHECK(ldnr_close_socket(context, other) == 0);
