@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: veildawn <40253459+veildawn@users.noreply.github.com>
-Date: Sun, 1 Nov 2026 11:06:09 +0800
+Date: Sun, 1 Nov 2026 13:13:55 +0800
 Subject: [PATCH] LDN relay client: nn::ldn over an LDN relay server (opt-in,
  DM_LDNR=1)
 
@@ -10,33 +10,33 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
 
 ---
  dm/host/Makefile                |    2 +-
- dm/host/hle_ldnr.c              |  888 ++++++++++++++
- dm/host/ldnr/ldnr.c             |  898 +++++++++++++++
- dm/host/ldnr/ldnr.h             |  131 +++
- dm/host/ldnr/ldnr_client.c      |  579 ++++++++++
+ dm/host/hle_ldnr.c              |  895 +++++++++++
+ dm/host/ldnr/ldnr.c             |  941 ++++++++++++
+ dm/host/ldnr/ldnr.h             |  131 ++
+ dm/host/ldnr/ldnr_client.c      |  614 ++++++++
  dm/host/ldnr/ldnr_hook.h        |   13 +
- dm/host/ldnr/ldnr_internal.h    |  211 ++++
- dm/host/ldnr/ldnr_native.c      |  622 ++++++++++
- dm/host/ldnr/ldnr_native.h      |  203 ++++
- dm/host/ldnr/ldnr_protocol.c    |  645 +++++++++++
- dm/host/ldnr/ldnr_protocol.h    |  159 +++
- dm/host/ldnr/ldnr_tcp.c         |  500 ++++++++
- dm/host/ldnr/ldnr_transport.h   |   42 +
- dm/host/ldnr/ldnr_vnet.c        | 1112 ++++++++++++++++++
- dm/host/ldnr/ldnr_vnet.h        |   17 +
+ dm/host/ldnr/ldnr_internal.h    |  220 +++
+ dm/host/ldnr/ldnr_native.c      |  622 ++++++++
+ dm/host/ldnr/ldnr_native.h      |  203 +++
+ dm/host/ldnr/ldnr_protocol.c    |  645 ++++++++
+ dm/host/ldnr/ldnr_protocol.h    |  159 ++
+ dm/host/ldnr/ldnr_tcp.c         |  534 +++++++
+ dm/host/ldnr/ldnr_transport.h   |   44 +
+ dm/host/ldnr/ldnr_vnet.c        | 1379 +++++++++++++++++
+ dm/host/ldnr/ldnr_vnet.h        |   20 +
  dm/host/ldnr/tests/.gitignore   |    1 +
  dm/host/ldnr/tests/Makefile     |   60 +
  dm/host/ldnr/tests/shim/hle.h   |   38 +
- dm/host/ldnr/tests/t_glue.c     |  539 +++++++++
- dm/host/ldnr/tests/t_ldnr_e2e.c |  199 ++++
- dm/host/ldnr/tests/t_native.c   |  340 ++++++
- dm/host/ldnr/tests/t_protocol.c | 1101 ++++++++++++++++++
- dm/host/ldnr/tests/t_state.c    |  883 ++++++++++++++
- dm/host/ldnr/tests/t_tcp.c      |  259 +++++
- dm/host/ldnr/tests/t_vnet.c     | 1917 +++++++++++++++++++++++++++++++
+ dm/host/ldnr/tests/t_glue.c     |  572 +++++++
+ dm/host/ldnr/tests/t_ldnr_e2e.c |  198 +++
+ dm/host/ldnr/tests/t_native.c   |  340 ++++
+ dm/host/ldnr/tests/t_protocol.c | 1101 +++++++++++++
+ dm/host/ldnr/tests/t_state.c    | 1215 +++++++++++++++
+ dm/host/ldnr/tests/t_tcp.c      |  442 ++++++
+ dm/host/ldnr/tests/t_vnet.c     | 2565 +++++++++++++++++++++++++++++++
  dm/host/loader.c                |   16 +-
  docs/LDN-RELAY.md               |   91 ++
- 27 files changed, 11461 insertions(+), 5 deletions(-)
+ 27 files changed, 13056 insertions(+), 5 deletions(-)
  create mode 100644 dm/host/hle_ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.h
@@ -78,10 +78,10 @@ index 978fee0..3038a23 100644
  	rm -rf gen dmhost dmhost_* *.dSYM
 diff --git a/dm/host/hle_ldnr.c b/dm/host/hle_ldnr.c
 new file mode 100644
-index 0000000..6c4d578
+index 0000000..fcfe23d
 --- /dev/null
 +++ b/dm/host/hle_ldnr.c
-@@ -0,0 +1,888 @@
+@@ -0,0 +1,895 @@
 +// Optional nn::ldn / nn::socket takeover for relay play. The separate swldnr
 +// section keeps force_init's upstream duplicate check and accounting unchanged.
 +#ifdef LDNR_GLUE_SYNTAX_TEST
@@ -562,18 +562,25 @@ index 0000000..6c4d578
 +    }
 +    // A configuration that does not decode is an invalid input: the local
 +    // validation error is returned directly, not a stale core error.
++    // The failure of the operation is kept apart from its error: a core
++    // that failed without recording one must not be reported as a success.
++    int failed = 0;
 +    int error = 0;
 +    if ((config_bytes && ldnr_native_network_config_decode(&config, config_bytes, sizeof config) != LDNR_NATIVE_OK) ||
 +        ldnr_native_security_config_decode(&security, security_bytes, sizeof security) != LDNR_NATIVE_OK ||
 +        (user_bytes && ldnr_native_user_config_decode(&user, user_bytes, sizeof user) != LDNR_NATIVE_OK) ||
-+        (parameter_bytes && ldnr_native_security_parameter_decode(&parameter, parameter_bytes, sizeof parameter) != LDNR_NATIVE_OK))
++        (parameter_bytes && ldnr_native_security_parameter_decode(&parameter, parameter_bytes, sizeof parameter) != LDNR_NATIVE_OK)) {
++        failed = 1;
 +        error = LDNR_EINVAL;
-+    if (!error && ldnr_connect_network(l, info, config_bytes ? &config : NULL, &security,
-+                                       user_bytes ? &user : NULL,
-+                                       parameter_bytes ? &parameter : NULL, option, version))
++    }
++    if (!failed && ldnr_connect_network(l, info, config_bytes ? &config : NULL, &security,
++                                        user_bytes ? &user : NULL,
++                                        parameter_bytes ? &parameter : NULL, option, version)) {
++        failed = 1;
 +        error = ldnr_last_errno();
++    }
 +    free(info);
-+    return error ? lr_failure(error) : RES_OK;
++    return failed ? lr_failure(error) : RES_OK;
 +}
 +LDNR_HLE("_ZN2nn3ldn7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE", Result, lr_ldn_connect,
 +         const void *info, const void *security, const void *user, int version, int option) {
@@ -972,10 +979,10 @@ index 0000000..6c4d578
 +#include "ldnr/ldnr.c"
 diff --git a/dm/host/ldnr/ldnr.c b/dm/host/ldnr/ldnr.c
 new file mode 100644
-index 0000000..55acf15
+index 0000000..2a94ba9
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr.c
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,941 @@
 +// LDN service state and the public lifecycle API. Relay I/O and virtual
 +// sockets are separate so illegal transitions can be tested without a server.
 +#include "ldnr_internal.h"
@@ -1167,6 +1174,22 @@ index 0000000..55acf15
 +    memset(l->history, 0, sizeof l->history);
 +}
 +
++// The membership ends without the guest asking for it: the relay is gone.
++// The membership is cleared, the sockets that belong to it are marked down
++// and their waiters are woken, and the guest sees the open state with the
++// reason of the loss. The caller holds the core lock.
++void ldnr_membership_retire(ldnr *l, int reason) {
++    if (!l) return;
++    ldnr_clear_membership(l);
++    l->disconnect_reason = reason;
++    // The relay is gone: no descriptor of the membership may wait for a
++    // connection, a datagram or data that can no longer arrive.
++    ldnr_vnet_network_down(l);
++    // The room does not exist any more: the guest sees the open state.
++    if (l->state == LDNR_STATE_AP_CREATED) ldnr_state_set(l, LDNR_STATE_AP_OPEN);
++    else if (l->state == LDNR_STATE_STATION_CONNECTED) ldnr_state_set(l, LDNR_STATE_STATION_OPEN);
++}
++
 +void ldnr_finalize(ldnr *l) {
 +    if (!l) return;
 +    ldnr_client_close(l);
@@ -1355,19 +1378,33 @@ index 0000000..55acf15
 +    pthread_mutex_unlock(&l->mutex);
 +    // The room was never created: there is nothing to remove.
 +    if (!created) return;
++    // The error of the operation that failed is the one the caller sees:
++    // the rollback is not that operation, and its own failure must not
++    // replace its error.
++    int error = ldnr_last_errno();
 +    ldnr_message *message = ldnr_message_new();
++    int destroyed = 0;
 +    if (message) {
 +        message->network_info = network;
 +        message->has_network_info = 1;
-+        ldnr_client_request(l, LDNR_MSG_DESTROY_ACK, LDNR_MSG_DESTROY_ACK, id, message,
-+                            NULL, NULL, l->config.connect_timeout_ms);
++        destroyed = ldnr_client_request(l, LDNR_MSG_DESTROY_ACK, LDNR_MSG_DESTROY_ACK, id,
++                                        message, NULL, NULL, l->config.connect_timeout_ms) == 0;
 +        ldnr_message_delete(message);
++    }
++    if (!destroyed) {
++        // The relay still owns the room: the removal was not confirmed.
++        // The connection is what holds the membership, so it is retired
++        // before the local membership is cleared. A room that the relay
++        // kept would refuse the next create with "already in a room".
++        ldnr_client_close(l);
 +    }
 +    pthread_mutex_lock(&l->mutex);
 +    ldnr_vnet_reset(l);
 +    ldnr_clear_membership(l);
 +    ldnr_state_set(l, LDNR_STATE_AP_OPEN);
 +    pthread_mutex_unlock(&l->mutex);
++    // The error of the operation is kept.
++    ldnr_set_errno(error);
 +}
 +
 +int ldnr_create_network(ldnr *l, const ldnr_network_config *config,
@@ -1415,7 +1452,8 @@ index 0000000..55acf15
 +    int filter_count = l->pending_filter_count;
 +    uint8_t filters[16][6];
 +    memcpy(filters, l->pending_filters, sizeof filters);
-+    l->pending_filter_count = 0;
++    // The staged filters stay staged until the room holds them: a create
++    // that fails must leave the configuration for the next attempt.
 +    // A room with a filter list must not admit a station before the list is
 +    // complete: the room is created with a policy that refuses everybody
 +    // and gets the wanted one once the filters are in place.
@@ -1454,9 +1492,21 @@ index 0000000..55acf15
 +                                     l->config.connect_timeout_ms);
 +    }
 +    if (result) {
++        // The staged configuration is kept: a retry must create the room
++        // with the filters the host asked for, or a blacklisted station
++        // would be admitted by the room that replaces it.
++        pthread_mutex_lock(&l->mutex);
++        memcpy(l->pending_filters, filters, sizeof filters);
++        l->pending_filter_count = filter_count;
++        pthread_mutex_unlock(&l->mutex);
 +        // The room exists but its configuration failed: it is removed, so
 +        // that no station joins a room that is not the one the host asked for.
 +        ldnr_create_rollback(l);
++    } else {
++        // The room holds the filters now: they are not staged any more.
++        pthread_mutex_lock(&l->mutex);
++        l->pending_filter_count = 0;
++        pthread_mutex_unlock(&l->mutex);
 +    }
 +    pthread_mutex_unlock(&l->control);
 +    return result;
@@ -2013,10 +2063,10 @@ index 0000000..d82f463
 +                    const void *data, size_t size);
 diff --git a/dm/host/ldnr/ldnr_client.c b/dm/host/ldnr/ldnr_client.c
 new file mode 100644
-index 0000000..5c9db8c
+index 0000000..f69a82a
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_client.c
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,614 @@
 +// Relay connection, request/reply matching, and the background receive loop.
 +// The codec only turns frames into ldnr_message; this file owns no wire rules.
 +#include "ldnr_internal.h"
@@ -2053,7 +2103,13 @@ index 0000000..5c9db8c
 +    int result = ldnr_protocol_encode_ex(frame, LDNR_MAX_FRAME, &size, type, request_id,
 +                                         network_id, message, operation,
 +                                         atomic_load(&l->protocol_major));
-+    if (!result) result = ldnr_send_encoded(l, frame, size);
++    if (result) {
++        // The frame could not be built: the request is not one the wire
++        // accepts. The failure carries an error of its own, never a stale
++        // one, so that the caller cannot read it as a success.
++        ldnr_set_error(l, "relay frame could not be encoded: %s", ldnr_protocol_error());
++        result = ldnr_fail(LDNR_EINVAL);
++    } else result = ldnr_send_encoded(l, frame, size);
 +    free(frame);
 +    return result;
 +}
@@ -2062,16 +2118,25 @@ index 0000000..5c9db8c
 +// carries the connection id of the open, or with an error that carries the
 +// request id of the open. The open is remembered here, so that both forms
 +// reach the socket that waits for the answer.
-+static void ldnr_proxy_open_record(ldnr *l, uint64_t request_id, uint64_t connection_id) {
++static int ldnr_proxy_open_record(ldnr *l, uint64_t request_id, uint64_t connection_id) {
++    int recorded = 0;
 +    pthread_mutex_lock(&l->proxy_mutex);
 +    for (unsigned i = 0; i < LDNR_MAX_PROXY_OPENS; i++) {
 +        if (l->proxy_opens[i].used) continue;
 +        l->proxy_opens[i].used = 1;
 +        l->proxy_opens[i].request_id = request_id;
 +        l->proxy_opens[i].connection_id = connection_id;
++        recorded = 1;
 +        break;
 +    }
 +    pthread_mutex_unlock(&l->proxy_mutex);
++    if (!recorded) {
++        // An open that cannot be remembered must not go out: its answer
++        // would have no way to reach the socket that waits for it.
++        ldnr_set_error(l, "too many proxied opens are waiting for their answer");
++        return ldnr_fail(LDNR_ENOBUFS);
++    }
++    return 0;
 +}
 +
 +static void ldnr_proxy_open_forget(ldnr *l, uint64_t request_id) {
@@ -2109,6 +2174,14 @@ index 0000000..5c9db8c
 +    pthread_mutex_unlock(&l->proxy_mutex);
 +}
 +
++// The membership is gone: no open can be answered any more, and the table
++// must not keep the entries of a room that does not exist any more.
++static void ldnr_proxy_open_clear_all(ldnr *l) {
++    pthread_mutex_lock(&l->proxy_mutex);
++    for (unsigned i = 0; i < LDNR_MAX_PROXY_OPENS; i++) l->proxy_opens[i].used = 0;
++    pthread_mutex_unlock(&l->proxy_mutex);
++}
++
 +int ldnr_client_send(ldnr *l, ldnr_message_type type, uint64_t network_id,
 +                     const ldnr_message *message, const ldnr_operation *operation) {
 +    uint64_t request_id = 0;
@@ -2118,7 +2191,15 @@ index 0000000..5c9db8c
 +        // the control requests, so that the two can never be confused.
 +        request_id = LDNR_PROXY_REQUEST_BASE +
 +            (uint64_t)atomic_fetch_add(&l->proxy_request_seq, 1);
-+        ldnr_proxy_open_record(l, request_id, message->proxy.connection_id);
++        // The open is remembered before it goes out: an answer that names
++        // it must reach the socket that waits for it.
++        if (ldnr_proxy_open_record(l, request_id, message->proxy.connection_id)) return -1;
++    }
++    if (type == LDNR_MSG_PROXY_DISCONNECT && message) {
++        // The stream is over: a close of the socket or a reset of a stream
++        // that timed out ends the open. The entry must not survive it, or a
++        // later error of the relay would reach a socket that is gone.
++        ldnr_proxy_open_clear(l, message->proxy.connection_id);
 +    }
 +    int result = ldnr_client_send_ex(l, type, request_id, network_id, message, operation);
 +    if (result && request_id) ldnr_proxy_open_forget(l, request_id);
@@ -2134,7 +2215,13 @@ index 0000000..5c9db8c
 +    int result = ldnr_protocol_encode_ex(frame, LDNR_MAX_FRAME, &size, send_type, request_id,
 +                                         network_id, message, operation,
 +                                         atomic_load(&l->protocol_major));
-+    if (!result) result = ldnr_send_encoded(l, frame, size);
++    if (result) {
++        // The frame could not be built: the request is not one the wire
++        // accepts. The failure carries an error of its own, never a stale
++        // one, so that the caller cannot read it as a success.
++        ldnr_set_error(l, "relay frame could not be encoded: %s", ldnr_protocol_error());
++        result = ldnr_fail(LDNR_EINVAL);
++    } else result = ldnr_send_encoded(l, frame, size);
 +    free(frame);
 +    return result;
 +}
@@ -2187,6 +2274,12 @@ index 0000000..5c9db8c
 +        l->stop = 1;
 +        if (l->transport && l->transport->close) l->transport->close(l->transport->ctx);
 +        atomic_store(&l->transport_open, 0);
++        // The membership is over: it is cleared, the sockets that belong to
++        // it are marked down and their waiters are woken, and the guest
++        // sees the open state with the reason of the loss.
++        ldnr_membership_retire(l, LDNR_REASON_SIGNAL_LOST);
++        // No open of that room can be answered any more.
++        ldnr_proxy_open_clear_all(l);
 +    }
 +    // The reply is handed over before the request slot is released, so no
 +    // other request can replace it while the caller reads it.
@@ -2289,6 +2382,8 @@ index 0000000..5c9db8c
 +    }
 +    ldnr_vnet_network_down(l);
 +    pthread_mutex_unlock(&l->mutex);
++    // The membership is gone: no open of it can be answered any more.
++    ldnr_proxy_open_clear_all(l);
 +}
 +
 +static void ldnr_reply(ldnr *l, const ldnr_message *message) {
@@ -2493,18 +2588,6 @@ index 0000000..5c9db8c
 +    pthread_mutex_unlock(&l->mutex);
 +}
 +
-+// The bytes of a relayed segment are lost: the stream that carried them is
-+// reset, so the guest reads the failure instead of a stream with a hole.
-+static void ldnr_client_reset_stream(ldnr *l, uint64_t connection_id) {
-+    ldnr_message message;
-+    memset(&message, 0, sizeof message);
-+    message.type = LDNR_MSG_PROXY_DISCONNECT;
-+    message.proxy.connection_id = connection_id;
-+    message.status = 1;      // the relay marks a reset with the first flag
-+    message.reason = 1;      // ProxyCloseDeliveryFailure
-+    ldnr_vnet_proxy_disconnect(l, &message);
-+}
-+
 +// The client answers a message it cannot read: the relay wants the error
 +// that names the request. The code 2 is the relay's own UNSUPPORTED.
 +static void ldnr_client_send_error(ldnr *l, uint64_t request_id, uint32_t code,
@@ -2563,9 +2646,11 @@ index 0000000..5c9db8c
 +            }
 +            if (status.has_connection_id) {
 +                // The bytes of a relayed segment are lost: the stream that
-+                // carried them is broken, the connection is not.
++                // carried them is broken, the connection is not. The stream
++                // is failed terminally so nothing that follows the gap can
++                // be delivered, and the relay is told with a reset.
 +                ldnr_log(l, "resetting the stream that lost its payload");
-+                ldnr_client_reset_stream(l, status.connection_id);
++                ldnr_vnet_stream_fail(l, status.connection_id);
 +                continue;
 +            }
 +            if (status.kind == LDNR_DECODE_MEMORY) {
@@ -2617,10 +2702,10 @@ index 0000000..b613bcd
 +#endif
 diff --git a/dm/host/ldnr/ldnr_internal.h b/dm/host/ldnr/ldnr_internal.h
 new file mode 100644
-index 0000000..a4cbffe
+index 0000000..b96aa99
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_internal.h
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,220 @@
 +// Private shared state for the unity build and the standalone test build.
 +#pragma once
 +#include "ldnr.h"
@@ -2807,6 +2892,11 @@ index 0000000..a4cbffe
 +                        uint64_t network_id, const ldnr_message *message,
 +                        const ldnr_operation *operation);
 +void *ldnr_client_receive_main(void *argument);
++// The membership of the relay ended without the guest asking for it: it is
++// cleared, the sockets that belong to it are marked down and their waiters
++// are woken, and the open state is published with the reason of the loss.
++// The caller holds the core lock.
++void ldnr_membership_retire(ldnr *l, int reason);
 +
 +void ldnr_vnet_init(ldnr *l);
 +void ldnr_vnet_destroy(ldnr *l);
@@ -2818,6 +2908,10 @@ index 0000000..a4cbffe
 +void ldnr_vnet_proxy_ack(ldnr *l, const ldnr_message *message);
 +void ldnr_vnet_proxy_data(ldnr *l, const ldnr_message *message);
 +void ldnr_vnet_proxy_disconnect(ldnr *l, const ldnr_message *message);
++// The bytes of a relayed stream are lost: the stream is failed terminally,
++// its waiters are woken, and the relay is told with a reset. The transport
++// is retired when the reset cannot be sent.
++void ldnr_vnet_stream_fail(ldnr *l, uint64_t connection_id);
 +void ldnr_vnet_network_down(ldnr *l);
 +// Every socket wait ends at once: the relay is gone or the context is
 +// closing, so no caller may stay blocked.
@@ -4487,10 +4581,10 @@ index 0000000..4330789
 +const char *ldnr_protocol_error(void);
 diff --git a/dm/host/ldnr/ldnr_tcp.c b/dm/host/ldnr/ldnr_tcp.c
 new file mode 100644
-index 0000000..512c62c
+index 0000000..68d0bab
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_tcp.c
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,534 @@
 +// POSIX stream transport for LDNR frames. TLS is deliberately not implicit:
 +// use a TLS endpoint/tunnel until this small transport gains certificate verification.
 +#include "ldnr_transport.h"
@@ -4537,11 +4631,14 @@ index 0000000..512c62c
 +    pthread_mutex_t mutex;             // guards the connection and the state
 +    pthread_mutex_t send_mutex;         // serializes the writers
 +    ldnr_tcp_conn *current;             // the connection in use
++    // The connection of a connect that is in progress. It owns its
++    // descriptor like any other: a close that interrupts the connect shuts
++    // the descriptor down, and the worker that owns the connect closes it.
++    ldnr_tcp_conn *connecting;
 +    uint64_t generation;                // identity of the connection
 +    uint32_t limit;                     // the largest payload the relay accepts
 +    int failed;                         // the framing stream is broken
 +    int closed;                         // the transport was closed
-+    int connecting_fd;                  // the descriptor of a connect in progress
 +} ldnr_tcp;
 +
 +// The transports that were built here. The core asks a transport for its
@@ -4682,10 +4779,11 @@ index 0000000..512c62c
 +    if (gai) { ldnr_tcp_error(error, error_size, gai_strerror(gai)); return -1; }
 +    if (timeout_ms <= 0) timeout_ms = LDNR_TCP_CONNECT_TIMEOUT_MS;
 +    int64_t deadline = ldnr_tcp_now_ms() + timeout_ms;
-+    int fd = -1, saved = ECONNREFUSED;
++    int saved = ECONNREFUSED;
++    ldnr_tcp_conn *conn = NULL;
 +    for (struct addrinfo *at = addresses; at; at = at->ai_next) {
 +        if (cancelled && cancelled(cancel_ctx)) { saved = ECANCELED; break; }
-+        fd = socket(at->ai_family, at->ai_socktype, at->ai_protocol);
++        int fd = socket(at->ai_family, at->ai_socktype, at->ai_protocol);
 +        if (fd < 0) { saved = errno; continue; }
 +        int one = 1;
 +        (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -4693,22 +4791,39 @@ index 0000000..512c62c
 +        (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 +#endif
 +        ldnr_tcp_nonblock(fd);
++        // The descriptor belongs to a connection from now on: it is closed
++        // exactly once, by the worker that owns it, and a close that
++        // interrupts the connect only shuts it down. A descriptor that the
++        // kernel gave to somebody else is never touched.
++        ldnr_tcp_conn *pending = calloc(1, sizeof *pending);
++        if (!pending) { close(fd); saved = ENOMEM; break; }
++        pending->fd = fd;
++        pending->refs = 1;              // the worker owns the connect
 +        // The descriptor is published before the connect: a cancellation
 +        // closes it and ends the wait at once.
 +        pthread_mutex_lock(&tcp->mutex);
-+        tcp->connecting_fd = fd;
++        pending->refs++;                // the published slot owns a reference
++        tcp->connecting = pending;
 +        pthread_mutex_unlock(&tcp->mutex);
 +        int connected = ldnr_tcp_connect_wait(fd, at->ai_addr, at->ai_addrlen, deadline,
 +                                              cancelled, cancel_ctx, &saved);
 +        pthread_mutex_lock(&tcp->mutex);
-+        tcp->connecting_fd = -1;
++        // The connect is over: the descriptor leaves the published slot,
++        // unless a close has taken it already.
++        int published = tcp->connecting == pending;
++        if (published) tcp->connecting = NULL;
 +        pthread_mutex_unlock(&tcp->mutex);
-+        if (connected) break;
-+        close(fd);
-+        fd = -1;
++        if (published) ldnr_tcp_conn_release(tcp, pending);
++        if (!connected) {
++            // The attempt failed: the descriptor is closed here, once.
++            ldnr_tcp_conn_retire(tcp, pending);
++            continue;
++        }
++        conn = pending;
++        break;
 +    }
 +    freeaddrinfo(addresses);
-+    if (fd < 0) {
++    if (!conn) {
 +        ldnr_tcp_error(error, error_size, strerror(saved));
 +        return -1;
 +    }
@@ -4720,22 +4835,13 @@ index 0000000..512c62c
 +        // The transport was closed while the connect was in progress: the
 +        // connection is dropped instead of reviving a closed transport.
 +        pthread_mutex_unlock(&tcp->mutex);
-+        close(fd);
++        ldnr_tcp_conn_retire(tcp, conn);
 +        ldnr_tcp_error(error, error_size, "the transport was closed");
-+        return -1;
-+    }
-+    ldnr_tcp_conn *conn = calloc(1, sizeof *conn);
-+    if (!conn) {
-+        pthread_mutex_unlock(&tcp->mutex);
-+        close(fd);
-+        ldnr_tcp_error(error, error_size, "out of memory");
 +        return -1;
 +    }
 +    ldnr_tcp_conn *old = tcp->current;
 +    tcp->current = NULL;
-+    conn->fd = fd;
 +    conn->generation = ++tcp->generation;
-+    conn->refs = 1;                    // the owner of the descriptor
 +    tcp->current = conn;
 +    tcp->failed = 0;
 +    pthread_mutex_unlock(&tcp->mutex);
@@ -4915,19 +5021,28 @@ index 0000000..512c62c
 +
 +static void ldnr_tcp_close(void *ctx) {
 +    ldnr_tcp *tcp = ctx;
-+    // A connect that is in progress is interrupted: the wait ends at once.
 +    pthread_mutex_lock(&tcp->mutex);
 +    tcp->closed = 1;
-+    int connecting = tcp->connecting_fd;
-+    tcp->connecting_fd = -1;
-+    pthread_mutex_unlock(&tcp->mutex);
-+    if (connecting >= 0) shutdown(connecting, SHUT_RDWR);
++    // A connect that is in progress is interrupted: the wait ends at once.
++    // The published slot owns a reference, so the descriptor stays alive
++    // until the shutdown below has reached it.
++    ldnr_tcp_conn *connecting = tcp->connecting;
++    tcp->connecting = NULL;
 +    // The connection in use is retired: its descriptor is shut down, so that
 +    // the reader returns, and closed when its last user is gone.
-+    pthread_mutex_lock(&tcp->mutex);
 +    ldnr_tcp_conn *conn = tcp->current;
 +    tcp->current = NULL;
 +    pthread_mutex_unlock(&tcp->mutex);
++    if (connecting) {
++        // Only the shutdown happens here: the worker that owns the connect
++        // closes the descriptor when the connect is over. A descriptor that
++        // the kernel gave to somebody else is never shut down.
++        pthread_mutex_lock(&tcp->mutex);
++        connecting->retired = 1;
++        pthread_mutex_unlock(&tcp->mutex);
++        shutdown(connecting->fd, SHUT_RDWR);
++        ldnr_tcp_conn_release(tcp, connecting);
++    }
 +    ldnr_tcp_conn_retire(tcp, conn);
 +}
 +
@@ -4955,7 +5070,7 @@ index 0000000..512c62c
 +        pthread_mutex_init(&tcp->send_mutex, NULL)) {
 +        free(transport); free(tcp); return NULL;
 +    }
-+    tcp->connecting_fd = -1; tcp->limit = LDNR_TCP_DEFAULT_LIMIT;
++    tcp->limit = LDNR_TCP_DEFAULT_LIMIT;
 +    transport->ctx = tcp;
 +    transport->connect = ldnr_tcp_connect;
 +    transport->recv = ldnr_tcp_recv;
@@ -4969,6 +5084,19 @@ index 0000000..512c62c
 +    ldnr_tcp_registry = tcp;
 +    pthread_mutex_unlock(&ldnr_tcp_registry_mutex);
 +    return transport;
++}
++
++// Test hook: the descriptor of the connect that is in progress, or -1 when
++// there is none. The descriptor belongs to the transport while it is
++// published: the tests use it to check that a close interrupts the connect
++// without reaching a descriptor of somebody else.
++int ldnr_tcp_test_connecting_fd(const ldnr_transport *transport) {
++    if (!transport || !transport->ctx) return -1;
++    ldnr_tcp *tcp = transport->ctx;
++    pthread_mutex_lock(&tcp->mutex);
++    int fd = tcp->connecting ? tcp->connecting->fd : -1;
++    pthread_mutex_unlock(&tcp->mutex);
++    return fd;
 +}
 +
 +// Test hook: replaces the connected descriptor with one the caller owns.
@@ -4993,10 +5121,10 @@ index 0000000..512c62c
 +}
 diff --git a/dm/host/ldnr/ldnr_transport.h b/dm/host/ldnr/ldnr_transport.h
 new file mode 100644
-index 0000000..6d9b0c9
+index 0000000..f158534
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_transport.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,44 @@
 +// Frame transport contract. recv returns exactly one protocol frame and blocks
 +// until one arrives. close must wake a concurrent recv. Implementations may be
 +// in-memory, which keeps the state machine and vnet tests independent of TCP.
@@ -5039,12 +5167,14 @@ index 0000000..6d9b0c9
 +const ldnr_transport *ldnr_tcp_transport_create(void);
 +// Test hook only: swaps the connected descriptor for one the caller owns.
 +void ldnr_tcp_test_replace(const ldnr_transport *transport, int fd);
++// Test hook only: the descriptor of the connect that is in progress, or -1.
++int ldnr_tcp_test_connecting_fd(const ldnr_transport *transport);
 diff --git a/dm/host/ldnr/ldnr_vnet.c b/dm/host/ldnr/ldnr_vnet.c
 new file mode 100644
-index 0000000..1f4cf18
+index 0000000..618a40b
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_vnet.c
-@@ -0,0 +1,1112 @@
+@@ -0,0 +1,1379 @@
 +// Virtual BSD sockets on the LDN subnet. No host socket descriptor escapes:
 +// readiness and datagram queues are entirely under this layer's control.
 +#include "ldnr_internal.h"
@@ -5082,13 +5212,107 @@ index 0000000..1f4cf18
 +    memset(s, 0, sizeof *s);
 +}
 +
++// The check that lets a stream frame go out and the write itself are one
++// step: a close, a shutdown or a reset that lands between them would
++// otherwise put DATA on the wire after its own FIN or RST, which is a
++// protocol violation the relay answers with a reset. Every stream frame —
++// data, FIN and RST alike — is written under this lock; the socket state is
++// only ever read under the socket mutex, which nests inside it. One lock is
++// shared by every context of the process: the ordering it adds between
++// independent sessions is harmless.
++static pthread_mutex_t ldnr_stream_send_lock = PTHREAD_MUTEX_INITIALIZER;
++
++// A frame that cannot leave the host can never reach the relay: the session
++// is closed, so that the receive path reports the loss the usual way and
++// the membership ends with it.
++static void ldnr_transport_kill(ldnr *l) {
++    if (l->transport && l->transport->close) l->transport->close(l->transport->ctx);
++    atomic_store(&l->transport_open, 0);
++}
++
++// A stream whose descriptor is closed keeps a small record: its FIN only
++// ended this side's direction, so it is reaped when the peer's close
++// arrives, or reset when the linger runs out. The records live apart from
++// the socket slots so that the descriptor number is free right away, and
++// they are shared between the contexts of the process: an entry is only
++// ever matched against the context that made it. The records are guarded
++// by the stream send lock, which every caller of these helpers holds.
++#define LDNR_STREAM_LINGER_MS 750
++#define LDNR_RETIRED_MAX 64
++typedef struct {
++    ldnr *owner;
++    uint64_t connection_id;
++    uint32_t source_address;
++    int64_t deadline;
++} ldnr_retired_stream;
++static ldnr_retired_stream ldnr_retired[LDNR_RETIRED_MAX];
++
++// The stream is half closed: the peer's direction stays open until its own
++// close or until the linger ends it. Returns 0 when no record is free, in
++// which case the caller retires the stream with a reset instead.
++static int ldnr_stream_retire(ldnr *l, uint64_t connection_id, uint32_t source_address) {
++    for (unsigned i = 0; i < LDNR_RETIRED_MAX; i++) {
++        if (ldnr_retired[i].owner) continue;
++        ldnr_retired[i].owner = l;
++        ldnr_retired[i].connection_id = connection_id;
++        ldnr_retired[i].source_address = source_address;
++        ldnr_retired[i].deadline = ldnr_monotonic_ms() + LDNR_STREAM_LINGER_MS;
++        return 1;
++    }
++    return 0;
++}
++
++// The peer's own close reached the stream: it is reaped at both ends and
++// nothing more is sent. Returns 1 when the stream was a retired one.
++static int ldnr_retired_drop(ldnr *l, uint64_t connection_id) {
++    for (unsigned i = 0; i < LDNR_RETIRED_MAX; i++) {
++        if (ldnr_retired[i].owner != l || ldnr_retired[i].connection_id != connection_id)
++            continue;
++        ldnr_retired[i].owner = NULL;
++        return 1;
++    }
++    return 0;
++}
++
++// The membership a retired stream belonged to is gone: its record must not
++// send a close into a later membership, which numbers its streams anew.
++static void ldnr_retired_purge(ldnr *l) {
++    for (unsigned i = 0; i < LDNR_RETIRED_MAX; i++)
++        if (ldnr_retired[i].owner == l) ldnr_retired[i].owner = NULL;
++}
++
++// Every retired stream of this context that ran out its linger gets the
++// reset that ends it on the relay. The caller holds no socket lock.
++static void ldnr_retired_sweep(ldnr *l) {
++    int64_t now = ldnr_monotonic_ms();
++    pthread_mutex_lock(&ldnr_stream_send_lock);
++    for (unsigned i = 0; i < LDNR_RETIRED_MAX; i++) {
++        if (ldnr_retired[i].owner != l || ldnr_retired[i].deadline > now) continue;
++        ldnr_message *message = ldnr_message_new();
++        if (message) {
++            message->proxy.connection_id = ldnr_retired[i].connection_id;
++            message->proxy.source_address = ldnr_retired[i].source_address;
++            message->status = 1;   // a reset reaps the stream at both ends
++            message->reason = 0;
++            if (ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, message, NULL))
++                ldnr_transport_kill(l);
++            ldnr_message_delete(message);
++            ldnr_retired[i].owner = NULL;
++        }
++    }
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
++}
++
 +void ldnr_vnet_reset(ldnr *l) {
++    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) ldnr_socket_clear(&l->vnet.sockets[i]);
++    ldnr_retired_purge(l);
 +    l->vnet.local_address = 0;
 +    l->vnet.failed = 0;
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    pthread_mutex_unlock(&l->vnet.mutex);
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
 +}
 +
 +// Every wait of the socket layer ends: the relay is gone or the context is
@@ -5322,6 +5546,7 @@ index 0000000..1f4cf18
 +    s->remote_error = LDNR_ECONNRESET;
 +    s->remote_eof = 1;
 +    s->stream_failed = 1;
++    if (s->connecting) { s->connecting = 0; s->connect_error = LDNR_ECONNRESET; }
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    return LDNR_STREAM_RESET;
 +}
@@ -5369,8 +5594,70 @@ index 0000000..1f4cf18
 +    return 0;
 +}
 +
++// The stream is retired at both ends with a reset: an abortive close, a
++// child its listener took down, a stream that ran out its linger. The
++// caller holds the stream send lock.
++static void ldnr_send_stream_reset(ldnr *l, uint64_t connection_id, uint32_t source_address) {
++    ldnr_message *message = ldnr_message_new();
++    if (!message) { ldnr_transport_kill(l); return; }
++    message->proxy.connection_id = connection_id;
++    message->proxy.source_address = source_address;
++    message->status = 1;    // flags bit0: reset, the stream is reaped at both ends
++    message->reason = 0;    // ProxyClose: none (user close)
++    if (ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, message, NULL))
++        ldnr_transport_kill(l);
++    ldnr_message_delete(message);
++}
++
++// The orderly close of this side's direction: the peer may keep sending
++// until its own close. The caller holds the stream send lock.
++static void ldnr_send_stream_fin(ldnr *l, uint64_t connection_id, uint32_t source_address) {
++    ldnr_message *message = ldnr_message_new();
++    if (!message) { ldnr_transport_kill(l); return; }
++    message->proxy.connection_id = connection_id;
++    message->proxy.source_address = source_address;
++    message->status = 0;    // flags clear: an orderly FIN, not a reset
++    message->reason = 0;
++    if (ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, message, NULL))
++        ldnr_transport_kill(l);
++    ldnr_message_delete(message);
++}
++
++// The bytes of a relayed stream are lost: the stream is failed terminally,
++// its queued data is dropped, its waiters are woken, and the relay is told
++// with a reset. A reset that cannot leave the host retires the transport,
++// or the relay would keep a stream this client already buried.
++void ldnr_vnet_stream_fail(ldnr *l, uint64_t connection_id) {
++    // The mark and the reset stay one step under the stream send lock: no
++    // send that was still in flight may put DATA behind it on the wire.
++    pthread_mutex_lock(&ldnr_stream_send_lock);
++    pthread_mutex_lock(&l->vnet.mutex);
++    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
++        ldnr_vsock *s = &l->vnet.sockets[i];
++        if (!s->used || s->type != 1 || s->connection_id != connection_id) continue;
++        ldnr_stream_fail(l, s);
++        break;
++    }
++    uint32_t source_address = l->vnet.local_address;
++    pthread_mutex_unlock(&l->vnet.mutex);
++    ldnr_message *message = ldnr_message_new();
++    if (!message) {
++        ldnr_transport_kill(l);
++    } else {
++        message->proxy.connection_id = connection_id;
++        message->proxy.source_address = source_address;
++        message->status = 1;   // the relay marks a reset with the first flag
++        message->reason = 1;   // ProxyCloseDeliveryFailure
++        if (ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, message, NULL))
++            ldnr_transport_kill(l);
++        ldnr_message_delete(message);
++    }
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
++}
++
 +void ldnr_vnet_udp(ldnr *l, const ldnr_message *message) {
 +    if (message->udp.size > LDNR_UDP_MTU) return;
++    ldnr_retired_sweep(l);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    int broadcast = message->udp.destination_address == 0xffffffffu ||
 +        (message->udp.destination_address | l->vnet.subnet_mask) == 0xffffffffu;
@@ -5380,7 +5667,8 @@ index 0000000..1f4cf18
 +    }
 +    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
 +        ldnr_vsock *s = &l->vnet.sockets[i];
-+        if (!s->used || s->type != 2 || !s->bound || s->shut_read || s->local.port != message->udp.destination_port)
++        if (!s->used || s->type != 2 || !s->bound || s->shut_read || s->remote_error ||
++            s->local.port != message->udp.destination_port)
 +            continue;
 +        if (s->local.address && s->local.address != message->udp.destination_address &&
 +            s->local.address != l->vnet.local_address) continue;
@@ -5480,6 +5768,7 @@ index 0000000..1f4cf18
 +
 +ssize_t ldnr_recv(ldnr *l, int fd, void *data, size_t capacity, int flags, int timeout_ms) {
 +    if (!l || (capacity && !data)) return ldnr_fail(LDNR_EINVAL);
++    ldnr_retired_sweep(l);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_socket_at(l, fd);
 +    if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
@@ -5489,7 +5778,9 @@ index 0000000..1f4cf18
 +        pthread_mutex_unlock(&l->vnet.mutex);
 +        return ldnr_recvfrom(l, fd, data, capacity, flags, NULL, timeout_ms);
 +    }
-+    if (s->type != 1 || (!s->connected && !s->connect_error)) {
++    // A descriptor that saw the network die keeps its terminal error even
++    // though its connected state was retired with the membership.
++    if (s->type != 1 || (!s->connected && !s->connect_error && !s->remote_error)) {
 +        pthread_mutex_unlock(&l->vnet.mutex);
 +        return ldnr_fail(LDNR_ENOTCONN);
 +    }
@@ -5557,26 +5848,22 @@ index 0000000..1f4cf18
 +    // be closed and reused by another socket while a frame is in flight, and
 +    // the rest of the buffer must not go to that other stream.
 +    uint64_t generation = s->generation;
++    pthread_mutex_unlock(&l->vnet.mutex);
 +    size_t sent = 0;
 +    while (sent < size) {
 +        size_t chunk = size - sent;
 +        if (chunk > LDNR_TCP_CHUNK) chunk = LDNR_TCP_CHUNK;
-+        // The frame is prepared under the lock and written after it is
-+        // released, so a blocked relay cannot hold the socket layer hostage.
-+        ldnr_message *message = ldnr_vnet_prepare_proxy(l, LDNR_MSG_PROXY_DATA, s,
-+                                                        l->vnet.local_address,
-+                                                        (const uint8_t *)data + sent, chunk);
-+        pthread_mutex_unlock(&l->vnet.mutex);
-+        int result = ldnr_vnet_transmit(l, LDNR_MSG_PROXY_DATA, message);
++        // The check and the write of a chunk are one step, serialized with
++        // every close and shutdown of the stream: a FIN or a RST can never
++        // reach the wire before the data that was allowed to go out. The
++        // socket mutex is still released around the write itself, so a
++        // blocked relay cannot hold the socket layer hostage.
++        pthread_mutex_lock(&ldnr_stream_send_lock);
 +        pthread_mutex_lock(&l->vnet.mutex);
-+        // The bytes that left the host are counted before the identity of
-+        // the socket is checked again: a partial send is reported as the
-+        // number of bytes that were sent.
-+        if (!result) sent += chunk;
 +        s = ldnr_socket_of(l, fd, generation);
-+        if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return sent ? (ssize_t)sent : -1; }
-+        if (result) {
++        if (!s) {
 +            pthread_mutex_unlock(&l->vnet.mutex);
++            pthread_mutex_unlock(&ldnr_stream_send_lock);
 +            return sent ? (ssize_t)sent : -1;
 +        }
 +        // A close, a shutdown or a peer reset since the last chunk ends the
@@ -5587,10 +5874,20 @@ index 0000000..1f4cf18
 +            int error = s->remote_error ? s->remote_error :
 +                        (l->cancelled ? LDNR_ECANCELED : LDNR_EPIPE);
 +            pthread_mutex_unlock(&l->vnet.mutex);
++            pthread_mutex_unlock(&ldnr_stream_send_lock);
 +            return sent ? (ssize_t)sent : ldnr_fail(error);
 +        }
++        // The frame is prepared under the socket lock and written after it
++        // is released, still inside the stream send step.
++        ldnr_message *message = ldnr_vnet_prepare_proxy(l, LDNR_MSG_PROXY_DATA, s,
++                                                        l->vnet.local_address,
++                                                        (const uint8_t *)data + sent, chunk);
++        pthread_mutex_unlock(&l->vnet.mutex);
++        int result = ldnr_vnet_transmit(l, LDNR_MSG_PROXY_DATA, message);
++        pthread_mutex_unlock(&ldnr_stream_send_lock);
++        if (result) return sent ? (ssize_t)sent : -1;
++        sent += chunk;
 +    }
-+    pthread_mutex_unlock(&l->vnet.mutex);
 +    return (ssize_t)sent;
 +}
 +
@@ -5735,7 +6032,9 @@ index 0000000..1f4cf18
 +                                             int only_connecting, int check_peer) {
 +    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
 +        ldnr_vsock *s = &l->vnet.sockets[i];
-+        if (!s->used || s->type != 1) continue;
++        // A descriptor that saw the network die is terminal: nothing that
++        // arrives for the streams of the lost membership may reach it.
++        if (!s->used || s->type != 1 || s->remote_error) continue;
 +        if (s->connection_id != message->proxy.connection_id) continue;
 +        if (only_connecting && !s->connecting) continue;
 +        if (check_peer) {
@@ -5750,11 +6049,13 @@ index 0000000..1f4cf18
 +}
 +
 +void ldnr_vnet_proxy_connect(ldnr *l, const ldnr_message *message) {
++    ldnr_retired_sweep(l);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *listener = NULL;
 +    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
 +        ldnr_vsock *s = &l->vnet.sockets[i];
-+        if (s->used && s->type == 1 && s->listening && s->local.port == message->proxy.destination_port &&
++        if (s->used && s->type == 1 && s->listening && !s->remote_error &&
++            s->local.port == message->proxy.destination_port &&
 +            (!s->local.address || s->local.address == message->proxy.destination_address) &&
 +            s->accept_count < s->backlog) { listener = s; break; }
 +    }
@@ -5768,7 +6069,11 @@ index 0000000..1f4cf18
 +            break;
 +        }
 +    }
++    // The child is kept unpublished until its acceptance reached the relay:
++    // an accept() that fires first would let the game send on a stream the
++    // relay still holds in SYN_SENT, which is a protocol violation.
 +    ldnr_vsock *accepted = listener && !duplicate ? ldnr_socket_alloc(l, 1) : NULL;
++    uint64_t listener_generation = listener ? listener->generation : 0;
 +    if (accepted) {
 +        accepted->bound = accepted->connected = 1;
 +        accepted->local.address = message->proxy.destination_address;
@@ -5776,21 +6081,50 @@ index 0000000..1f4cf18
 +        accepted->peer.address = message->proxy.source_address;
 +        accepted->peer.port = message->proxy.source_port;
 +        accepted->connection_id = message->proxy.connection_id;
-+        int index = (listener->accept_head + listener->accept_count) % LDNR_ACCEPT_MAX;
-+        listener->accept_fds[index] = accepted->fd;
-+        listener->accept_count++;
-+        pthread_cond_broadcast(&l->vnet.condition);
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
 +    ldnr_message *reply = ldnr_message_new();
-+    if (!reply) return;
-+    reply->proxy = message->proxy;
-+    reply->status = accepted ? 0 : LDNR_ECONNREFUSED;
-+    ldnr_client_send(l, LDNR_MSG_PROXY_CONNECT_ACK, 0, reply, NULL);
-+    ldnr_message_delete(reply);
++    int sent = -1;
++    if (reply) {
++        reply->proxy = message->proxy;
++        reply->status = accepted ? 0 : LDNR_ECONNREFUSED;
++        sent = ldnr_client_send(l, LDNR_MSG_PROXY_CONNECT_ACK, 0, reply, NULL);
++        ldnr_message_delete(reply);
++    }
++    // The reply is required by the protocol: a session that cannot carry it
++    // is closed instead of leaving a stream half-open on the relay.
++    if (sent) ldnr_transport_kill(l);
++    if (!accepted) return;
++    pthread_mutex_lock(&ldnr_stream_send_lock);
++    pthread_mutex_lock(&l->vnet.mutex);
++    uint32_t source_address = l->vnet.local_address;
++    // The child is published only when its acceptance went out and the
++    // listener that queued it is still alive and still has room.
++    int publish = !sent && listener->used && listener->listening &&
++        listener->generation == listener_generation &&
++        listener->accept_count < listener->backlog;
++    if (publish) {
++        int index = (listener->accept_head + listener->accept_count) % LDNR_ACCEPT_MAX;
++        listener->accept_fds[index] = accepted->fd;
++        listener->accept_count++;
++        // The id belongs to the new stream now: a stale linger for the same
++        // number must not reset it.
++        ldnr_retired_drop(l, message->proxy.connection_id);
++        pthread_cond_broadcast(&l->vnet.condition);
++    } else {
++        ldnr_socket_clear(accepted);
++    }
++    pthread_mutex_unlock(&l->vnet.mutex);
++    if (!sent && !publish) {
++        // The relay admitted the stream but nothing waits for it here:
++        // retire it instead of leaving it on the relay.
++        ldnr_send_stream_reset(l, message->proxy.connection_id, source_address);
++    }
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
 +}
 +
 +void ldnr_vnet_proxy_ack(ldnr *l, const ldnr_message *message) {
++    ldnr_retired_sweep(l);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_stream_by_connection(l, message, 1, 0);
 +    if (s) {
@@ -5806,9 +6140,11 @@ index 0000000..1f4cf18
 +    // A relayed segment may be larger than the chunk this client sends, but
 +    // it stays inside the limit of the frame.
 +    if (message->proxy.size > LDNR_WIRE_DEFAULT_LIMIT) return;
++    ldnr_retired_sweep(l);
 +    int reset = 0;
 +    uint64_t connection_id = 0;
 +    uint32_t source_address = 0;
++    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_stream_by_connection(l, message, 0, 1);
 +    if (s && s->connected) {
@@ -5821,22 +6157,35 @@ index 0000000..1f4cf18
 +            connection_id = s->connection_id;
 +            source_address = l->vnet.local_address;
 +        }
++    } else if (!s && ldnr_retired_drop(l, message->proxy.connection_id)) {
++        // A segment for a retired stream cannot be delivered: the record is
++        // dropped and the stream is reset, the way an undeliverable payload
++        // is.
++        reset = 1;
++        connection_id = message->proxy.connection_id;
++        source_address = l->vnet.local_address;
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
 +    if (reset) {
 +        ldnr_message *reply = ldnr_message_new();
-+        if (reply) {
++        if (!reply) {
++            ldnr_transport_kill(l);
++        } else {
 +            reply->proxy.connection_id = connection_id;
 +            reply->proxy.source_address = source_address;
 +            reply->status = 1;          // FlagProxyReset
 +            reply->reason = 1;          // ProxyCloseDeliveryFailure
-+            ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, reply, NULL);
++            if (ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, reply, NULL))
++                ldnr_transport_kill(l);
 +            ldnr_message_delete(reply);
 +        }
 +    }
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
 +}
 +
 +void ldnr_vnet_proxy_disconnect(ldnr *l, const ldnr_message *message) {
++    ldnr_retired_sweep(l);
++    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_stream_by_connection(l, message, 0, 1);
 +    if (s) {
@@ -5846,30 +6195,28 @@ index 0000000..1f4cf18
 +        else s->remote_eof = 1;
 +        if (s->connecting) { s->connecting = 0; s->connect_error = LDNR_ECONNREFUSED; }
 +        pthread_cond_broadcast(&l->vnet.condition);
++    } else {
++        // The descriptor of this stream is already gone: the peer's close
++        // reaps the retired stream at both ends and needs no answer.
++        ldnr_retired_drop(l, message->proxy.connection_id);
 +    }
 +    pthread_mutex_unlock(&l->vnet.mutex);
-+}
-+
-+// A full close retires the whole stream at once: the relay reaps it on a
-+// reset, while a FIN alone would only close this side's sending direction
-+// and leave a half-open stream nothing can reach. Shutdown(SHUT_WR) stays
-+// the FIN-only half close.
-+static void ldnr_send_stream_reset(ldnr *l, uint64_t connection_id, uint32_t source_address) {
-+    ldnr_message *message = ldnr_message_new();
-+    if (!message) return;
-+    message->proxy.connection_id = connection_id;
-+    message->proxy.source_address = source_address;
-+    message->status = 1;    // flags bit0: reset, the stream is reaped at both ends
-+    message->reason = 0;    // ProxyClose: none (user close)
-+    ldnr_client_send(l, LDNR_MSG_PROXY_DISCONNECT, 0, message, NULL);
-+    ldnr_message_delete(message);
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
 +}
 +
 +int ldnr_close_socket(ldnr *l, int fd) {
 +    if (!l) return ldnr_fail(LDNR_EINVAL);
++    // The decision about the stream and the frame it sends stay under the
++    // stream send lock: they keep their order against the sends of the same
++    // stream.
++    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_socket_at(l, fd);
-+    if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
++    if (!s) {
++        pthread_mutex_unlock(&l->vnet.mutex);
++        pthread_mutex_unlock(&ldnr_stream_send_lock);
++        return ldnr_fail(LDNR_EBADF);
++    }
 +    // A descriptor that waits in a listener's queue is taken out of it: a
 +    // dead descriptor must not be handed to a later accept().
 +    for (unsigned i = 0; i < LDNR_MAX_SOCKETS; i++) {
@@ -5900,45 +6247,75 @@ index 0000000..1f4cf18
 +    }
 +    uint64_t connection_id = s->connection_id;
 +    uint32_t source_address = l->vnet.local_address;
-+    int notify = s->type == 1 && connection_id && !s->listening;
++    int fin = 0, rst = 0;
++    if (s->type == 1 && connection_id && !s->listening) {
++        if (s->connected) {
++            if (s->remote_error || s->stream_failed) {
++                // The stream is broken or was reset by the peer: the close
++                // is abortive and retires it at both ends.
++                rst = 1;
++            } else {
++                // The orderly close of this direction is a FIN; one that
++                // already went out with a shutdown is not repeated.
++                fin = !s->shut_write;
++                if (!s->remote_eof && !ldnr_stream_retire(l, connection_id, source_address)) {
++                    // The peer's direction stays open and there is no room
++                    // to watch it: the stream is aborted instead of being
++                    // left half-open on the relay.
++                    fin = 0;
++                    rst = 1;
++                }
++            }
++        } else if (!s->connect_error) {
++            // A stream that is still opening is aborted; a refused open
++            // left nothing on the relay to close.
++            rst = 1;
++        }
++    }
 +    ldnr_socket_clear(s);
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    pthread_mutex_unlock(&l->vnet.mutex);
-+    if (notify) ldnr_send_stream_reset(l, connection_id, source_address);
++    if (fin) ldnr_send_stream_fin(l, connection_id, source_address);
++    else if (rst) ldnr_send_stream_reset(l, connection_id, source_address);
 +    for (int i = 0; i < child_count; i++) ldnr_send_stream_reset(l, children[i], source_address);
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
 +    return 0;
 +}
 +
 +int ldnr_shutdown(ldnr *l, int fd, int how) {
 +    if (!l || how < 0 || how > 2) return ldnr_fail(LDNR_EINVAL);
++    // The flag flip and the FIN go out under the stream send lock: a DATA
++    // chunk of the same stream can never overtake the FIN on the wire.
++    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_socket_at(l, fd);
-+    if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
++    if (!s) {
++        pthread_mutex_unlock(&l->vnet.mutex);
++        pthread_mutex_unlock(&ldnr_stream_send_lock);
++        return ldnr_fail(LDNR_EBADF);
++    }
 +    if (how == 0 || how == 2) s->shut_read = 1;
++    // The FIN belongs to the transition into the write shutdown: a second
++    // shutdown must not put another one on the wire, and a dead stream has
++    // no direction left to close.
++    int fin = (how == 1 || how == 2) && !s->shut_write &&
++        s->type == 1 && s->connected && s->connection_id && !s->remote_error;
++    uint64_t connection_id = s->connection_id;
++    uint32_t source_address = l->vnet.local_address;
 +    if (how == 1 || how == 2) s->shut_write = 1;
 +    if (s->shut_read) ldnr_free_packets(s->head);
 +    if (s->shut_read) { s->head = s->tail = NULL; s->queued = 0; s->queued_bytes = 0; }
-+    // The disconnect is built while the socket is locked: the slot can be
-+    // closed and reused by another thread as soon as the lock is released.
-+    ldnr_vsock snapshot;
-+    memset(&snapshot, 0, sizeof snapshot);
-+    uint32_t source_address = l->vnet.local_address;
-+    int notify = 0;
-+    if ((how == 1 || how == 2) && s->connection_id) {
-+        snapshot = *s;
-+        notify = 1;
-+    }
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    pthread_mutex_unlock(&l->vnet.mutex);
-+    if (notify) {
-+        ldnr_message *message = ldnr_vnet_prepare_proxy(l, LDNR_MSG_PROXY_DISCONNECT,
-+                                                        &snapshot, source_address, NULL, 0);
-+        ldnr_vnet_transmit(l, LDNR_MSG_PROXY_DISCONNECT, message);
-+    }
++    if (fin) ldnr_send_stream_fin(l, connection_id, source_address);
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
 +    return 0;
 +}
 +
 +void ldnr_vnet_network_down(ldnr *l) {
++    // The stream send lock keeps the teardown ordered against a send that
++    // is in flight: no frame of the lost membership goes out after it.
++    pthread_mutex_lock(&ldnr_stream_send_lock);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    l->vnet.local_address = 0;
 +    // The relay is gone: no descriptor may wait for a connection, a
@@ -5952,9 +6329,21 @@ index 0000000..1f4cf18
 +        // has no peer that could report the loss.
 +        s->remote_error = LDNR_ENETDOWN;
 +        s->remote_eof = 1;
++        // The identities of the lost membership die with it: the next
++        // membership numbers its streams from one again, and an old
++        // descriptor must neither take the frames of the new streams nor
++        // send closes for them. The queued children of a listener are
++        // dropped the same way: they belonged to it too.
++        s->connection_id = 0;
++        s->connected = 0;
++        s->accept_count = 0;
 +    }
++    // The retired streams belonged to the membership that is gone: their
++    // records are dropped so no reset escapes into a later one.
++    ldnr_retired_purge(l);
 +    pthread_cond_broadcast(&l->vnet.condition);
 +    pthread_mutex_unlock(&l->vnet.mutex);
++    pthread_mutex_unlock(&ldnr_stream_send_lock);
 +}
 +
 +int ldnr_fcntl(ldnr *l, int fd, int command, long argument) {
@@ -6048,6 +6437,7 @@ index 0000000..1f4cf18
 +
 +int ldnr_poll(ldnr *l, ldnr_pollfd *fds, size_t count, int timeout_ms) {
 +    if (!l || (count && !fds)) return ldnr_fail(LDNR_EINVAL);
++    ldnr_retired_sweep(l);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    int64_t deadline = timeout_ms < 0 ? -1 : ldnr_monotonic_ms() + timeout_ms;
 +    // An infinite wait with no descriptors would never be wakeable. Match the
@@ -6135,19 +6525,26 @@ index 0000000..1f4cf18
 +        for (size_t i = 0; i < count; i++) {
 +            int fd = fds[i].fd;
 +            uint64_t bit = 1ull << (fd & 63);
-+            int descriptor_ready = 0;
 +            if (fds[i].revents & LDNR_POLLNVAL) {
 +                // A selected descriptor that is not a virtual socket is an
 +                // error, the way select() reports a bad descriptor.
 +                free(fds);
 +                return ldnr_fail(LDNR_EBADF);
 +            }
-+            if (fds[i].revents & LDNR_POLLIN) { r[fd >> 6] |= bit; descriptor_ready = 1; }
-+            if (fds[i].revents & LDNR_POLLOUT) { w[fd >> 6] |= bit; descriptor_ready = 1; }
-+            if (fds[i].revents & (LDNR_POLLPRI | LDNR_POLLERR | LDNR_POLLHUP)) {
-+                e[fd >> 6] |= bit; descriptor_ready = 1;
++            // A terminal error or a hang-up is readiness in every set the
++            // descriptor was requested in, the way select() reports a
++            // socket that can answer a failed connect with its pending
++            // error. Exceptional readiness stays exceptional conditions.
++            int terminal = fds[i].revents & (LDNR_POLLERR | LDNR_POLLHUP);
++            if ((fds[i].revents & LDNR_POLLIN) ||
++                (terminal && (fds[i].events & LDNR_POLLIN))) {
++                r[fd >> 6] |= bit; ready++;
 +            }
-+            if (descriptor_ready) ready++;
++            if ((fds[i].revents & LDNR_POLLOUT) ||
++                (terminal && (fds[i].events & LDNR_POLLOUT))) {
++                w[fd >> 6] |= bit; ready++;
++            }
++            if (fds[i].revents & LDNR_POLLPRI) { e[fd >> 6] |= bit; ready++; }
 +        }
 +        if (readfds) memcpy(readfds, r, sizeof r);
 +        if (writefds) memcpy(writefds, w, sizeof w);
@@ -6159,10 +6556,10 @@ index 0000000..1f4cf18
 +}
 diff --git a/dm/host/ldnr/ldnr_vnet.h b/dm/host/ldnr/ldnr_vnet.h
 new file mode 100644
-index 0000000..2d47737
+index 0000000..896b555
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_vnet.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,20 @@
 +// The socket layer's internal entry points, shared with the vnet tests: the
 +// full internal state lives in ldnr_internal.h, which these declarations
 +// match.
@@ -6176,6 +6573,9 @@ index 0000000..2d47737
 +void ldnr_vnet_proxy_ack(ldnr *l, const ldnr_message *message);
 +void ldnr_vnet_proxy_data(ldnr *l, const ldnr_message *message);
 +void ldnr_vnet_proxy_disconnect(ldnr *l, const ldnr_message *message);
++// The bytes of a relayed stream are lost: the stream is failed terminally,
++// its waiters are woken, and the relay is told with a reset.
++void ldnr_vnet_stream_fail(ldnr *l, uint64_t connection_id);
 +// The relay is gone: every descriptor gets a terminal error and every wait
 +// ends.
 +void ldnr_vnet_network_down(ldnr *l);
@@ -6299,10 +6699,10 @@ index 0000000..6b13662
 +const struct dm_profile *dm_profile(void);
 diff --git a/dm/host/ldnr/tests/t_glue.c b/dm/host/ldnr/tests/t_glue.c
 new file mode 100644
-index 0000000..d6a98bb
+index 0000000..ea5f3a5
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_glue.c
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,572 @@
 +// Runtime test of the Apple glue. The host symbols the glue calls are
 +// stubbed here, so the test runs without the Apple SDK. It checks the
 +// result translation, the event binding identity, the hook selection in
@@ -6830,6 +7230,38 @@ index 0000000..d6a98bb
 +    CHECK(g_glue.core == NULL);
 +}
 +
++// A Connect whose security configuration the wire refuses must fail: the
++// frame never goes out, and the caller does not see a success.
++static void test_connect_with_an_unencodable_passphrase(void)
++{
++    uint8_t info[LDNR_NATIVE_NETWORK_INFO_SIZE];
++    uint8_t security[LDNR_NATIVE_SECURITY_CONFIG_SIZE];
++    uint8_t user[LDNR_NATIVE_USER_CONFIG_SIZE];
++    Result result;
++
++    setenv("DM_LDNR_SERVER", "127.0.0.1:1", 1);
++    CHECK(lr_ldn_initialize() == RES_OK);
++    CHECK(lr_ldn_open_station() == RES_OK);
++    memset(info, 0, sizeof(info));
++    memset(security, 0, sizeof(security));
++    memset(user, 0, sizeof(user));
++    // A passphrase of one byte: the native layout of the guest accepts it,
++    // the wire refuses it.
++    security[0x02] = 1;
++    // The error of the call must be its own: a stale one from an earlier
++    // call must not stand in for it.
++    ldnr_set_errno(0);
++    result = lr_ldn_connect(info, security, user, 0, 0);
++    // The call failed: it is not a success with a stale error.
++    CHECK(result != RES_OK);
++    CHECK(result == ldnr_res(96));
++    // The failure carries an error of its own.
++    CHECK(ldnr_last_errno() == LDNR_EINVAL);
++    // The request never reached the relay.
++    CHECK(glue_wire_count(0x15) == 0);
++    lr_ldn_finalize();
++}
++
 +int main(void)
 +{
 +    test_result_translation();
@@ -6837,6 +7269,7 @@ index 0000000..d6a98bb
 +    test_hook_selection();
 +    test_mangled_names();
 +    test_scan_alloc_failure();
++    test_connect_with_an_unencodable_passphrase();
 +    test_finalize_cancels_a_blocked_call();
 +    test_double_finalize();
 +    puts("PASS");
@@ -6844,10 +7277,10 @@ index 0000000..d6a98bb
 +}
 diff --git a/dm/host/ldnr/tests/t_ldnr_e2e.c b/dm/host/ldnr/tests/t_ldnr_e2e.c
 new file mode 100644
-index 0000000..1c8e277
+index 0000000..3cbdb05
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_ldnr_e2e.c
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,198 @@
 +// Real relay integration test. No server is bundled: set LDNR_SERVER_BIN.
 +#include "ldnr.h"
 +#include <arpa/inet.h>
@@ -7022,10 +7455,9 @@ index 0000000..1c8e277
 +    CHECK(ldnr_recv(station, connector, buffer, sizeof buffer, 0, 2000) == sizeof response);
 +    CHECK(!memcmp(buffer, response, sizeof response));
 +    CHECK(!ldnr_close_socket(station, connector));
-+    // A full close retires the stream at both ends: the peer reads the
-+    // reset instead of a clean end of file.
-+    CHECK(ldnr_recv(host, accepted, buffer, sizeof buffer, 0, 2000) == -1);
-+    CHECK(ldnr_last_errno() == LDN_ECONNRESET);
++    // The orderly close ends the sending direction: the peer reads the end
++    // of the stream, not an error.
++    CHECK(ldnr_recv(host, accepted, buffer, sizeof buffer, 0, 2000) == 0);
 +    CHECK(!ldnr_close_socket(host, accepted)); CHECK(!ldnr_close_socket(host, listener));
 +
 +    CHECK(!ldnr_disconnect(station));
@@ -8502,15 +8934,18 @@ index 0000000..862a9ac
 +}
 diff --git a/dm/host/ldnr/tests/t_state.c b/dm/host/ldnr/tests/t_state.c
 new file mode 100644
-index 0000000..dcca118
+index 0000000..5e1a2fd
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_state.c
-@@ -0,0 +1,883 @@
+@@ -0,0 +1,1215 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
 +#include "../ldnr_protocol.h"
 +#include "../ldnr_transport.h"
++// The private state of the core: the table of the opens that wait for their
++// answer is part of it.
++#include "../ldnr_internal.h"
 +
 +#include <errno.h>
 +#include <pthread.h>
@@ -8543,12 +8978,15 @@ index 0000000..dcca118
 +
 +enum {
 +    TEST_EINVAL = 22,
++    TEST_ENOBUFS = 55,
 +    TEST_EISCONN = 56,
 +    TEST_ENOTCONN = 57,
 +    TEST_ENETDOWN = 50,
++    TEST_ETIMEDOUT = 60,
 +    TEST_ECONNREFUSED = 61,
 +    // The classes of the relay are kept apart: the guest can tell a full
 +    // room from a missing one, and a wrong password from a lost relay.
++    TEST_EBADFRAME = 101,
 +    TEST_EROOMNOTFOUND = 104,
 +    TEST_EROOMFULL = 105,
 +    TEST_EBADPASSWORD = 106,
@@ -8574,6 +9012,19 @@ index 0000000..dcca118
 +    int proxy_refusal;            // 1: an error, 2: a refused reply
 +    uint32_t create_status;
 +    uint32_t connect_status;
++    uint32_t filter_status;       // the filter request fails
++    uint32_t policy_status;       // the policy request fails
++    uint32_t destroy_status;      // the removal of the room fails
++    uint16_t error_code;          // the code of the error replies
++    uint16_t filter_code;         // the code of a failed filter request
++    uint16_t destroy_code;        // the code of a failed removal request
++    int silent_create;            // the create request is never answered
++    int silent_proxy;             // the open of a stream is never answered
++    int close_count;              // the times the transport was closed
++    int filter_count;             // the filter requests the core sent
++    int policy_count;             // the policy requests the core sent
++    int destroy_count;            // the removal requests the core sent
++    uint8_t filters[16][6];       // the macs of the filter requests
 +    uint16_t connect_version;     // the version of the last connect request
 +} test_transport;
 +
@@ -8727,7 +9178,9 @@ index 0000000..dcca118
 +    test_writer writer;
 +    memset(&writer, 0, sizeof(writer));
 +    writer.size = 16;
-+    test_u16(&writer, code);
++    // The test may choose the class of the failure: the default is the one
++    // of the request that failed.
++    test_u16(&writer, transport->error_code ? transport->error_code : code);
 +    test_u16(&writer, 0);
 +    test_finish(&writer, 0x05, request_id);
 +    test_enqueue_locked(transport, writer.bytes, writer.size);
@@ -8786,7 +9239,28 @@ index 0000000..dcca118
 +        test_finish(&writer, 0x16, request_id);
 +        break;
 +    case 0x12:
++        if (transport->destroy_status) {
++            // The room is not removed: the relay still owns it.
++            test_error_reply_locked(transport, request_id,
++                                    transport->destroy_code ? transport->destroy_code : 5);
++            return;
++        }
 +        test_finish(&writer, 0x12, request_id);
++        break;
++    case 0x19:
++        if (transport->policy_status) {
++            test_error_reply_locked(transport, request_id, 5);
++            return;
++        }
++        test_finish(&writer, 0x19, request_id);
++        break;
++    case 0x1b:
++        if (transport->filter_status) {
++            test_error_reply_locked(transport, request_id,
++                                    transport->filter_code ? transport->filter_code : 5);
++            return;
++        }
++        test_finish(&writer, 0x1b, request_id);
 +        break;
 +    case 0x17:
 +        test_finish(&writer, 0x17, request_id);
@@ -8870,6 +9344,28 @@ index 0000000..dcca118
 +                 (uint32_t)bytes[14] << 16 | (uint32_t)bytes[15] << 24;
 +    transport->sent_count++;
 +    if (bytes[5] == 0x15) transport->connect_version = test_read_connect_version(bytes, size);
++    if (bytes[5] == 0x1b) {
++        // The filter request carries the mac of the station.
++        CHECK(size >= 22);
++        if (transport->filter_count <
++            (int)(sizeof transport->filters / sizeof transport->filters[0]))
++            memcpy(transport->filters[transport->filter_count], bytes + 16, 6);
++        transport->filter_count++;
++    }
++    if (bytes[5] == 0x19) transport->policy_count++;
++    if (bytes[5] == 0x12) transport->destroy_count++;
++    if (bytes[5] == 0x10 && transport->silent_create) {
++        // The relay does not answer the create: the client waits for its
++        // deadline and ends the membership with it.
++        pthread_mutex_unlock(&transport->mutex);
++        return 0;
++    }
++    if (bytes[5] == 0x31 && transport->silent_proxy) {
++        // The relay does not answer the open: the socket waits for its
++        // deadline and the open stays in the table of the core.
++        pthread_mutex_unlock(&transport->mutex);
++        return 0;
++    }
 +    if (bytes[5] == 0x31 && transport->proxy_refusal == 2) {
 +        // The relay refuses the open with a reply that names the connection
 +        // of the initiator: the accepted flag is zero.
@@ -8902,11 +9398,52 @@ index 0000000..dcca118
 +    return count;
 +}
 +
++// The requests of the room that the core sent.
++typedef struct {
++    int close_count, filter_count, policy_count, destroy_count;
++} test_counters;
++
++static test_counters test_get_counters(test_transport *transport)
++{
++    test_counters counters;
++    pthread_mutex_lock(&transport->mutex);
++    counters.close_count = transport->close_count;
++    counters.filter_count = transport->filter_count;
++    counters.policy_count = transport->policy_count;
++    counters.destroy_count = transport->destroy_count;
++    pthread_mutex_unlock(&transport->mutex);
++    return counters;
++}
++
++// The mac of a filter entry the core sent to the room.
++static int test_has_filter(test_transport *transport, const uint8_t mac[6])
++{
++    int found = 0;
++    pthread_mutex_lock(&transport->mutex);
++    for (int i = 0; i < transport->filter_count &&
++                    i < (int)(sizeof transport->filters / sizeof transport->filters[0]); i++) {
++        if (memcmp(transport->filters[i], mac, 6) == 0) { found = 1; break; }
++    }
++    pthread_mutex_unlock(&transport->mutex);
++    return found;
++}
++
++// The opens that wait for their answer.
++static int test_proxy_open_count(ldnr *l)
++{
++    int count = 0;
++    pthread_mutex_lock(&l->proxy_mutex);
++    for (unsigned i = 0; i < LDNR_MAX_PROXY_OPENS; i++) if (l->proxy_opens[i].used) count++;
++    pthread_mutex_unlock(&l->proxy_mutex);
++    return count;
++}
++
 +static void test_close(void *ctx)
 +{
 +    test_transport *transport = ctx;
 +    pthread_mutex_lock(&transport->mutex);
 +    transport->connected = 0;
++    transport->close_count++;
 +    transport->head = 0;
 +    transport->count = 0;
 +    pthread_cond_broadcast(&transport->condition);
@@ -9377,6 +9914,229 @@ index 0000000..dcca118
 +    free((void *)api);
 +}
 +
++// The relay that does not answer the create leaves the client without a
++// membership: the room is gone, the sockets that belong to it are down and
++// their waiters are woken, and the guest sees the reason of the loss.
++static void test_membership_timeout_retires_the_membership(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    ldnr_config config;
++    ldnr_network_config network;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    ldnr_network_info info;
++    ldnr_sockaddr source;
++    ldnr *context = NULL;
++    int socket;
++
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.server = "relay.test:11470";
++    config.connect_timeout_ms = 200;
++    memset(&network, 0, sizeof(network));
++    network.node_count_max = 4;
++    memset(&security, 0, sizeof(security));
++    memset(&user, 0, sizeof(user));
++
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_access_point(context) == 0);
++    // A listener of the room: it must not wait for a connection that can no
++    // longer arrive.
++    socket = ldnr_socket(context, 2, 1, 6);
++    CHECK(socket >= 0);
++    CHECK(ldnr_listen(context, socket, 4) == 0);
++
++    // The relay never answers the create: the membership ends with the
++    // deadline of the request.
++    transport->silent_create = 1;
++    CHECK(ldnr_create_network(context, &network, &security, &user, NULL, NULL, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++    // The membership is gone: the guest sees the open state and the reason.
++    CHECK(ldnr_get_state(context) == TEST_STATE_AP_OPEN);
++    CHECK(ldnr_get_disconnect_reason(context) == 6);   // SignalLost
++    CHECK(ldnr_get_network_info(context, &info) == -1);
++    CHECK(ldnr_last_errno() == TEST_ENOTCONN);
++    // The sockets of the lost membership are down: their waiters are woken.
++    CHECK(ldnr_accept(context, socket, &source, 5000) == -1);
++    CHECK(ldnr_last_errno() == TEST_ENETDOWN);
++    ldnr_destroy(context);
++    free((void *)api);
++}
++
++// The filter entries that the host staged belong to the configuration of the
++// room: a create that fails must not consume them, or the room that comes
++// later would admit a station the host wanted to refuse.
++static void test_staged_filters_survive_a_failed_create(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    ldnr_config config;
++    ldnr_network_config network;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    static const uint8_t mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
++    ldnr *context = NULL;
++
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.server = "relay.test:11470";
++    config.connect_timeout_ms = 200;
++    memset(&network, 0, sizeof(network));
++    network.node_count_max = 4;
++    memset(&security, 0, sizeof(security));
++    memset(&user, 0, sizeof(user));
++
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_access_point(context) == 0);
++    // The host refuses a station before the room exists.
++    CHECK(ldnr_add_accept_filter_entry(context, mac) == 0);
++
++    // The relay refuses the room: the create fails.
++    transport->create_status = 1;
++    CHECK(ldnr_create_network(context, &network, &security, &user, NULL, NULL, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_EROOMFULL);
++    CHECK(ldnr_get_state(context) == TEST_STATE_AP_OPEN);
++
++    // The filters are still staged: the next room gets them.
++    transport->create_status = 0;
++    CHECK(ldnr_create_network(context, &network, &security, &user, NULL, NULL, 0) == 0);
++    CHECK(test_has_filter(transport, mac));
++    ldnr_destroy(context);
++    free((void *)api);
++}
++
++// A room that was created but whose configuration failed is removed again.
++// When the relay does not confirm the removal, the connection is retired
++// before the local membership is cleared: a room that the relay kept would
++// refuse the next create. The error of the operation is the one the caller
++// sees: the rollback is not that operation.
++static void test_failed_rollback_retires_the_transport(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    ldnr_config config;
++    ldnr_network_config network;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    ldnr_network_info info;
++    ldnr *context = NULL;
++    test_counters counters;
++
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.server = "relay.test:11470";
++    config.connect_timeout_ms = 200;
++    memset(&network, 0, sizeof(network));
++    network.node_count_max = 4;
++    memset(&security, 0, sizeof(security));
++    memset(&user, 0, sizeof(user));
++
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_access_point(context) == 0);
++    // The room holds a filter entry, so that its configuration is sent after
++    // the create.
++    static const uint8_t mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x02};
++    CHECK(ldnr_add_accept_filter_entry(context, mac) == 0);
++    // The room is created, but the list of its filters is refused.
++    transport->filter_status = 1;
++    transport->filter_code = 5;       // the relay says that the room is full
++    // The relay does not remove the room either.
++    transport->destroy_status = 1;
++    transport->destroy_code = 1;       // a broken frame
++
++    CHECK(ldnr_create_network(context, &network, &security, &user, NULL, NULL, 0) == -1);
++    // The error of the operation is kept: the failure of the rollback does
++    // not replace it.
++    CHECK(ldnr_last_errno() == TEST_EROOMFULL);
++    counters = test_get_counters(transport);
++    // The removal was tried...
++    CHECK(counters.destroy_count == 1);
++    // ...and the connection was retired: the relay still owns the room.
++    CHECK(counters.close_count >= 1);
++    // The membership is gone.
++    CHECK(ldnr_get_state(context) == TEST_STATE_AP_OPEN);
++    CHECK(ldnr_get_network_info(context, &info) == -1);
++    CHECK(ldnr_last_errno() == TEST_ENOTCONN);
++    ldnr_destroy(context);
++    free((void *)api);
++}
++
++// The opens that wait for their answer are remembered, so that the answer of
++// the relay can reach the socket that waits for it. A socket that is closed
++// releases its entry, and an open that cannot be remembered fails at once
++// instead of going out with no way to answer it.
++static void test_proxy_opens_are_released(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    ldnr_config config;
++    ldnr_network_config network;
++    ldnr_security_config security;
++    ldnr_user_config user;
++    ldnr_sockaddr destination;
++    ldnr_message message;
++    ldnr *context = NULL;
++    int socket, before, after;
++
++    // The relay never answers the opens: they wait for their deadline.
++    transport->silent_proxy = 1;
++    memset(&config, 0, sizeof(config));
++    config.transport = api;
++    config.server = "relay.test:11470";
++    config.connect_timeout_ms = 200;
++    memset(&network, 0, sizeof(network));
++    network.node_count_max = 4;
++    memset(&security, 0, sizeof(security));
++    memset(&user, 0, sizeof(user));
++
++    CHECK(ldnr_create(&config, &context) == 0);
++    CHECK(ldnr_initialize(context) == 0);
++    CHECK(ldnr_open_access_point(context) == 0);
++    CHECK(ldnr_create_network(context, &network, &security, &user, NULL, NULL, 0) == 0);
++
++    // An open that waits for its answer is remembered.
++    socket = ldnr_socket(context, 2, 1, 6);
++    CHECK(socket >= 0);
++    memset(&destination, 0, sizeof(destination));
++    destination.address = ldnr_ipv4(192, 168, 44, 10);
++    destination.port = ldnr_htons(40002);
++    CHECK(ldnr_connect_socket(context, socket, &destination, 50) == -1);
++    CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++    CHECK(test_proxy_open_count(context) == 1);
++
++    // The socket is closed: the open is over and its entry is released.
++    CHECK(ldnr_close_socket(context, socket) == 0);
++    CHECK(test_proxy_open_count(context) == 0);
++
++    // The table of the opens is full: an open that cannot be remembered
++    // fails with an error of its own, and nothing goes out.
++    memset(&message, 0, sizeof(message));
++    message.type = LDNR_MSG_PROXY_CONNECT;
++    message.proxy.source_address = ldnr_ipv4(192, 168, 44, 10);
++    message.proxy.source_port = ldnr_htons(1234);
++    message.proxy.destination_address = ldnr_ipv4(192, 168, 44, 20);
++    message.proxy.destination_port = ldnr_htons(40002);
++    before = test_sent_count(transport);
++    for (int i = 0; i < LDNR_MAX_PROXY_OPENS; i++) {
++        message.proxy.connection_id = (uint64_t)(1000 + i);
++        CHECK(ldnr_client_send(context, LDNR_MSG_PROXY_CONNECT, 0, &message, NULL) == 0);
++    }
++    after = test_sent_count(transport);
++    CHECK(test_proxy_open_count(context) == LDNR_MAX_PROXY_OPENS);
++    CHECK(after == before + LDNR_MAX_PROXY_OPENS);
++    message.proxy.connection_id = 9999;
++    CHECK(ldnr_client_send(context, LDNR_MSG_PROXY_CONNECT, 0, &message, NULL) == -1);
++    CHECK(ldnr_last_errno() == TEST_ENOBUFS);
++    // The open that could not be remembered did not go out.
++    CHECK(test_sent_count(transport) == after);
++    ldnr_destroy(context);
++    free((void *)api);
++}
++
 +int main(void)
 +{
 +    test_create_arguments();
@@ -9386,15 +10146,19 @@ index 0000000..dcca118
 +    test_room_password_is_refused_locally();
 +    test_proxy_open_refusal_fails_the_socket(1);
 +    test_proxy_open_refusal_fails_the_socket(2);
++    test_membership_timeout_retires_the_membership();
++    test_staged_filters_survive_a_failed_create();
++    test_failed_rollback_retires_the_transport();
++    test_proxy_opens_are_released();
 +    puts("PASS");
 +    return 0;
 +}
 diff --git a/dm/host/ldnr/tests/t_tcp.c b/dm/host/ldnr/tests/t_tcp.c
 new file mode 100644
-index 0000000..ece259e
+index 0000000..583b703
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_tcp.c
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,442 @@
 +// Regression tests for the TCP transport: a writer pinned to one connection
 +// must not continue on the connection that replaced it, and a write that
 +// fails part way must leave the framing stream unusable.
@@ -9402,8 +10166,12 @@ index 0000000..ece259e
 +
 +#include "../ldnr_transport.h"
 +
++#include <arpa/inet.h>
 +#include <errno.h>
++#include <fcntl.h>
++#include <netinet/in.h>
 +#include <pthread.h>
++#include <stdatomic.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -9604,6 +10372,50 @@ index 0000000..ece259e
 +    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 +}
 +
++// A local listener whose accept queue is full: further SYNs are dropped, so
++// a connect to it stays pending. Unroutable test addresses are not used for
++// this because VPN/TUN proxies on developer machines accept any address.
++static int test_full_listener(uint16_t *port, int fillers[8])
++{
++    struct sockaddr_in address;
++    socklen_t size = sizeof(address);
++    int listener = socket(AF_INET, SOCK_STREAM, 0);
++    CHECK(listener >= 0);
++    memset(&address, 0, sizeof(address));
++    address.sin_family = AF_INET;
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    CHECK(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
++    CHECK(listen(listener, 0) == 0);
++    CHECK(getsockname(listener, (struct sockaddr *)&address, &size) == 0);
++    *port = ntohs(address.sin_port);
++    for (int i = 0; i < 8; i++) {
++        fillers[i] = socket(AF_INET, SOCK_STREAM, 0);
++        CHECK(fillers[i] >= 0);
++        CHECK(fcntl(fillers[i], F_SETFL, fcntl(fillers[i], F_GETFL) | O_NONBLOCK) == 0);
++        (void)connect(fillers[i], (struct sockaddr *)&address, sizeof(address));
++    }
++    nanosleep(&(struct timespec){0, 200000000}, NULL);
++    return listener;
++}
++
++// A listener that accepts a connection: the tests use it to check that a
++// socket is alive.
++static int test_listener(uint16_t *port)
++{
++    struct sockaddr_in address;
++    socklen_t size = sizeof(address);
++    int listener = socket(AF_INET, SOCK_STREAM, 0);
++    CHECK(listener >= 0);
++    memset(&address, 0, sizeof(address));
++    address.sin_family = AF_INET;
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    CHECK(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
++    CHECK(listen(listener, 4) == 0);
++    CHECK(getsockname(listener, (struct sockaddr *)&address, &size) == 0);
++    *port = ntohs(address.sin_port);
++    return listener;
++}
++
 +static void test_connect_is_bounded_and_cancellable(void)
 +{
 +    const ldnr_transport *transport = ldnr_tcp_transport_create();
@@ -9618,21 +10430,36 @@ index 0000000..ece259e
 +    // The built-in transport is a plaintext stream: the core has to know it.
 +    CHECK(caps->plaintext == 1);
 +
++    uint16_t port;
++    int fillers[8];
++    int listener = test_full_listener(&port, fillers);
++    char pending[32];
++    snprintf(pending, sizeof(pending), "127.0.0.1:%u", port);
++
 +    // A connect that is cancelled before it starts fails at once.
 +    start = test_now_ms();
-+    CHECK(caps->connect_ex(transport->ctx, "192.0.2.1:11470", error, sizeof(error),
++    CHECK(caps->connect_ex(transport->ctx, pending, error, sizeof(error),
 +                            5000, test_cancelled, NULL) == -1);
 +    elapsed = test_now_ms() - start;
 +    CHECK(elapsed < 2000);
 +
-+    // A connect that nothing answers ends at the deadline.
-+    error[0] = 0;
-+    start = test_now_ms();
-+    CHECK(caps->connect_ex(transport->ctx, "192.0.2.1:11470", error, sizeof(error),
-+                            300, NULL, NULL) == -1);
-+    elapsed = test_now_ms() - start;
-+    CHECK(elapsed < 3000);
-+    CHECK(error[0] != 0);
++    // A connect that nothing answers ends at the deadline. Some hosts
++    // complete it anyway (macOS does not drop SYNs for a full accept queue;
++    // a TUN-mode VPN/proxy answers any address): the case is skipped there
++    // rather than reported as a failure, it is covered where SYNs are dropped.
++    const char *targets[] = {pending, "192.0.2.1:11470"};
++    int bounded = 0;
++    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]) && !bounded; i++) {
++        error[0] = 0;
++        start = test_now_ms();
++        int result = caps->connect_ex(transport->ctx, targets[i], error, sizeof(error),
++                                      300, NULL, NULL);
++        elapsed = test_now_ms() - start;
++        CHECK(elapsed < 3000);
++        if (result == -1) { CHECK(error[0] != 0); bounded = 1; }
++        else transport->close(transport->ctx);
++    }
++    if (!bounded) puts("SKIP: connect deadline (this host completes unanswered connects)");
 +
 +    // A relay that is not there fails at once.
 +    error[0] = 0;
@@ -9640,6 +10467,125 @@ index 0000000..ece259e
 +                            1000, NULL, NULL) == -1);
 +    CHECK(error[0] != 0);
 +
++    for (int i = 0; i < 8; i++) close(fillers[i]);
++    close(listener);
++    transport->destroy(transport->ctx);
++    free((void *)transport);
++}
++
++// A connect that is in progress, with a cancellation the test controls.
++typedef struct {
++    const ldnr_transport *transport;
++    const char *target;
++    char error[160];
++    int result;
++    _Atomic int cancel;
++    _Atomic int finished;
++} test_connect;
++
++static int test_connect_cancel(void *ctx)
++{
++    test_connect *job = ctx;
++    return atomic_load(&job->cancel);
++}
++
++static void *test_connect_thread(void *argument)
++{
++    test_connect *job = argument;
++    const ldnr_transport_caps *caps = ldnr_transport_caps_of(job->transport);
++    job->result = caps->connect_ex(job->transport->ctx, job->target, job->error,
++                                    sizeof job->error, 30000, test_connect_cancel, job);
++    atomic_store(&job->finished, 1);
++    return NULL;
++}
++
++// A close during a connect does not reach a descriptor of somebody else: the
++// descriptor of the connect belongs to the transport while it is published,
++// and only its owner closes it. The round is repeated, because the hazard is
++// a race: the descriptor of the kernel may be handed out again right after
++// the close.
++static void test_close_during_a_connect_keeps_the_descriptor(void)
++{
++    const ldnr_transport *transport = ldnr_tcp_transport_create();
++    uint16_t port;
++    int fillers[8];
++    int listener;
++    char target[32];
++
++    CHECK(transport != NULL);
++    listener = test_full_listener(&port, fillers);
++    snprintf(target, sizeof(target), "127.0.0.1:%u", port);
++
++    for (int round = 0; round < 8; round++) {
++        pthread_t thread;
++        test_connect job;
++        int fd = -1;
++
++        memset(&job, 0, sizeof job);
++        job.transport = transport;
++        job.target = target;
++        CHECK(pthread_create(&thread, NULL, test_connect_thread, &job) == 0);
++
++        // The descriptor of the connect is published: the transport owns it.
++        for (int i = 0; i < 400 && fd < 0; i++) {
++            fd = ldnr_tcp_test_connecting_fd(transport);
++            if (fd < 0) nanosleep(&(struct timespec){0, 5000000}, NULL);
++        }
++        if (fd < 0) {
++            // The host answered the connect even though the queue was full:
++            // the case does not exist here.
++            CHECK(atomic_load(&job.finished));
++            CHECK(pthread_join(thread, NULL) == 0);
++            transport->destroy(transport->ctx);
++            free((void *)transport);
++            for (int i = 0; i < 8; i++) close(fillers[i]);
++            close(listener);
++            puts("SKIP: close during a connect (this host answers the connect)");
++            return;
++        }
++        // The published descriptor is a live one.
++        CHECK(fcntl(fd, F_GETFD) != -1);
++
++        // The close takes the pending connect away and only shuts its
++        // descriptor down: the worker that owns the connect closes it.
++        transport->close(transport->ctx);
++        CHECK(ldnr_tcp_test_connecting_fd(transport) == -1);
++
++        // The connect ends at once.
++        atomic_store(&job.cancel, 1);
++        CHECK(pthread_join(thread, NULL) == 0);
++        CHECK(job.result == -1);
++        CHECK(job.error[0] != 0);
++
++        // The descriptor is closed exactly once, by its owner: it is not
++        // left behind and it is not closed twice.
++        CHECK(fcntl(fd, F_GETFD) == -1);
++        CHECK(errno == EBADF);
++
++        // A descriptor that the kernel hands out now belongs to somebody
++        // else: the transport must not have shut it down.
++        int fresh = socket(AF_INET, SOCK_STREAM, 0);
++        CHECK(fresh >= 0);
++        if (fresh == fd) {
++            uint16_t other_port;
++            int other = test_listener(&other_port);
++            struct sockaddr_in address;
++            memset(&address, 0, sizeof(address));
++            address.sin_family = AF_INET;
++            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++            address.sin_port = htons(other_port);
++            CHECK(connect(fresh, (struct sockaddr *)&address, sizeof(address)) == 0);
++            int flags = 0;
++#ifdef MSG_NOSIGNAL
++            flags |= MSG_NOSIGNAL;
++#endif
++            CHECK(send(fresh, "x", 1, flags) == 1);
++            close(other);
++        }
++        close(fresh);
++    }
++    for (int i = 0; i < 8; i++) close(fillers[i]);
++    close(listener);
 +    transport->destroy(transport->ctx);
 +    free((void *)transport);
 +}
@@ -9651,15 +10597,16 @@ index 0000000..ece259e
 +    test_partial_write_breaks_the_stream();
 +    test_oversized_frame_ends_the_connection();
 +    test_connect_is_bounded_and_cancellable();
++    test_close_during_a_connect_keeps_the_descriptor();
 +    puts("PASS");
 +    return 0;
 +}
 diff --git a/dm/host/ldnr/tests/t_vnet.c b/dm/host/ldnr/tests/t_vnet.c
 new file mode 100644
-index 0000000..e280670
+index 0000000..926fdc1
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_vnet.c
-@@ -0,0 +1,1917 @@
+@@ -0,0 +1,2565 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
@@ -9729,6 +10676,11 @@ index 0000000..e280670
 +    ldnr_message last;
 +    int block_data;             // a PROXY_DATA send waits here
 +    int data_blocked;           // a send is waiting for the test
++    int block_reply;            // a PROXY_CONNECT_ACK send waits here
++    int reply_blocked;          // that send is waiting for the test
++    int delay_data;             // park the Nth PROXY_DATA before it is recorded
++    int data_delayed;           // that send is parked
++    int release_data;           // let the parked send through
 +} test_transport;
 +
 +typedef struct {
@@ -9741,6 +10693,15 @@ index 0000000..e280670
 +    struct timespec now;
 +    CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
 +    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
++}
++
++// A pause that lets a blocked thread reach the point the test checks.
++static void test_sleep_ms(int ms)
++{
++    struct timespec duration;
++    duration.tv_sec = ms / 1000;
++    duration.tv_nsec = (long)(ms % 1000) * 1000000;
++    nanosleep(&duration, NULL);
 +}
 +
 +static ldnr_network_info test_network_info(void)
@@ -10090,6 +11051,17 @@ index 0000000..e280670
 +    }
 +    test_parse_request(frame, size, &request);
 +    CHECK(request.type >= 0 && request.type <= LDNR_MSG_ERROR);
++    if (request.type == LDNR_MSG_PROXY_DATA && transport->delay_data &&
++        --transport->delay_data == 0) {
++        // The frame is parked before it is recorded: a close or a shutdown
++        // that runs now must still go out after it on the wire.
++        transport->data_delayed = 1;
++        pthread_cond_broadcast(&transport->condition);
++        while (!transport->release_data)
++            pthread_cond_wait(&transport->condition, &transport->mutex);
++        transport->data_delayed = 0;
++        transport->release_data = 0;
++    }
 +    transport->sent_count[request.type]++;
 +    // The payload of the previous frame belongs to the transport.
 +    free(transport->last.proxy.data);
@@ -10102,6 +11074,14 @@ index 0000000..e280670
 +        transport->data_blocked = 1;
 +        pthread_cond_broadcast(&transport->condition);
 +        while (transport->block_data)
++            pthread_cond_wait(&transport->condition, &transport->mutex);
++    }
++    if (request.type == LDNR_MSG_PROXY_CONNECT_ACK && transport->block_reply) {
++        // The acceptance of a stream is in flight: an accept() must not
++        // hand out its socket until this reply reached the relay.
++        transport->reply_blocked = 1;
++        pthread_cond_broadcast(&transport->condition);
++        while (transport->block_reply)
 +            pthread_cond_wait(&transport->condition, &transport->mutex);
 +    }
 +    test_reply_locked(transport, &request);
@@ -10207,6 +11187,16 @@ index 0000000..e280670
 +    pthread_mutex_lock(&transport->mutex);
 +    CHECK(transport->connected);
 +    test_enqueue_locked(transport, writer.bytes, writer.size);
++    pthread_mutex_unlock(&transport->mutex);
++}
++
++// A frame built by hand, for the cases a well-formed message cannot reach.
++static void test_push_frame(test_transport *transport, const uint8_t *bytes,
++                            size_t size)
++{
++    pthread_mutex_lock(&transport->mutex);
++    CHECK(transport->connected);
++    test_enqueue_locked(transport, bytes, size);
 +    pthread_mutex_unlock(&transport->mutex);
 +}
 +
@@ -10592,13 +11582,12 @@ index 0000000..e280670
 +    // A plain FIN closes the sending side of the peer only: the stream can
 +    // still be written to.
 +    CHECK(ldnr_send(context, client, "x", 1, 0) == 1);
-+    // Closing the descriptor retires the stream with a reset: a FIN alone
-+    // would only close this side's sending direction and would leave a
-+    // half-open stream on the relay.
++    // Closing the descriptor is the orderly close of this direction: a FIN
++    // ends it, and the peer's own close reaps the stream.
 +    CHECK(ldnr_close_socket(context, client) == 0);
 +    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
 +    CHECK(sent.proxy.connection_id == connection_id);
-+    CHECK(sent.status == 1);   // a full close is a reset, not another FIN
++    CHECK(sent.status == 0);   // a full close is a FIN, not a reset
 +
 +    // A reset is an error, not an orderly end of file.
 +    client = ldnr_socket(context, 2, 1, 6);
@@ -10682,7 +11671,7 @@ index 0000000..e280670
 +    CHECK(ldnr_close_socket(context, accepted) == 0);
 +    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
 +    CHECK(sent.proxy.connection_id == incoming.proxy.connection_id);
-+    CHECK(sent.status == 1);
++    CHECK(sent.status == 0);   // the peer closed already: our FIN completes it
 +    CHECK(ldnr_close_socket(context, listener) == 0);
 +
 +    transport->proxy_ack_status = TEST_ECONNREFUSED;
@@ -10888,6 +11877,19 @@ index 0000000..e280670
 +    return NULL;
 +}
 +
++typedef struct {
++    ldnr *context;
++    int fd;
++    int result;
++} test_closer;
++
++static void *test_close_thread(void *argument)
++{
++    test_closer *closer = argument;
++    closer->result = ldnr_close_socket(closer->context, closer->fd);
++    return NULL;
++}
++
 +static void test_wait_for_blocked_data(test_transport *transport)
 +{
 +    struct timespec deadline;
@@ -10899,6 +11901,28 @@ index 0000000..e280670
 +                                            &deadline);
 +        CHECK(result != ETIMEDOUT);
 +    }
++    pthread_mutex_unlock(&transport->mutex);
++}
++
++static void test_wait_for_flag(test_transport *transport, int *flag)
++{
++    struct timespec deadline;
++    CHECK(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
++    deadline.tv_sec += 2;
++    pthread_mutex_lock(&transport->mutex);
++    while (!*flag) {
++        int result = pthread_cond_timedwait(&transport->condition, &transport->mutex,
++                                            &deadline);
++        CHECK(result != ETIMEDOUT);
++    }
++    pthread_mutex_unlock(&transport->mutex);
++}
++
++static void test_set_flag(test_transport *transport, int *flag, int value)
++{
++    pthread_mutex_lock(&transport->mutex);
++    *flag = value;
++    pthread_cond_broadcast(&transport->condition);
 +    pthread_mutex_unlock(&transport->mutex);
 +}
 +
@@ -10937,20 +11961,34 @@ index 0000000..e280670
 +    sender.result = 0;
 +    CHECK(pthread_create(&thread, NULL, test_send_thread, &sender) == 0);
 +    test_wait_for_blocked_data(transport);
-+    // The socket is closed and its slot taken by another socket while the
-+    // send is in flight.
-+    CHECK(ldnr_close_socket(context, client) == 0);
-+    replacement = ldnr_socket(context, 2, 1, 6);
-+    CHECK(replacement == client);
++    // The close waits for the chunk that is in flight: it cannot retire the
++    // stream underneath it, so it is parked on its own thread.
++    test_closer closer;
++    pthread_t close_thread;
++    unsigned disconnects;
++    closer.context = context;
++    closer.fd = client;
++    closer.result = -1;
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++    CHECK(pthread_create(&close_thread, NULL, test_close_thread, &closer) == 0);
++    test_sleep_ms(60);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects);
 +    pthread_mutex_lock(&transport->mutex);
 +    transport->block_data = 0;
 +    pthread_cond_broadcast(&transport->condition);
 +    pthread_mutex_unlock(&transport->mutex);
++    CHECK(pthread_join(close_thread, NULL) == 0);
++    CHECK(closer.result == 0);
++    // The slot came back and a new socket took it while the send was still
++    // in flight.
++    replacement = ldnr_socket(context, 2, 1, 6);
++    CHECK(replacement == client);
 +    CHECK(pthread_join(thread, NULL) == 0);
-+    // Only the first chunk went out: the tail did not follow the descriptor
-+    // to the socket that took its slot.
-+    CHECK(sender.result == 16384);
-+    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DATA) == data_frames + 1);
++    // The tail did not follow the descriptor to the socket that took its
++    // slot: only the chunks that raced ahead of the close went out.
++    CHECK(sender.result == 16384 || sender.result == 16385);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DATA) ==
++          data_frames + (sender.result == 16385 ? 2 : 1));
 +    CHECK(ldnr_close_socket(context, replacement) == 0);
 +    test_destroy_context(context, api);
 +}
@@ -11371,9 +12409,94 @@ index 0000000..e280670
 +    test_destroy_context(context, api);
 +}
 +
-+// A send that is in flight ends when its stream does: a shutdown or a peer
-+// reset between two chunks stops the rest of the buffer instead of sending
-+// it after the FIN or letting it die silently after the RST.
++typedef struct {
++    ldnr *context;
++    int fd;
++    int how;
++    int result;
++} test_shutter;
++
++static void *test_shut_thread(void *argument)
++{
++    test_shutter *shutter = argument;
++    shutter->result = ldnr_shutdown(shutter->context, shutter->fd, shutter->how);
++    return NULL;
++}
++
++// A frame that was prepared but is still in flight owns the wire: a close
++// or a shutdown that runs while it is parked must queue behind it. DATA
++// may never go out after its own FIN or RST.
++static void test_data_never_follows_the_fin(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    ldnr_message sent;
++    test_sender sender;
++    test_shutter shutter;
++    pthread_t send_thread;
++    pthread_t shut_thread;
++    static uint8_t payload[16385];
++    unsigned data_frames;
++    unsigned disconnects;
++    int client;
++
++    memset(payload, 0x5a, sizeof(payload));
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
++
++    // The second chunk is parked before it reaches the wire: the shutdown
++    // that runs in parallel must not pass it.
++    data_frames = test_sent_count(transport, LDNR_MSG_PROXY_DATA);
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++    test_set_flag(transport, &transport->delay_data, 2);
++    sender.context = context;
++    sender.fd = client;
++    sender.data = payload;
++    sender.size = sizeof(payload);
++    sender.result = 0;
++    CHECK(pthread_create(&send_thread, NULL, test_send_thread, &sender) == 0);
++    test_wait_for_flag(transport, &transport->data_delayed);
++
++    shutter.context = context;
++    shutter.fd = client;
++    shutter.how = 1;   // SHUT_WR
++    shutter.result = -1;
++    CHECK(pthread_create(&shut_thread, NULL, test_shut_thread, &shutter) == 0);
++    test_sleep_ms(60);
++    // The FIN could not pass the chunk that is still in flight.
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DATA) == data_frames + 1);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects);
++    test_set_flag(transport, &transport->release_data, 1);
++    CHECK(pthread_join(send_thread, NULL) == 0);
++    CHECK(pthread_join(shut_thread, NULL) == 0);
++    CHECK(shutter.result == 0);
++    CHECK(sender.result == (ssize_t)sizeof(payload));
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DATA) == data_frames + 2);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_DISCONNECT, disconnects + 1);
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.status == 0);   // the FIN follows the data, never precedes it
++
++    // The close that follows sends nothing new: the FIN already went out
++    // and the peer's own close will reap the stream.
++    CHECK(ldnr_close_socket(context, client) == 0);
++    test_sleep_ms(30);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects + 1);
++    test_destroy_context(context, api);
++}
++
++// A send that is in flight ends when its stream does: whichever terminal
++// frame is applied first decides how much of the buffer goes out, but the
++// wire never sees a DATA frame after the FIN or behind the reset the peer
++// already sent.
 +static void test_send_stops_at_shutdown_and_reset(void)
 +{
 +    test_transport *transport;
@@ -11387,7 +12510,9 @@ index 0000000..e280670
 +    pthread_t thread;
 +    static uint8_t payload[16385];
 +    unsigned data_frames;
++    unsigned disconnects;
 +    uint64_t connection_id;
++    ssize_t expected;
 +    int client;
 +    int64_t deadline;
 +
@@ -11396,13 +12521,15 @@ index 0000000..e280670
 +    atomic_init(&waits.exited, 0);
 +    context = test_connected_context(api, &waits);
 +
-+    // Shutdown in mid-flight: the second chunk must not go out after the FIN.
++    // Shutdown in mid-flight: the second chunk goes out first or not at
++    // all, and the FIN is the last frame either way.
 +    client = ldnr_socket(context, 2, 1, 6);
 +    CHECK(client >= 0);
 +    peer.address = ldnr_ipv4(192, 168, 44, 20);
 +    peer.port = ldnr_htons(TEST_TCP_PORT);
 +    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
 +    data_frames = test_sent_count(transport, LDNR_MSG_PROXY_DATA);
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
 +    pthread_mutex_lock(&transport->mutex);
 +    transport->block_data = 1;
 +    transport->data_blocked = 0;
@@ -11414,21 +12541,50 @@ index 0000000..e280670
 +    sender.result = 0;
 +    CHECK(pthread_create(&thread, NULL, test_send_thread, &sender) == 0);
 +    test_wait_for_blocked_data(transport);
-+    CHECK(ldnr_shutdown(context, client, 1) == 0);   // SHUT_WR: the FIN half close
-+    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
-+    CHECK(sent.status == 0);   // a shutdown writes only the FIN
++    // The first chunk is in flight: the shutdown waits behind it and then
++    // races the second chunk for the wire.
++    pthread_t shut;
++    test_shutter shutter;
++    shutter.context = context;
++    shutter.fd = client;
++    shutter.how = 1;
++    shutter.result = -1;
++    CHECK(pthread_create(&shut, NULL, test_shut_thread, &shutter) == 0);
++    test_sleep_ms(60);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects);
 +    pthread_mutex_lock(&transport->mutex);
 +    transport->block_data = 0;
 +    pthread_cond_broadcast(&transport->condition);
 +    pthread_mutex_unlock(&transport->mutex);
++    // Whichever frame is applied first wins: the second DATA chunk out
++    // first means a full send, the FIN first means a partial one.
++    deadline = test_now_ms() + 2000;
++    for (;;) {
++        if (test_sent_count(transport, LDNR_MSG_PROXY_DATA) == data_frames + 2) {
++            expected = 16385;
++            break;
++        }
++        if (test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects + 1) {
++            expected = 16384;
++            break;
++        }
++        CHECK(test_now_ms() < deadline);
++        sched_yield();
++    }
 +    CHECK(pthread_join(thread, NULL) == 0);
-+    CHECK(sender.result == 16384);
-+    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DATA) == data_frames + 1);
-+    CHECK(ldnr_close_socket(context, client) == 0);
++    CHECK(pthread_join(shut, NULL) == 0);
++    CHECK(shutter.result == 0);
++    CHECK(sender.result == expected);
 +    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
-+    CHECK(sent.status == 1);   // the close afterwards is the full reset
++    CHECK(sent.status == 0);   // a shutdown writes only the FIN
++    // The close after the FIN sends nothing new.
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++    CHECK(ldnr_close_socket(context, client) == 0);
++    test_sleep_ms(30);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects);
 +
-+    // A reset from the peer in mid-flight ends the buffer the same way.
++    // A reset from the peer in mid-flight ends the buffer the same way: the
++    // chunk that was already out stays the last one on the wire.
 +    client = ldnr_socket(context, 2, 1, 6);
 +    CHECK(client >= 0);
 +    peer.port = ldnr_htons(TEST_TCP_PORT + 1);
@@ -11454,7 +12610,31 @@ index 0000000..e280670
 +    incoming.proxy.source_port = peer.port;
 +    incoming.status = 1;
 +    test_push_message(transport, &incoming);
-+    // The socket must have taken the reset before the send is released.
++    pthread_mutex_lock(&transport->mutex);
++    transport->block_data = 0;
++    pthread_cond_broadcast(&transport->condition);
++    pthread_mutex_unlock(&transport->mutex);
++    // The peer reset lands behind the chunk that was in flight: either it
++    // is applied before the second chunk is sent or it is not.
++    deadline = test_now_ms() + 2000;
++    for (;;) {
++        if (test_sent_count(transport, LDNR_MSG_PROXY_DATA) == data_frames + 2) {
++            expected = 16385;
++            break;
++        }
++        int32_t error = 0;
++        uint32_t error_size = sizeof(error);
++        CHECK(ldnr_getsockopt(context, client, 0, 0x1007, &error, &error_size) == 0);
++        if (error == TEST_ECONNRESET) {
++            expected = 16384;
++            break;
++        }
++        CHECK(test_now_ms() < deadline);
++        sched_yield();
++    }
++    CHECK(pthread_join(thread, NULL) == 0);
++    CHECK(sender.result == expected);
++    // The socket must have taken the reset before the close runs.
 +    deadline = test_now_ms() + 2000;
 +    for (;;) {
 +        int32_t error = 0;
@@ -11464,14 +12644,13 @@ index 0000000..e280670
 +        CHECK(test_now_ms() < deadline);
 +        sched_yield();
 +    }
-+    pthread_mutex_lock(&transport->mutex);
-+    transport->block_data = 0;
-+    pthread_cond_broadcast(&transport->condition);
-+    pthread_mutex_unlock(&transport->mutex);
-+    CHECK(pthread_join(thread, NULL) == 0);
-+    CHECK(sender.result == 16384);
-+    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DATA) == data_frames + 1);
++    // The close of a stream the peer reset is abortive: a reset retires it
++    // at both ends.
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
 +    CHECK(ldnr_close_socket(context, client) == 0);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_DISCONNECT, disconnects + 1);
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.status == 1);
 +    test_destroy_context(context, api);
 +}
 +
@@ -11557,6 +12736,416 @@ index 0000000..e280670
 +    test_destroy_context(context, api);
 +}
 +
++// An incoming stream exists for the application only after the relay took
++// the acceptance: while the reply is still in flight, accept() must not
++// hand out the child.
++static void test_accept_waits_for_the_reply(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr name;
++    ldnr_sockaddr peer;
++    ldnr_message incoming;
++    ldnr_message sent;
++    unsigned acknowledgements;
++    int listener;
++    int accepted;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    listener = ldnr_socket(context, 2, 1, 6);
++    CHECK(listener >= 0);
++    name.address = ldnr_ipv4(192, 168, 44, 10);
++    name.port = ldnr_htons(TEST_LISTEN_PORT);
++    CHECK(ldnr_bind(context, listener, &name) == 0);
++    CHECK(ldnr_listen(context, listener, 2) == 0);
++
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_CONNECT;
++    incoming.proxy.connection_id = UINT64_C(0x23456789);
++    incoming.proxy.source_address = ldnr_ipv4(192, 168, 44, 30);
++    incoming.proxy.source_port = ldnr_htons(8000);
++    incoming.proxy.destination_address = ldnr_ipv4(192, 168, 44, 10);
++    incoming.proxy.destination_port = ldnr_htons(TEST_LISTEN_PORT);
++    acknowledgements = test_sent_count(transport, LDNR_MSG_PROXY_CONNECT_ACK);
++
++    // The acceptance is held inside the transport: the child exists but is
++    // not admitted yet, so accept() finds nothing.
++    test_set_flag(transport, &transport->block_reply, 1);
++    test_push_message(transport, &incoming);
++    test_wait_for_flag(transport, &transport->reply_blocked);
++    CHECK(ldnr_accept(context, listener, &peer, 100) == -1);
++    CHECK(ldnr_last_errno() == TEST_EAGAIN);
++    test_set_flag(transport, &transport->block_reply, 0);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_CONNECT_ACK, acknowledgements + 1);
++
++    // Once the relay took the reply the child is handed out and can send.
++    accepted = ldnr_accept(context, listener, &peer, 1000);
++    CHECK(accepted >= 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT_ACK, &sent);
++    CHECK(sent.status == 0);
++    CHECK(peer.address == incoming.proxy.source_address);
++    CHECK(ldnr_send(context, accepted, "x", 1, 0) == 1);
++    test_last_message(transport, LDNR_MSG_PROXY_DATA, &sent);
++    CHECK(sent.proxy.size == 1);
++
++    CHECK(ldnr_close_socket(context, accepted) == 0);
++    CHECK(ldnr_close_socket(context, listener) == 0);
++    test_destroy_context(context, api);
++}
++
++// The bytes of a relayed segment are lost: the stream that carried them is
++// failed terminally, a later segment does not fill the hole, and the relay
++// is told with a reset.
++static void test_lost_payload_fails_the_stream(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    ldnr_sockaddr name;
++    ldnr_message sent;
++    ldnr_message incoming;
++    test_writer writer;
++    unsigned disconnects;
++    uint64_t connection_id;
++    char buffer[64];
++    int client;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    connection_id = sent.proxy.connection_id;
++    CHECK(ldnr_get_sock_name(context, client, &name) == 0);
++
++    // A segment whose declared payload never arrives on the wire: the bytes
++    // that were queued for the stream are gone.
++    memset(&writer, 0, sizeof(writer));
++    writer.size = 16;
++    test_u32(&writer, peer.address);
++    test_u16(&writer, ldnr_port_to_host(peer.port));
++    test_u32(&writer, ldnr_ipv4(192, 168, 44, 10));
++    test_u16(&writer, ldnr_port_to_host(name.port));
++    test_u8(&writer, 6);
++    test_u32(&writer, (uint32_t)connection_id);
++    test_u16(&writer, 8);               // the frame declares eight bytes
++    test_put(&writer, "los", 3);        // and carries only three
++    test_finish(&writer, 0x30, 0);
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++    test_push_frame(transport, writer.bytes, writer.size);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_DISCONNECT, disconnects + 1);
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.proxy.connection_id == connection_id);
++    CHECK(sent.status == 1);   // a reset, not a FIN
++    CHECK(sent.reason == 1);   // the delivery of the payload failed
++
++    // The segment that follows the gap must not be delivered: the reader
++    // sees the failure, never a hole in the stream.
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_DATA;
++    incoming.proxy.connection_id = connection_id;
++    incoming.proxy.source_address = peer.address;
++    incoming.proxy.source_port = peer.port;
++    incoming.proxy.destination_address = ldnr_ipv4(192, 168, 44, 10);
++    incoming.proxy.destination_port = name.port;
++    test_set_payload(&incoming, "after", 5);
++    test_push_message(transport, &incoming);
++    free(incoming.proxy.data);
++    incoming.proxy.data = NULL;
++    test_sleep_ms(50);
++    memset(buffer, 0, sizeof(buffer));
++    CHECK(ldnr_recv(context, client, buffer, sizeof(buffer), 0, 1000) == -1);
++    CHECK(ldnr_last_errno() == TEST_ECONNRESET);
++    CHECK(ldnr_send(context, client, "x", 1, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_ECONNRESET);
++
++    // Closing a broken stream is abortive.
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++    CHECK(ldnr_close_socket(context, client) == 0);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_DISCONNECT, disconnects + 1);
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.status == 1);
++    test_destroy_context(context, api);
++}
++
++// A lost membership retires the identities of its streams: the next
++// membership numbers its streams from one again, and an old descriptor
++// must neither take the frames of the new streams nor send closes for
++// them.
++static void test_rejoin_retires_stream_identities(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_network_info info;
++    ldnr_security_config security;
++    ldnr_sockaddr peer;
++    ldnr_sockaddr name;
++    ldnr_message sent;
++    ldnr_message incoming;
++    test_writer writer;
++    uint64_t first_id;
++    unsigned disconnects;
++    char buffer[64];
++    int old_tcp;
++    int new_tcp;
++    int old_listener;
++    int64_t deadline;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++
++    // An established stream and a listener of the first membership.
++    old_tcp = ldnr_socket(context, 2, 1, 6);
++    CHECK(old_tcp >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, old_tcp, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    first_id = sent.proxy.connection_id;
++    old_listener = ldnr_socket(context, 2, 1, 6);
++    CHECK(old_listener >= 0);
++    name.address = ldnr_ipv4(192, 168, 44, 10);
++    name.port = ldnr_htons(TEST_LISTEN_PORT);
++    CHECK(ldnr_bind(context, old_listener, &name) == 0);
++    CHECK(ldnr_listen(context, old_listener, 2) == 0);
++
++    // The network dies under the sockets and the room membership ends.
++    ldnr_vnet_network_down(context);
++    memset(&writer, 0, sizeof(writer));
++    writer.size = 16;
++    test_finish(&writer, 0x17, 0);   // DISCONNECTED, the way a lost signal reports
++    test_push_frame(transport, writer.bytes, writer.size);
++    memset(&info, 0, sizeof(info));
++    info = test_network_info();
++    memset(&security, 0, sizeof(security));
++    deadline = test_now_ms() + 2000;
++    for (;;) {
++        if (ldnr_connect_network(context, &info, NULL, &security, NULL, NULL, 0, 0) == 0)
++            break;
++        CHECK(ldnr_last_errno() == TEST_EINVAL);
++        CHECK(test_now_ms() < deadline);
++        test_sleep_ms(5);
++    }
++
++    // The new membership numbers its streams from one again: the fresh
++    // connect reuses the connection id of the old stream.
++    new_tcp = ldnr_socket(context, 2, 1, 6);
++    CHECK(new_tcp >= 0);
++    peer.port = ldnr_htons(TEST_TCP_PORT + 1);
++    CHECK(ldnr_connect_socket(context, new_tcp, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    CHECK(sent.proxy.connection_id == first_id);
++    CHECK(ldnr_get_sock_name(context, new_tcp, &name) == 0);
++
++    // A segment for the recycled id reaches only the new socket.
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_DATA;
++    incoming.proxy.connection_id = first_id;
++    incoming.proxy.source_address = peer.address;
++    incoming.proxy.source_port = peer.port;
++    incoming.proxy.destination_address = ldnr_ipv4(192, 168, 44, 10);
++    incoming.proxy.destination_port = name.port;
++    test_set_payload(&incoming, "fresh", 5);
++    test_push_message(transport, &incoming);
++    free(incoming.proxy.data);
++    incoming.proxy.data = NULL;
++    memset(buffer, 0, sizeof(buffer));
++    CHECK(ldnr_recv(context, new_tcp, buffer, sizeof(buffer), 0, 1000) == 5);
++    CHECK(memcmp(buffer, "fresh", 5) == 0);
++    CHECK(ldnr_recv(context, old_tcp, buffer, sizeof(buffer), 0, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_ENETDOWN);
++    CHECK(ldnr_send(context, old_tcp, "x", 1, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_ENETDOWN);
++
++    // The dead listener of the old membership refuses the connections of
++    // the new one instead of queueing them for a dead accept().
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_CONNECT;
++    incoming.proxy.connection_id = UINT64_C(0x1111);
++    incoming.proxy.source_address = ldnr_ipv4(192, 168, 44, 30);
++    incoming.proxy.source_port = ldnr_htons(8000);
++    incoming.proxy.destination_address = ldnr_ipv4(192, 168, 44, 10);
++    incoming.proxy.destination_port = ldnr_htons(TEST_LISTEN_PORT);
++    test_push_message(transport, &incoming);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_CONNECT_ACK,
++                       test_sent_count(transport, LDNR_MSG_PROXY_CONNECT_ACK) + 1);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT_ACK, &sent);
++    CHECK(sent.status == TEST_ECONNREFUSED);
++    CHECK(ldnr_accept(context, old_listener, &peer, 0) == -1);
++    CHECK(ldnr_last_errno() == TEST_ENETDOWN);
++
++    // Closing the dead descriptors emits nothing into the new membership.
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++    CHECK(ldnr_close_socket(context, old_tcp) == 0);
++    CHECK(ldnr_close_socket(context, old_listener) == 0);
++    test_sleep_ms(30);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects);
++
++    CHECK(ldnr_close_socket(context, new_tcp) == 0);
++    test_destroy_context(context, api);
++}
++
++// A terminal readiness is reported in every set the descriptor was
++// requested in: a failed connect is writable the way select() reports it,
++// not only exceptional.
++static void test_select_maps_errors_to_sets(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    uint64_t readfds[16], writefds[16], exceptfds[16];
++    uint64_t bit;
++    int client;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    bit = UINT64_C(1) << (client & 63);
++
++    // A refused connect leaves a terminal error on the socket.
++    transport->proxy_ack_status = TEST_ECONNREFUSED;
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == -1);
++    CHECK(ldnr_last_errno() == TEST_ECONNREFUSED);
++
++    // Selected for writability alone, the failed connect is still reported.
++    memset(readfds, 0, sizeof(readfds));
++    memset(writefds, 0, sizeof(writefds));
++    memset(exceptfds, 0, sizeof(exceptfds));
++    writefds[client >> 6] |= bit;
++    CHECK(ldnr_select(context, client + 1, readfds, writefds, exceptfds, 1000) == 1);
++    CHECK((writefds[client >> 6] & bit) != 0);
++    CHECK((readfds[client >> 6] & bit) == 0);
++    CHECK((exceptfds[client >> 6] & bit) == 0);
++
++    // In every requested set: the same descriptor reports two bits.
++    memset(readfds, 0, sizeof(readfds));
++    memset(writefds, 0, sizeof(writefds));
++    memset(exceptfds, 0, sizeof(exceptfds));
++    readfds[client >> 6] |= bit;
++    writefds[client >> 6] |= bit;
++    CHECK(ldnr_select(context, client + 1, readfds, writefds, exceptfds, 1000) == 2);
++    CHECK((readfds[client >> 6] & bit) != 0);
++    CHECK((writefds[client >> 6] & bit) != 0);
++
++    // The error itself is no exceptional readiness: an exceptfds-only
++    // selection is not woken by it.
++    memset(exceptfds, 0, sizeof(exceptfds));
++    exceptfds[client >> 6] |= bit;
++    CHECK(ldnr_select(context, client + 1, NULL, NULL, exceptfds, 0) == 0);
++    CHECK((exceptfds[client >> 6] & bit) == 0);
++
++    // The same mapping holds for a descriptor the lost network killed.
++    ldnr_vnet_network_down(context);
++    memset(readfds, 0, sizeof(readfds));
++    memset(writefds, 0, sizeof(writefds));
++    memset(exceptfds, 0, sizeof(exceptfds));
++    readfds[client >> 6] |= bit;
++    writefds[client >> 6] |= bit;
++    CHECK(ldnr_select(context, client + 1, readfds, writefds, exceptfds, 1000) == 2);
++    CHECK((readfds[client >> 6] & bit) != 0);
++    CHECK((writefds[client >> 6] & bit) != 0);
++
++    CHECK(ldnr_close_socket(context, client) == 0);
++    test_destroy_context(context, api);
++}
++
++// The orderly close of a stream is a FIN that only ends this side's
++// direction: the peer's own close reaps the stream, and a peer that never
++// closes is reset when the bounded linger runs out.
++static void test_close_is_fin_then_linger_reset(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    ldnr_message sent;
++    ldnr_message incoming;
++    uint64_t first_id;
++    uint64_t second_id;
++    unsigned disconnects;
++    int64_t deadline;
++    int first;
++    int second;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++
++    first = ldnr_socket(context, 2, 1, 6);
++    CHECK(first >= 0);
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, first, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    first_id = sent.proxy.connection_id;
++    second = ldnr_socket(context, 2, 1, 6);
++    CHECK(second >= 0);
++    peer.port = ldnr_htons(TEST_TCP_PORT + 1);
++    CHECK(ldnr_connect_socket(context, second, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    second_id = sent.proxy.connection_id;
++
++    // The ordinary close sends a FIN: the sending direction is over, the
++    // peer's stays open.
++    disconnects = test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT);
++    CHECK(ldnr_close_socket(context, first) == 0);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_DISCONNECT, disconnects + 1);
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.proxy.connection_id == first_id);
++    CHECK(sent.status == 0);
++
++    // The peer's own FIN reaps the retired stream at both ends: nothing is
++    // answered for it.
++    memset(&incoming, 0, sizeof(incoming));
++    incoming.type = LDNR_MSG_PROXY_DISCONNECT;
++    incoming.proxy.connection_id = first_id;
++    incoming.proxy.source_address = ldnr_ipv4(192, 168, 44, 20);
++    incoming.proxy.source_port = ldnr_htons(TEST_TCP_PORT);
++    incoming.status = 0;
++    test_push_message(transport, &incoming);
++    test_sleep_ms(60);
++    CHECK(test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects + 1);
++
++    // The peer that never closes is reset when the bounded linger ends.
++    CHECK(ldnr_close_socket(context, second) == 0);
++    test_wait_for_send(transport, LDNR_MSG_PROXY_DISCONNECT, disconnects + 2);
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.proxy.connection_id == second_id);
++    CHECK(sent.status == 0);
++    // A wait on an empty poll past the linger sends the reset that reaps
++    // the stream: the socket layer reaps it on its own time, not on a call.
++    deadline = test_now_ms() + 3000;
++    while (test_sent_count(transport, LDNR_MSG_PROXY_DISCONNECT) == disconnects + 2) {
++        CHECK(test_now_ms() < deadline);
++        CHECK(ldnr_poll(context, NULL, 0, 100) == 0);
++    }
++    test_last_message(transport, LDNR_MSG_PROXY_DISCONNECT, &sent);
++    CHECK(sent.proxy.connection_id == second_id);
++    CHECK(sent.status == 1);   // the linger ran out: the stream is reset
++
++    test_destroy_context(context, api);
++}
++
 +int main(void)
 +{
 +    test_offline_and_fd_limit();
@@ -11572,7 +13161,13 @@ index 0000000..e280670
 +    test_poll_cancellation_ends();
 +    test_rejoin_keeps_old_descriptors_terminal();
 +    test_listener_close_reclaims_queued_children();
++    test_data_never_follows_the_fin();
 +    test_send_stops_at_shutdown_and_reset();
++    test_accept_waits_for_the_reply();
++    test_lost_payload_fails_the_stream();
++    test_rejoin_retires_stream_identities();
++    test_select_maps_errors_to_sets();
++    test_close_is_fin_then_linger_reset();
 +    test_empty_select_waits_for_deadline();
 +    puts("PASS");
 +    return 0;
