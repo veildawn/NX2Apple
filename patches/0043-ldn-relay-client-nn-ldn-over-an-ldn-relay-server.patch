@@ -10,33 +10,33 @@ Issue: veildawn/NX2Apple (owner request, LDN online multiplayer via relay)
 
 ---
  dm/host/Makefile                |    2 +-
- dm/host/hle_ldnr.c              |  895 +++++++++
- dm/host/ldnr/ldnr.c             |  989 ++++++++++
+ dm/host/hle_ldnr.c              |  984 +++++++++
+ dm/host/ldnr/ldnr.c             |  989 +++++++++
  dm/host/ldnr/ldnr.h             |  131 ++
- dm/host/ldnr/ldnr_client.c      |  640 +++++++
+ dm/host/ldnr/ldnr_client.c      |  640 ++++++
  dm/host/ldnr/ldnr_hook.h        |   13 +
- dm/host/ldnr/ldnr_internal.h    |  246 +++
+ dm/host/ldnr/ldnr_internal.h    |  255 +++
  dm/host/ldnr/ldnr_native.c      |  622 ++++++
  dm/host/ldnr/ldnr_native.h      |  203 ++
- dm/host/ldnr/ldnr_protocol.c    |  645 +++++++
+ dm/host/ldnr/ldnr_protocol.c    |  645 ++++++
  dm/host/ldnr/ldnr_protocol.h    |  163 ++
- dm/host/ldnr/ldnr_tcp.c         |  534 ++++++
+ dm/host/ldnr/ldnr_tcp.c         |  534 +++++
  dm/host/ldnr/ldnr_transport.h   |   44 +
- dm/host/ldnr/ldnr_vnet.c        | 1587 ++++++++++++++++
+ dm/host/ldnr/ldnr_vnet.c        | 1600 +++++++++++++++
  dm/host/ldnr/ldnr_vnet.h        |   24 +
  dm/host/ldnr/tests/.gitignore   |    1 +
  dm/host/ldnr/tests/Makefile     |   60 +
  dm/host/ldnr/tests/shim/hle.h   |   38 +
- dm/host/ldnr/tests/t_glue.c     |  572 ++++++
+ dm/host/ldnr/tests/t_glue.c     |  600 ++++++
  dm/host/ldnr/tests/t_ldnr_e2e.c |  198 ++
  dm/host/ldnr/tests/t_native.c   |  340 ++++
- dm/host/ldnr/tests/t_protocol.c | 1101 +++++++++++
- dm/host/ldnr/tests/t_state.c    | 1652 ++++++++++++++++
- dm/host/ldnr/tests/t_tcp.c      |  442 +++++
- dm/host/ldnr/tests/t_vnet.c     | 3172 +++++++++++++++++++++++++++++++
+ dm/host/ldnr/tests/t_protocol.c | 1101 ++++++++++
+ dm/host/ldnr/tests/t_state.c    | 1652 +++++++++++++++
+ dm/host/ldnr/tests/t_tcp.c      |  442 ++++
+ dm/host/ldnr/tests/t_vnet.c     | 3328 +++++++++++++++++++++++++++++++
  dm/host/loader.c                |   16 +-
- docs/LDN-RELAY.md               |   91 +
- 27 files changed, 14416 insertions(+), 5 deletions(-)
+ docs/LDN-RELAY.md               |   96 +
+ 27 files changed, 14716 insertions(+), 5 deletions(-)
  create mode 100644 dm/host/hle_ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.c
  create mode 100644 dm/host/ldnr/ldnr.h
@@ -78,10 +78,10 @@ index 978fee0..3038a23 100644
  	rm -rf gen dmhost dmhost_* *.dSYM
 diff --git a/dm/host/hle_ldnr.c b/dm/host/hle_ldnr.c
 new file mode 100644
-index 0000000..fcfe23d
+index 0000000..ca2f5d6
 --- /dev/null
 +++ b/dm/host/hle_ldnr.c
-@@ -0,0 +1,895 @@
+@@ -0,0 +1,984 @@
 +// Optional nn::ldn / nn::socket takeover for relay play. The separate swldnr
 +// section keeps force_init's upstream duplicate check and accounting unchanged.
 +#ifdef LDNR_GLUE_SYNTAX_TEST
@@ -816,62 +816,66 @@ index 0000000..fcfe23d
 +LDNR_HLE("_ZN2nn6socket8ShutdownEii", int, lr_shutdown_cpp, int fd, int how) { return lr_shutdown(fd, how); }
 +LDNR_HLE("nnsocketShutdown", int, lr_shutdown_c, int fd, int how) { return lr_shutdown(fd, how); }
 +
-+static long lr_sendto(int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
++// The byte-count calls of nn::socket return ssize_t (s64): the guest reads
++// x0 whole, and a narrower return would leave -1 unextended — the caller
++// would see 4294967295 instead of an error. The syntax check at the end of
++// the file pins every hook's declared signature against the real API.
++static ssize_t lr_sendto(int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
 +    ldnr_sockaddr parsed;
 +    ldnr *l = lr_acquire();
 +    if (!l) return ldnr_fail(LDNR_ENETDOWN);
-+    long result = lr_guest_address(&parsed, address, address_size) ?
++    ssize_t result = lr_guest_address(&parsed, address, address_size) ?
 +        ldnr_sendto(l, fd, data, size, flags, &parsed) : ldnr_fail(LDNR_EINVAL);
 +    lr_release();
 +    return result;
 +}
-+LDNR_HLE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", long, lr_sendto_old, int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
++LDNR_HLE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", ssize_t, lr_sendto_old, int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
 +    return lr_sendto(fd, data, size, flags, address, address_size);
 +}
-+LDNR_HLE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", long, lr_sendto_new, int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
++LDNR_HLE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", ssize_t, lr_sendto_new, int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
 +    return lr_sendto(fd, data, size, flags, address, address_size);
 +}
-+LDNR_HLE("nnsocketSendTo", long, lr_sendto_c, int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
++LDNR_HLE("nnsocketSendTo", ssize_t, lr_sendto_c, int fd, const void *data, unsigned long size, int flags, const void *address, unsigned address_size) {
 +    return lr_sendto(fd, data, size, flags, address, address_size);
 +}
-+static long lr_recvfrom(int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
++static ssize_t lr_recvfrom(int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
 +    ldnr_sockaddr source;
 +    ldnr *l = lr_acquire();
 +    if (!l) return ldnr_fail(LDNR_ENETDOWN);
-+    long result = ldnr_recvfrom(l, fd, data, size, flags, &source, -2);
++    ssize_t result = ldnr_recvfrom(l, fd, data, size, flags, &source, -2);
 +    lr_release();
 +    if (result >= 0 && address) lr_put_address(address, address_size, &source);
 +    return result;
 +}
-+LDNR_HLE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", long, lr_recvfrom_old, int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
++LDNR_HLE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", ssize_t, lr_recvfrom_old, int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
 +    return lr_recvfrom(fd, data, size, flags, address, address_size);
 +}
-+LDNR_HLE("_ZN2nn6socket8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj", long, lr_recvfrom_new, int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
++LDNR_HLE("_ZN2nn6socket8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj", ssize_t, lr_recvfrom_new, int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
 +    return lr_recvfrom(fd, data, size, flags, address, address_size);
 +}
-+LDNR_HLE("nnsocketRecvFrom", long, lr_recvfrom_c, int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
++LDNR_HLE("nnsocketRecvFrom", ssize_t, lr_recvfrom_c, int fd, void *data, unsigned long size, int flags, void *address, unsigned *address_size) {
 +    return lr_recvfrom(fd, data, size, flags, address, address_size);
 +}
-+static long lr_send(int fd, const void *data, unsigned long size, int flags) {
++static ssize_t lr_send(int fd, const void *data, unsigned long size, int flags) {
 +    ldnr *l = lr_acquire();
 +    if (!l) return ldnr_fail(LDNR_ENETDOWN);
-+    long result = ldnr_send(l, fd, data, size, flags);
++    ssize_t result = ldnr_send(l, fd, data, size, flags);
 +    lr_release();
 +    return result;
 +}
-+LDNR_HLE("_ZN2nn6socket4SendEiPKvmi", long, lr_send_old, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
-+LDNR_HLE("_ZN2nn6socket4SendEiPKvmNS0_7MsgFlagE", long, lr_send_new, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
-+LDNR_HLE("nnsocketSend", long, lr_send_c, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
-+static long lr_recv(int fd, void *data, unsigned long size, int flags) {
++LDNR_HLE("_ZN2nn6socket4SendEiPKvmi", ssize_t, lr_send_old, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
++LDNR_HLE("_ZN2nn6socket4SendEiPKvmNS0_7MsgFlagE", ssize_t, lr_send_new, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
++LDNR_HLE("nnsocketSend", ssize_t, lr_send_c, int fd, const void *data, unsigned long size, int flags) { return lr_send(fd, data, size, flags); }
++static ssize_t lr_recv(int fd, void *data, unsigned long size, int flags) {
 +    ldnr *l = lr_acquire();
 +    if (!l) return ldnr_fail(LDNR_ENETDOWN);
-+    long result = ldnr_recv(l, fd, data, size, flags, -2);
++    ssize_t result = ldnr_recv(l, fd, data, size, flags, -2);
 +    lr_release();
 +    return result;
 +}
-+LDNR_HLE("_ZN2nn6socket4RecvEiPvmi", long, lr_recv_old, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
-+LDNR_HLE("_ZN2nn6socket4RecvEiPvmNS0_7MsgFlagE", long, lr_recv_new, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
-+LDNR_HLE("nnsocketRecv", long, lr_recv_c, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
++LDNR_HLE("_ZN2nn6socket4RecvEiPvmi", ssize_t, lr_recv_old, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
++LDNR_HLE("_ZN2nn6socket4RecvEiPvmNS0_7MsgFlagE", ssize_t, lr_recv_new, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
++LDNR_HLE("nnsocketRecv", ssize_t, lr_recv_c, int fd, void *data, unsigned long size, int flags) { return lr_recv(fd, data, size, flags); }
 +
 +static int lr_name(int fd, void *address, unsigned *size, int peer) {
 +    ldnr_sockaddr parsed;
@@ -966,8 +970,93 @@ index 0000000..fcfe23d
 +LDNR_HLE("_ZN2nn6socket17ResolverSetOptionERKNS0_14ResolverOptionE", int, lr_resolver_set, const void *option) { (void)option; return lr_unavailable(); }
 +LDNR_HLE("nnsocketResolverGetOption", int, lr_ns_resolver_get, void *option, int key) { (void)option; (void)key; return lr_unavailable(); }
 +LDNR_HLE("nnsocketResolverSetOption", int, lr_ns_resolver_set, const void *option) { (void)option; return lr_unavailable(); }
-+LDNR_HLE("nnsocketRecvMsg", int, lr_recvmsg, void) { return lr_unavailable(); }
-+LDNR_HLE("nnsocketSendMsg", int, lr_sendmsg, void) { return lr_unavailable(); }
++// The message-vector calls have no virtual-subnet mapping, but their real
++// API still returns ssize_t: the error must reach the guest sign-extended.
++LDNR_HLE("nnsocketRecvMsg", ssize_t, lr_recvmsg, void) { return lr_unavailable(); }
++LDNR_HLE("nnsocketSendMsg", ssize_t, lr_sendmsg, void) { return lr_unavailable(); }
++
++#ifdef LDNR_GLUE_SYNTAX_TEST
++// The guest-facing signature of every socket hook, pinned to the real
++// nn::socket API: a declaration that drifts stops type-checking here. The
++// byte-count calls must keep the pointer-width ssize_t — the guest reads
++// x0 whole, and a narrower return would not sign-extend -1 — while the
++// fixed-width calls keep their s32, void or Result.
++static ssize_t (*const ldnr_sig_sendto_old)(int, const void *, unsigned long, int, const void *, unsigned) = lr_sendto_old;
++static ssize_t (*const ldnr_sig_sendto_new)(int, const void *, unsigned long, int, const void *, unsigned) = lr_sendto_new;
++static ssize_t (*const ldnr_sig_sendto_c)(int, const void *, unsigned long, int, const void *, unsigned) = lr_sendto_c;
++static ssize_t (*const ldnr_sig_recvfrom_old)(int, void *, unsigned long, int, void *, unsigned *) = lr_recvfrom_old;
++static ssize_t (*const ldnr_sig_recvfrom_new)(int, void *, unsigned long, int, void *, unsigned *) = lr_recvfrom_new;
++static ssize_t (*const ldnr_sig_recvfrom_c)(int, void *, unsigned long, int, void *, unsigned *) = lr_recvfrom_c;
++static ssize_t (*const ldnr_sig_send_old)(int, const void *, unsigned long, int) = lr_send_old;
++static ssize_t (*const ldnr_sig_send_new)(int, const void *, unsigned long, int) = lr_send_new;
++static ssize_t (*const ldnr_sig_send_c)(int, const void *, unsigned long, int) = lr_send_c;
++static ssize_t (*const ldnr_sig_recv_old)(int, void *, unsigned long, int) = lr_recv_old;
++static ssize_t (*const ldnr_sig_recv_new)(int, void *, unsigned long, int) = lr_recv_new;
++static ssize_t (*const ldnr_sig_recv_c)(int, void *, unsigned long, int) = lr_recv_c;
++static ssize_t (*const ldnr_sig_recvmsg)(void) = lr_recvmsg;
++static ssize_t (*const ldnr_sig_sendmsg)(void) = lr_sendmsg;
++static Result (*const ldnr_sig_socket_init)(const void *) = lr_socket_init;
++static Result (*const ldnr_sig_socket_init4)(void *, uint64_t, uint64_t, int) = lr_socket_init4;
++static Result (*const ldnr_sig_socket_finalize)(void) = lr_socket_finalize;
++static int (*const ldnr_sig_socket_errno4)(void) = lr_socket_errno4;
++static int (*const ldnr_sig_socket_errno)(void) = lr_socket_errno;
++static int (*const ldnr_sig_ns_errno)(void) = lr_ns_errno;
++static void (*const ldnr_sig_ns_set_errno)(int) = lr_ns_set_errno;
++static int (*const ldnr_sig_socket)(int, int, int) = lr_socket;
++static int (*const ldnr_sig_socket4)(int, int, int) = lr_socket4;
++static int (*const ldnr_sig_ns_socket)(int, int, int) = lr_ns_socket;
++static int (*const ldnr_sig_bind_new)(int, const void *, unsigned) = lr_bind_new;
++static int (*const ldnr_sig_bind_old)(int, const void *, unsigned) = lr_bind_old;
++static int (*const ldnr_sig_ns_bind)(int, const void *, unsigned) = lr_ns_bind;
++static int (*const ldnr_sig_connect_new)(int, const void *, unsigned) = lr_connect_new;
++static int (*const ldnr_sig_connect_old)(int, const void *, unsigned) = lr_connect_old;
++static int (*const ldnr_sig_ns_connect)(int, const void *, unsigned) = lr_ns_connect;
++static int (*const ldnr_sig_listen_cpp)(int, int) = lr_listen_cpp;
++static int (*const ldnr_sig_listen_c)(int, int) = lr_listen_c;
++static int (*const ldnr_sig_accept_new)(int, void *, unsigned *) = lr_accept_new;
++static int (*const ldnr_sig_accept_old)(int, void *, unsigned *) = lr_accept_old;
++static int (*const ldnr_sig_accept_c)(int, void *, unsigned *) = lr_accept_c;
++static int (*const ldnr_sig_close_cpp)(int) = lr_close_cpp;
++static int (*const ldnr_sig_close_c)(int) = lr_close_c;
++static int (*const ldnr_sig_shutdown_cpp)(int, int) = lr_shutdown_cpp;
++static int (*const ldnr_sig_shutdown_c)(int, int) = lr_shutdown_c;
++static int (*const ldnr_sig_sockname_new)(int, void *, unsigned *) = lr_sockname_new;
++static int (*const ldnr_sig_sockname_old)(int, void *, unsigned *) = lr_sockname_old;
++static int (*const ldnr_sig_sockname_c)(int, void *, unsigned *) = lr_sockname_c;
++static int (*const ldnr_sig_peername_new)(int, void *, unsigned *) = lr_peername_new;
++static int (*const ldnr_sig_peername_c)(int, void *, unsigned *) = lr_peername_c;
++static int (*const ldnr_sig_setopt_new)(int, int, int, const void *, unsigned) = lr_setopt_new;
++static int (*const ldnr_sig_setopt_old)(int, int, int, const void *, unsigned) = lr_setopt_old;
++static int (*const ldnr_sig_setopt_c)(int, int, int, const void *, unsigned) = lr_setopt_c;
++static int (*const ldnr_sig_getopt_new)(int, int, int, void *, unsigned *) = lr_getopt_new;
++static int (*const ldnr_sig_getopt_old)(int, int, int, void *, unsigned *) = lr_getopt_old;
++static int (*const ldnr_sig_getopt_c)(int, int, int, void *, unsigned *) = lr_getopt_c;
++static int (*const ldnr_sig_fcntl_new)(int, int, long) = lr_fcntl_new;
++static int (*const ldnr_sig_fcntl_old)(int, int, long) = lr_fcntl_old;
++static int (*const ldnr_sig_fcntl_c)(int, int, long) = lr_fcntl_c;
++static int (*const ldnr_sig_poll_new)(void *, uint64_t, int) = lr_poll_new;
++static int (*const ldnr_sig_poll_old)(void *, uint64_t, int) = lr_poll_old;
++static int (*const ldnr_sig_poll_c)(void *, uint64_t, int) = lr_poll_c;
++static int (*const ldnr_sig_select_new)(int, void *, void *, void *, const int64_t *) = lr_select_new;
++static int (*const ldnr_sig_select_old)(int, void *, void *, void *, const int64_t *) = lr_select_old;
++static int (*const ldnr_sig_gai_new)(const char *, const char *, const void *, void **) = lr_gai_new;
++static int (*const ldnr_sig_gai_old)(const char *, const char *, const void *, void **) = lr_gai_old;
++static int (*const ldnr_sig_gai_c)(const char *, const char *, const void *, void **) = lr_gai_c;
++static void (*const ldnr_sig_freeai_new)(void *) = lr_freeai_new;
++static void (*const ldnr_sig_freeai_old)(void *) = lr_freeai_old;
++static void (*const ldnr_sig_freeai_c)(void *) = lr_freeai_c;
++static const char *(*const ldnr_sig_gai_error_new)(int) = lr_gai_error_new;
++static const char *(*const ldnr_sig_gai_error_c)(int) = lr_gai_error_c;
++static void *(*const ldnr_sig_host_new)(const char *, const void *, unsigned long) = lr_host_new;
++static void *(*const ldnr_sig_host_c)(const char *, const void *, unsigned long) = lr_host_c;
++static int (*const ldnr_sig_eventfd)(unsigned long, int) = lr_eventfd;
++static int (*const ldnr_sig_eventfd_read)(int, unsigned long *) = lr_eventfd_read;
++static int (*const ldnr_sig_eventfd_write)(int, unsigned long) = lr_eventfd_write;
++static int (*const ldnr_sig_resolver_get)(void *, int) = lr_resolver_get;
++static int (*const ldnr_sig_resolver_set)(const void *) = lr_resolver_set;
++static int (*const ldnr_sig_ns_resolver_get)(void *, int) = lr_ns_resolver_get;
++static int (*const ldnr_sig_ns_resolver_set)(const void *) = lr_ns_resolver_set;
++#endif
 +
 +// Unity build: the host Makefile picks up hle_ldnr.c without any upstream
 +// build-system change. Tests compile the same files as separate translation units.
@@ -2776,10 +2865,10 @@ index 0000000..b613bcd
 +#endif
 diff --git a/dm/host/ldnr/ldnr_internal.h b/dm/host/ldnr/ldnr_internal.h
 new file mode 100644
-index 0000000..92fe93e
+index 0000000..d4f3cd0
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_internal.h
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,255 @@
 +// Private shared state for the unity build and the standalone test build.
 +#pragma once
 +#include "ldnr.h"
@@ -2834,6 +2923,15 @@ index 0000000..92fe93e
 +    LDNR_ELIMITEXCEEDED = 110, LDNR_EINTERNAL = 111, LDNR_EREJECTED = 112,
 +    LDNR_EBADPARAM = 113, LDNR_ENOTHOST = 114, LDNR_ESECURITYMISMATCH = 115,
 +    LDNR_ETLSREQUIRED = 116,
++};
++
++// The per-call flags of nn::socket in the Horizon numbering, which the
++// guest passes to Send/SendTo/Recv/RecvFrom unchanged. Peek keeps the
++// datagram or the segment queued after it is read; DontWait makes the
++// single call nonblocking, whatever the descriptor's own mode is.
++enum {
++    LDNR_MSG_PEEK = 0x02,
++    LDNR_MSG_DONTWAIT = 0x80,
 +};
 +
 +// nn::ldn::DisconnectReason (libnx LdnDisconnectReason).
@@ -5275,10 +5373,10 @@ index 0000000..f158534
 +int ldnr_tcp_test_connecting_fd(const ldnr_transport *transport);
 diff --git a/dm/host/ldnr/ldnr_vnet.c b/dm/host/ldnr/ldnr_vnet.c
 new file mode 100644
-index 0000000..a8457b1
+index 0000000..beaf062
 --- /dev/null
 +++ b/dm/host/ldnr/ldnr_vnet.c
-@@ -0,0 +1,1587 @@
+@@ -0,0 +1,1600 @@
 +// Virtual BSD sockets on the LDN subnet. No host socket descriptor escapes:
 +// readiness and datagram queues are entirely under this layer's control.
 +#include "ldnr_internal.h"
@@ -5928,8 +6026,12 @@ index 0000000..a8457b1
 +    return 0;
 +}
 +
-+static int64_t ldnr_socket_deadline(const ldnr_vsock *s, int timeout_ms) {
-+    if (timeout_ms == -2) timeout_ms = s->nonblocking ? 0 : s->recv_timeout_ms;
++// The deadline a call gets when it blocks: an explicit call timeout wins,
++// a call with MSG_DONTWAIT or a descriptor in nonblocking mode does not
++// wait at all, and a plain call takes the socket option of its operation —
++// SO_RCVTIMEO for receives and accepts, SO_SNDTIMEO for connects.
++static int64_t ldnr_socket_deadline(const ldnr_vsock *s, int timeout_ms, int socket_ms) {
++    if (timeout_ms == -2) timeout_ms = s->nonblocking ? 0 : socket_ms;
 +    if (s->nonblocking) timeout_ms = 0;
 +    return timeout_ms < 0 ? -1 : ldnr_monotonic_ms() + timeout_ms;
 +}
@@ -5942,12 +6044,15 @@ index 0000000..a8457b1
 +ssize_t ldnr_recvfrom(ldnr *l, int fd, void *data, size_t capacity, int flags,
 +                      ldnr_sockaddr *source, int timeout_ms) {
 +    if (!l || (capacity && !data)) return ldnr_fail(LDNR_EINVAL);
++    // MSG_DONTWAIT makes this call alone nonblocking, whatever the mode of
++    // the descriptor is: with nothing queued it answers EAGAIN at once.
++    if (flags & LDNR_MSG_DONTWAIT) timeout_ms = 0;
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_socket_at(l, fd);
 +    if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
 +    if (s->type != 2) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_ENOTCONN); }
 +    uint64_t generation = s->generation;
-+    int64_t deadline = ldnr_socket_deadline(s, timeout_ms);
++    int64_t deadline = ldnr_socket_deadline(s, timeout_ms, s->recv_timeout_ms);
 +    while (!s->head) {
 +        if (l->cancelled) {
 +            pthread_mutex_unlock(&l->vnet.mutex);
@@ -5980,7 +6085,7 @@ index 0000000..a8457b1
 +    size_t copied = packet->size < capacity ? packet->size : capacity;
 +    if (copied) memcpy(data, packet->data + packet->offset, copied);
 +    if (source) *source = packet->source;
-+    if (!(flags & 2)) {
++    if (!(flags & LDNR_MSG_PEEK)) {
 +        s->head = packet->next;
 +        if (!s->head) s->tail = NULL;
 +        s->queued--;
@@ -5997,6 +6102,9 @@ index 0000000..a8457b1
 +
 +ssize_t ldnr_recv(ldnr *l, int fd, void *data, size_t capacity, int flags, int timeout_ms) {
 +    if (!l || (capacity && !data)) return ldnr_fail(LDNR_EINVAL);
++    // MSG_DONTWAIT makes this call alone nonblocking, whatever the mode of
++    // the descriptor is: with nothing queued it answers EAGAIN at once.
++    if (flags & LDNR_MSG_DONTWAIT) timeout_ms = 0;
 +    ldnr_retired_sweep(l);
 +    pthread_mutex_lock(&l->vnet.mutex);
 +    ldnr_vsock *s = ldnr_socket_at(l, fd);
@@ -6014,7 +6122,7 @@ index 0000000..a8457b1
 +        return ldnr_fail(LDNR_ENOTCONN);
 +    }
 +    uint64_t generation = s->generation;
-+    int64_t deadline = ldnr_socket_deadline(s, timeout_ms);
++    int64_t deadline = ldnr_socket_deadline(s, timeout_ms, s->recv_timeout_ms);
 +    while (!ldnr_stream_can_read(s)) {
 +        if (l->cancelled) {
 +            pthread_mutex_unlock(&l->vnet.mutex);
@@ -6042,7 +6150,7 @@ index 0000000..a8457b1
 +    size_t available = packet->size - packet->offset;
 +    size_t copied = available < capacity ? available : capacity;
 +    if (copied) memcpy(data, packet->data + packet->offset, copied);
-+    if (!(flags & 2)) {
++    if (!(flags & LDNR_MSG_PEEK)) {
 +        packet->offset += copied;
 +        s->queued_bytes -= copied;
 +        if (packet->offset == packet->size) {
@@ -6204,7 +6312,9 @@ index 0000000..a8457b1
 +        pthread_mutex_unlock(&l->vnet.mutex);
 +        return -1;
 +    }
-+    int64_t deadline = ldnr_socket_deadline(s, timeout_ms);
++    // A blocking open waits for its answer on the clock of SO_SNDTIMEO:
++    // the send timeout is the one BSD applies to connect().
++    int64_t deadline = ldnr_socket_deadline(s, timeout_ms, s->send_timeout_ms);
 +    if (deadline == ldnr_monotonic_ms() || s->nonblocking) {
 +        pthread_mutex_unlock(&l->vnet.mutex);
 +        return ldnr_fail(LDNR_EINPROGRESS);
@@ -6254,7 +6364,8 @@ index 0000000..a8457b1
 +    if (!s) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EBADF); }
 +    if (!s->listening) { pthread_mutex_unlock(&l->vnet.mutex); return ldnr_fail(LDNR_EINVAL); }
 +    uint64_t generation = s->generation;
-+    int64_t deadline = ldnr_socket_deadline(s, timeout_ms);
++    // An accept waits on the clock of SO_RCVTIMEO, the receive timeout.
++    int64_t deadline = ldnr_socket_deadline(s, timeout_ms, s->recv_timeout_ms);
 +    while (!s->accept_count) {
 +        // The relay is gone: a listener must not wait for a connection that
 +        // can no longer arrive.
@@ -7015,10 +7126,10 @@ index 0000000..6b13662
 +const struct dm_profile *dm_profile(void);
 diff --git a/dm/host/ldnr/tests/t_glue.c b/dm/host/ldnr/tests/t_glue.c
 new file mode 100644
-index 0000000..ea5f3a5
+index 0000000..a8baf83
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_glue.c
-@@ -0,0 +1,572 @@
+@@ -0,0 +1,600 @@
 +// Runtime test of the Apple glue. The host symbols the glue calls are
 +// stubbed here, so the test runs without the Apple SDK. It checks the
 +// result translation, the event binding identity, the hook selection in
@@ -7413,6 +7524,33 @@ index 0000000..ea5f3a5
 +    CHECK(!strcmp(ldnr_ent_lr_socket_finalize.name, "_ZN2nn6socket8FinalizeEv"));
 +}
 +
++// A byte-count hook reports its error through the whole return register:
++// the emitted entry, called through the ssize_t signature of the real
++// nn::socket API, must yield -1. A narrower declaration would leave the
++// upper word unwritten and the guest would see 4294967295 instead.
++static void test_byte_count_hooks_return_full_width(void)
++{
++    typedef ssize_t (*msg_fn)(void);
++    typedef ssize_t (*recv_fn)(int, void *, unsigned long, int);
++    typedef ssize_t (*recvfrom_fn)(int, void *, unsigned long, int, void *, unsigned *);
++    typedef ssize_t (*send_fn)(int, const void *, unsigned long, int);
++    typedef ssize_t (*sendto_fn)(int, const void *, unsigned long, int, const void *, unsigned);
++    uint8_t byte = 0;
++    setenv("DM_LDNR_SERVER", "127.0.0.1:1", 1);
++    CHECK(((msg_fn)ldnr_ent_lr_recvmsg.fn)() == (ssize_t)-1);
++    CHECK(((msg_fn)ldnr_ent_lr_sendmsg.fn)() == (ssize_t)-1);
++    // A bad descriptor fails inside the core without touching the relay.
++    CHECK(((recv_fn)ldnr_ent_lr_recv_c.fn)(-1, &byte, 1, 0) == (ssize_t)-1);
++    CHECK(((recv_fn)ldnr_ent_lr_recv_old.fn)(-1, &byte, 1, 0) == (ssize_t)-1);
++    CHECK(((recv_fn)ldnr_ent_lr_recv_new.fn)(-1, &byte, 1, 0) == (ssize_t)-1);
++    CHECK(((recvfrom_fn)ldnr_ent_lr_recvfrom_c.fn)(-1, &byte, 1, 0, NULL, NULL) == (ssize_t)-1);
++    CHECK(((send_fn)ldnr_ent_lr_send_c.fn)(-1, &byte, 1, 0) == (ssize_t)-1);
++    CHECK(((send_fn)ldnr_ent_lr_send_old.fn)(-1, &byte, 1, 0) == (ssize_t)-1);
++    CHECK(((send_fn)ldnr_ent_lr_send_new.fn)(-1, &byte, 1, 0) == (ssize_t)-1);
++    CHECK(((sendto_fn)ldnr_ent_lr_sendto_c.fn)(-1, &byte, 1, 0, NULL, 0) == (ssize_t)-1);
++    lr_ldn_finalize();
++}
++
 +// The guest's maximum cannot grow the staging buffer past the reply's
 +// capacity, and a staging buffer that cannot be allocated reports the
 +// out-of-memory mapping rather than pretending the relay answered.
@@ -7584,6 +7722,7 @@ index 0000000..ea5f3a5
 +    test_event_binding();
 +    test_hook_selection();
 +    test_mangled_names();
++    test_byte_count_hooks_return_full_width();
 +    test_scan_alloc_failure();
 +    test_connect_with_an_unencodable_passphrase();
 +    test_finalize_cancels_a_blocked_call();
@@ -11356,10 +11495,10 @@ index 0000000..583b703
 +}
 diff --git a/dm/host/ldnr/tests/t_vnet.c b/dm/host/ldnr/tests/t_vnet.c
 new file mode 100644
-index 0000000..25f0c5c
+index 0000000..508c423
 --- /dev/null
 +++ b/dm/host/ldnr/tests/t_vnet.c
-@@ -0,0 +1,3172 @@
+@@ -0,0 +1,3328 @@
 +#define _POSIX_C_SOURCE 200809L
 +
 +#include "../ldnr.h"
@@ -11406,6 +11545,7 @@ index 0000000..25f0c5c
 +    TEST_ENOBUFS = 55,
 +    TEST_ENOTCONN = 57,
 +    TEST_ECONNRESET = 54,
++    TEST_ETIMEDOUT = 60,
 +    TEST_ECONNREFUSED = 61,
 +    TEST_ECANCELED = 125,
 +};
@@ -14137,6 +14277,159 @@ index 0000000..25f0c5c
 +    test_destroy_context(context, api);
 +}
 +
++// MSG_DONTWAIT (0x80 in the Horizon numbering) makes one call nonblocking
++// on a descriptor that stays blocking: a receive with the flag answers
++// EAGAIN at once — without entering the wait, even with a positive
++// SO_RCVTIMEO — and the descriptor blocks again on the next plain call.
++static void test_msg_dontwait_is_per_call(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr address;
++    ldnr_sockaddr peer;
++    ldnr_sockaddr name;
++    ldnr_sockaddr source;
++    ldnr_message sent;
++    ldnr_message incoming;
++    ldnr_pollfd pollfd;
++    char buffer[32];
++    int32_t option;
++    int fd;
++    int client;
++    int entered;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    fd = ldnr_socket(context, 2, 2, 17);
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(fd >= 0 && client >= 0);
++    address.address = ldnr_ipv4(192, 168, 44, 10);
++    address.port = ldnr_htons(TEST_UDP_PORT);
++    CHECK(ldnr_bind(context, fd, &address) == 0);
++
++    // A positive SO_RCVTIMEO does not stretch the flagged call either: it
++    // fails at once and never reaches the wait.
++    option = 150;
++    CHECK(ldnr_setsockopt(context, fd, 0, 0x1006, &option, sizeof option) == 0);
++    entered = atomic_load(&waits.entered);
++    CHECK(ldnr_recvfrom(context, fd, buffer, sizeof buffer, 0x80, NULL, -2) == -1);
++    CHECK(ldnr_last_errno() == TEST_EAGAIN);
++    CHECK(atomic_load(&waits.entered) == entered);
++    // recv() on a datagram socket is the same receive: it honors the flag.
++    CHECK(ldnr_recv(context, fd, buffer, sizeof buffer, 0x80, -2) == -1);
++    CHECK(ldnr_last_errno() == TEST_EAGAIN);
++    CHECK(atomic_load(&waits.entered) == entered);
++    // A queued datagram is returned by the flagged call.
++    CHECK(ldnr_inject_udp(context, ldnr_ipv4(192, 168, 44, 30), ldnr_htons(6000),
++                          ldnr_ipv4(192, 168, 44, 10), ldnr_htons(TEST_UDP_PORT),
++                          "now", 3) == 0);
++    CHECK(ldnr_recvfrom(context, fd, buffer, sizeof buffer, 0x80, &source, -2) == 3);
++    CHECK(memcmp(buffer, "now", 3) == 0);
++    CHECK(source.address == ldnr_ipv4(192, 168, 44, 30));
++
++    // The stream read honors the flag the same way: a connected socket
++    // with nothing queued fails at once.
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++    CHECK(ldnr_connect_socket(context, client, &peer, 1000) == 0);
++    test_last_message(transport, LDNR_MSG_PROXY_CONNECT, &sent);
++    CHECK(ldnr_get_sock_name(context, client, &name) == 0);
++    entered = atomic_load(&waits.entered);
++    CHECK(ldnr_recv(context, client, buffer, sizeof buffer, 0x80, -2) == -1);
++    CHECK(ldnr_last_errno() == TEST_EAGAIN);
++    CHECK(atomic_load(&waits.entered) == entered);
++    memset(&incoming, 0, sizeof incoming);
++    incoming.type = LDNR_MSG_PROXY_DATA;
++    incoming.proxy.connection_id = sent.proxy.connection_id;
++    incoming.proxy.source_address = peer.address;
++    incoming.proxy.source_port = peer.port;
++    incoming.proxy.destination_address = name.address;
++    incoming.proxy.destination_port = name.port;
++    test_set_payload(&incoming, "flag", 4);
++    test_push_message(transport, &incoming);
++    free(incoming.proxy.data);
++    incoming.proxy.data = NULL;
++    // The pushed segment reaches the socket queue through the receive
++    // thread: poll until it is readable so the flagged call is not a race.
++    pollfd.fd = client;
++    pollfd.events = LDNR_POLLIN;
++    pollfd.revents = 0;
++    CHECK(ldnr_poll(context, &pollfd, 1, 1000) == 1);
++    CHECK((pollfd.revents & LDNR_POLLIN) != 0);
++    CHECK(ldnr_recv(context, client, buffer, sizeof buffer, 0x80, -2) == 4);
++    CHECK(memcmp(buffer, "flag", 4) == 0);
++
++    // The flag does not change the descriptor: the next plain call waits
++    // on the socket timeout again instead of failing at once.
++    CHECK(ldnr_recvfrom(context, fd, buffer, sizeof buffer, 0, NULL, -2) == -1);
++    CHECK(ldnr_last_errno() == TEST_EAGAIN);
++    CHECK(atomic_load(&waits.entered) > entered);
++
++    CHECK(ldnr_close_socket(context, client) == 0);
++    CHECK(ldnr_close_socket(context, fd) == 0);
++    CHECK(atomic_load(&waits.entered) == atomic_load(&waits.exited));
++    test_destroy_context(context, api);
++}
++
++// A blocking connect waits on the clock of SO_SNDTIMEO: the receive
++// timeout belongs to the receive calls and must not end the open early.
++static void test_connect_uses_the_send_timeout(void)
++{
++    test_transport *transport;
++    const ldnr_transport *api = test_transport_create(&transport);
++    test_waits waits;
++    ldnr *context;
++    ldnr_sockaddr peer;
++    int64_t started;
++    int64_t elapsed;
++    int32_t option;
++    int client;
++
++    atomic_init(&waits.entered, 0);
++    atomic_init(&waits.exited, 0);
++    context = test_connected_context(api, &waits);
++    // The relay never answers the open: only the socket timeout ends it.
++    transport->auto_proxy_ack = 0;
++    peer.address = ldnr_ipv4(192, 168, 44, 20);
++    peer.port = ldnr_htons(TEST_TCP_PORT);
++
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    // A short receive timeout would end the open early if it governed it.
++    option = 150;
++    CHECK(ldnr_setsockopt(context, client, 0, 0x1006, &option, sizeof option) == 0);
++    option = 800;
++    CHECK(ldnr_setsockopt(context, client, 0, 0x1005, &option, sizeof option) == 0);
++    started = test_now_ms();
++    CHECK(ldnr_connect_socket(context, client, &peer, -2) == -1);
++    elapsed = test_now_ms() - started;
++    CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++    CHECK(elapsed >= 500);
++    CHECK(ldnr_close_socket(context, client) == 0);
++
++    // The same open with a short send timeout and a long receive one ends
++    // on the send clock instead.
++    client = ldnr_socket(context, 2, 1, 6);
++    CHECK(client >= 0);
++    option = 2000;
++    CHECK(ldnr_setsockopt(context, client, 0, 0x1006, &option, sizeof option) == 0);
++    option = 120;
++    CHECK(ldnr_setsockopt(context, client, 0, 0x1005, &option, sizeof option) == 0);
++    started = test_now_ms();
++    CHECK(ldnr_connect_socket(context, client, &peer, -2) == -1);
++    elapsed = test_now_ms() - started;
++    CHECK(ldnr_last_errno() == TEST_ETIMEDOUT);
++    CHECK(elapsed >= 60);
++    CHECK(elapsed < 1000);
++    CHECK(ldnr_close_socket(context, client) == 0);
++
++    CHECK(atomic_load(&waits.entered) == atomic_load(&waits.exited));
++    test_destroy_context(context, api);
++}
++
 +typedef struct {
 +    ldnr *context;
 +    int fd;
@@ -14528,6 +14821,8 @@ index 0000000..25f0c5c
 +    test_select_maps_errors_to_sets();
 +    test_close_is_fin_then_linger_reset();
 +    test_zero_socket_timeout_disables();
++    test_msg_dontwait_is_per_call();
++    test_connect_uses_the_send_timeout();
 +    test_empty_select_waits_for_deadline();
 +    puts("PASS");
 +    return 0;
@@ -14573,10 +14868,10 @@ index fb14972..ce5e817 100644
  static void force_check(void) {
 diff --git a/docs/LDN-RELAY.md b/docs/LDN-RELAY.md
 new file mode 100644
-index 0000000..77e406c
+index 0000000..d0185bb
 --- /dev/null
 +++ b/docs/LDN-RELAY.md
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,96 @@
 +# LDN relay multiplayer (experimental)
 +
 +LDNR lets a game using `nn::ldn` local wireless and the virtual `nn::socket`
@@ -14601,10 +14896,15 @@ index 0000000..77e406c
 +updates, and password-room support. It refuses servers that do not negotiate
 +the required data-plane capabilities.
 +
-+**The built-in transport is plain TCP, not TLS.** Do not use a reusable
-+password. Use a private network or a correctly configured TLS tunnel when the
-+relay crosses an untrusted network. A TLS-enabled relay endpoint cannot be
-+used directly until certificate-verifying TLS support is added to the client.
++**The built-in transport is plaintext TCP: it has no relay authentication
++and no integrity protection.** Traffic to and from the relay is readable and
++modifiable by anyone on the path, and nothing proves the endpoint is the
++relay you intended. Do not use a reusable password. When the relay crosses
++an untrusted network, run the connection through a TLS tunnel or a VPN — the
++relay server supports TLS — so the plaintext client transport is never
++exposed. A TLS-enabled relay endpoint cannot be used directly until
++certificate-verifying TLS support is added to the client; an authenticated,
++integrity-protected transport is a known follow-up.
 +
 +**Room passwords require TLS on the relay by default.** Until client TLS
 +exists, a relay that enforces this refuses a password room over plaintext
