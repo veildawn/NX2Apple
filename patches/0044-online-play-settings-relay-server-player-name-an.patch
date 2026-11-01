@@ -25,10 +25,11 @@ Issue: veildawn/NX2Apple (owner request, in-app online play settings for the LDN
 
 ---
  dm/ios/Sources/Launcher.swift            |  24 +-
- dm/ios/Sources/OnlinePlay.swift          | 673 ++++++++++++++++++++++
- dm/ios/Sources/OnlinePlayView.swift      | 474 ++++++++++++++++
+ dm/ios/Sources/OnlinePlay.swift          | 682 ++++++++++++++++++++++
+ dm/ios/Sources/OnlinePlayView.swift      | 474 +++++++++++++++
+ dm/ios/project.yml                       |   1 +
  dm/ios/tests/launcher_layout_check.swift |   3 +-
- dm/ios/tests/online_play_check.swift     | 684 +++++++++++++++++++++++
+ dm/ios/tests/online_play_check.swift     | 711 +++++++++++++++++++++++
  dm/ios/tests/test_launcher_storage.py    |   3 +-
  dm/ios/tests/test_online_play.py         |  48 ++
  dm/mac/Launcher.swift                    |  31 +-
@@ -39,7 +40,7 @@ Issue: veildawn/NX2Apple (owner request, in-app online play settings for the LDN
  docs/LDN-SETTINGS.md                     |  73 +++
  docs/development.md                      |   2 +-
  docs/settings.md                         |   5 +
- 15 files changed, 2020 insertions(+), 20 deletions(-)
+ 16 files changed, 2057 insertions(+), 20 deletions(-)
  create mode 100644 dm/ios/Sources/OnlinePlay.swift
  create mode 100644 dm/ios/Sources/OnlinePlayView.swift
  create mode 100644 dm/ios/tests/online_play_check.swift
@@ -103,10 +104,10 @@ index f20e403..ffea257 100644
      let h = UIHostingController(rootView: view)
 diff --git a/dm/ios/Sources/OnlinePlay.swift b/dm/ios/Sources/OnlinePlay.swift
 new file mode 100644
-index 0000000..2dd7764
+index 0000000..9fbbe05
 --- /dev/null
 +++ b/dm/ios/Sources/OnlinePlay.swift
-@@ -0,0 +1,673 @@
+@@ -0,0 +1,682 @@
 +// Online play: the LDN relay settings the game launchers collect and write into the environment the host reads (docs/LDN-SETTINGS.md). Foundation only
 +// (POSIX sockets for the connection test come from Darwin or Glibc), so the same file builds for the iPhone app, for the Mac launcher and for the regression
 +// tests. The host still reads only the DM_LDNR* variables: nothing here changes the relay client.
@@ -423,8 +424,8 @@ index 0000000..2dd7764
 +    /// The chosen server: the one the environment fixes, else the saved choice, else a valid address that is no longer in the list.
 +    var selectedServer: RelayServer? {
 +        if let fixed = fixedValue(Keys.server) {   // the environment's address is the one the host will use: show it, and nothing else
-+            let address = RelayAddress.normalize(fixed)
-+            return RelayAddress.validate(address) == nil ? RelayServer(name: "", address: address) : nil
++            // exactly the string the host gets: a value the host would not read as written (an ldnr:// prefix, a trailing /) is not tested or shared
++            return RelayAddress.validate(fixed) == nil && RelayAddress.normalize(fixed) == fixed ? RelayServer(name: "", address: fixed) : nil
 +        }
 +        if let saved = servers.first(where: { $0.address == selected }) { return saved }
 +        guard !selected.isEmpty, RelayAddress.validate(selected) == nil else { return nil }
@@ -491,7 +492,8 @@ index 0000000..2dd7764
 +        put(Keys.ldnName, name.isEmpty ? nil : name)
 +        let password = effectivePassword
 +        put(Keys.roomPassword, password.isEmpty ? nil : password)
-+        put(Keys.allowPlaintext, password.isEmpty || !effectiveConsent ? nil : "1")
++        // the toggle consents only for the field's password: a password env.txt fixes is sent only when env.txt allows it too
++        put(Keys.allowPlaintext, fixedValue(Keys.roomPassword) == nil && !password.isEmpty && effectiveConsent ? "1" : nil)
 +        return out
 +    }
 +
@@ -540,9 +542,14 @@ index 0000000..2dd7764
 +    static let version = 1
 +
 +    /// HELLO: major 1 only, minor 2, no capability bits, this launcher's name.
++    /// The capabilities the game's relay client asks for (LDNR_WIRE_CAPS in dm/host/ldnr/ldnr_protocol.c) and the ones it cannot play without.
++    /// The server answers the AND of both sides, so the test asks for the same set and checks the same bits as the game.
++    static let clientCapabilities: UInt32 = 0x1F
++    static let requiredCapabilities: UInt32 = 0x1E
++
 +    static func helloFrame(requestID: UInt32) -> [UInt8] {
 +        var payload: [UInt8] = [1, 1, 2]
-+        append(&payload, UInt32(0))
++        append(&payload, clientCapabilities)
 +        append(&payload, "NX2Apple launcher")
 +        append(&payload, "1")
 +        return frame(type: 0x01, requestID: requestID, payload: payload)
@@ -569,11 +576,11 @@ index 0000000..2dd7764
 +
 +    /// HELLO_ACK's major, minor and server name. A payload too short for its own fields is malformed.
 +    /// major, minor, the server's major range and the capabilities come first (8 bytes), then the 16-byte conn_id (docs/PROTOCOL.md 3.1).
-+    static func parseHelloAck(_ payload: [UInt8]) -> (major: UInt8, minor: UInt8, serverName: String)? {
++    static func parseHelloAck(_ payload: [UInt8]) -> (major: UInt8, minor: UInt8, capabilities: UInt32, serverName: String)? {
 +        guard payload.count >= 34 else { return nil }   // through max_frame and keepalive, after an empty name
 +        let length = Int(u16(payload, 24))
 +        guard payload.count >= 26 + length + 8 else { return nil }
-+        return (payload[0], payload[1], String(decoding: payload[26..<(26 + length)], as: UTF8.self))
++        return (payload[0], payload[1], u32(payload, 4), String(decoding: payload[26..<(26 + length)], as: UTF8.self))
 +    }
 +
 +    /// Connects, shakes hands and times one PING. Never throws: every failure is an unreachable result with a short reason.
@@ -649,6 +656,9 @@ index 0000000..2dd7764
 +                case 0x02:   // HELLO_ACK
 +                    guard let ack = parseHelloAck(frame.payload) else { return failure(.notRelay, "bad HELLO_ACK") }
 +                    if ack.minor < 2 { return failure(.oldProtocol, "protocol 1.\(ack.minor)") }
++                    if ack.capabilities & requiredCapabilities != requiredCapabilities {   // the game would refuse this relay at its handshake
++                        return failure(.oldProtocol, "missing features (capabilities 0x\(String(ack.capabilities, radix: 16)))")
++                    }
 +                    serverName = ack.serverName
 +                    version = "\(ack.major).\(ack.minor)"
 +                    pingSentAt = monotonicMs()
@@ -782,7 +792,7 @@ index 0000000..2dd7764
 +}
 diff --git a/dm/ios/Sources/OnlinePlayView.swift b/dm/ios/Sources/OnlinePlayView.swift
 new file mode 100644
-index 0000000..4ee6f7c
+index 0000000..928ea97
 --- /dev/null
 +++ b/dm/ios/Sources/OnlinePlayView.swift
 @@ -0,0 +1,474 @@
@@ -892,9 +902,9 @@ index 0000000..4ee6f7c
 +        let address = server.address
 +        probe = nil
 +        testing = true
-+        DispatchQueue.global(qos: .userInitiated).async {
++        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
 +            let result = RelayProbe.run(address: address)
-+            DispatchQueue.main.async { [weak self] in
++            DispatchQueue.main.async {
 +                guard let self = self, token == self.probeToken else { return }
 +                self.testing = false
 +                self.probe = result
@@ -977,7 +987,7 @@ index 0000000..4ee6f7c
 +    @ViewBuilder private var serverRows: some View {
 +        if let fixedServer = fixedServer {
 +            LabeledContent(OnlineText.t("Server", "服务器")) {
-+                Text("\(RelayAddress.normalize(fixedServer)) \(OnlineText.t("(env.txt)", "(env.txt)"))")
++                Text("\(fixedServer) \(OnlineText.t("(env.txt)", "(env.txt)"))")   // as the host gets it
 +                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
 +            }
 +        } else {
@@ -1260,6 +1270,18 @@ index 0000000..4ee6f7c
 +        if failure == nil { dismiss() }
 +    }
 +}
+diff --git a/dm/ios/project.yml b/dm/ios/project.yml
+index ed0010a..fc95f5c 100644
+--- a/dm/ios/project.yml
++++ b/dm/ios/project.yml
+@@ -34,6 +34,7 @@ targets:
+         CFBundleShortVersionString: $(MARKETING_VERSION)
+         UILaunchStoryboardName: ""
+         UIFileSharingEnabled: true          # Documents (log.txt, saves) visible in the Files app
++        NSLocalNetworkUsageDescription: "Online play connects to the relay server you choose, which can be on your local network."   # the LDN relay client and the launcher's Test connection (docs/LDN-SETTINGS.md)
+         LSSupportsOpeningDocumentsInPlace: true
+         UISupportedInterfaceOrientations:
+           - UIInterfaceOrientationLandscapeRight
 diff --git a/dm/ios/tests/launcher_layout_check.swift b/dm/ios/tests/launcher_layout_check.swift
 index 3562502..4d87ac1 100644
 --- a/dm/ios/tests/launcher_layout_check.swift
@@ -1276,10 +1298,10 @@ index 3562502..4d87ac1 100644
          // loop until the report meets the step's expectation and has held for 0.2 s; after 5 s the check sees whatever was reported last
 diff --git a/dm/ios/tests/online_play_check.swift b/dm/ios/tests/online_play_check.swift
 new file mode 100644
-index 0000000..7864b93
+index 0000000..a42482b
 --- /dev/null
 +++ b/dm/ios/tests/online_play_check.swift
-@@ -0,0 +1,684 @@
+@@ -0,0 +1,711 @@
 +// The online play model (OnlinePlay.swift), run by test_online_play.py: address validation and splitting, name truncation, the invite round trip,
 +// persistence through a private UserDefaults suite, the environment Play writes for every combination, and the connection test's frames and
 +// behaviour against a fake relay on loopback. Compiles with OnlinePlay.swift alone (-parse-as-library), on macOS or Linux.
@@ -1383,9 +1405,9 @@ index 0000000..7864b93
 +    return out + payload
 +}
 +
-+func helloAck(requestID: UInt32, major: UInt8 = 1, minor: UInt8 = 2, name: String = "test relay") -> [UInt8] {
++func helloAck(requestID: UInt32, major: UInt8 = 1, minor: UInt8 = 2, capabilities: UInt8 = 0x1F, name: String = "test relay") -> [UInt8] {
 +    var payload: [UInt8] = [major, minor, 1, 1]
-+    payload += [0, 0, 0, 0]   // capabilities
++    payload += [capabilities, 0, 0, 0]   // capabilities, the AND of both sides
 +    payload += [UInt8](repeating: 7, count: 16)   // conn_id
 +    let utf8 = Array(name.utf8)
 +    payload += [UInt8(utf8.count & 0xFF), UInt8((utf8.count >> 8) & 0xFF)] + utf8
@@ -1755,6 +1777,25 @@ index 0000000..7864b93
 +        check(fixedPassword.invite() == OnlineInvite(server: "relay.example.com", password: "filepw", name: ""),
 +              "the invite carries the fixed password")
 +
++        // the toggle's consent was for the field's password: it does not allow a password env.txt fixes later
++        let carried = model(["DM_LDNR_ROOM_PASSWORD": "filepw"])
++        carried.enabled = true
++        _ = carried.addServer(name: "", address: "relay.example.com")
++        carried.password = "typed"
++        carried.plaintextConsent = true
++        let carriedEnv = carried.environment()
++        check(carriedEnv.keys.contains("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD") && carriedEnv["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"]! == nil,
++              "a fixed password is not allowed by the toggle: only env.txt can allow it")
++        let fileAllows = model(["DM_LDNR_ROOM_PASSWORD": "filepw", "DM_LDNR_ALLOW_PLAINTEXT_PASSWORD": "1"])
++        fileAllows.enabled = true
++        _ = fileAllows.addServer(name: "", address: "relay.example.com")
++        check(!fileAllows.environment().keys.contains("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"), "env.txt's own consent is left to the file")
++
++        // a fixed server is tested and shared exactly as the host gets it
++        let rawFixed = model(["DM_LDNR_SERVER": "ldnr://relay.example.com/"])
++        check(rawFixed.selectedServer == nil && rawFixed.invite() == nil,
++              "a fixed address the host would not read as written is neither tested nor shared")
++
 +        // 2. an invite carries the fixed server and the fixed password
 +        let fixedBoth = model(["DM_LDNR_SERVER": "env.example.com:9", "DM_LDNR_ROOM_PASSWORD": "filepw"])
 +        fixedBoth.password = "typed"
@@ -1843,7 +1884,7 @@ index 0000000..7864b93
 +        let expected: [UInt8] = [0x4C, 0x44, 0x4E, 0x52, 1, 0x01, 0, 0,
 +                                 29, 0, 0, 0,   // payload length: 3 + 4 + 2 + 17 + 2 + 1
 +                                 1, 0, 0, 0,    // request id
-+                                 1, 1, 2, 0, 0, 0, 0,
++                                 1, 1, 2, 0x1F, 0, 0, 0,   // the game client's capabilities
 +                                 17, 0] + Array("NX2Apple launcher".utf8) + [1, 0] + Array("1".utf8)
 +        check(RelayProbe.helloFrame(requestID: 1) == expected, "the HELLO frame, byte for byte")
 +        let ping = RelayProbe.pingFrame(major: 1, requestID: 7, timestampMs: 0x0102030405060708)
@@ -1863,7 +1904,7 @@ index 0000000..7864b93
 +        check(RelayProbe.parseFrame(Array(ack.dropFirst(16))) == nil, "a payload without its header does not parse")
 +        let ackPayload = Array(helloAck(requestID: 1).dropFirst(16))
 +        let decoded = RelayProbe.parseHelloAck(ackPayload)
-+        check(decoded?.major == 1 && decoded?.minor == 2 && decoded?.serverName == "test relay", "HELLO_ACK decodes")
++        check(decoded?.major == 1 && decoded?.minor == 2 && decoded?.capabilities == 0x1F && decoded?.serverName == "test relay", "HELLO_ACK decodes")
 +        check(RelayProbe.parseHelloAck(Array(ackPayload.prefix(10))) == nil, "a short HELLO_ACK does not decode")
 +    }
 +
@@ -1899,6 +1940,14 @@ index 0000000..7864b93
 +            writeAll(fd, helloAck(requestID: hello.requestID, minor: 1))
 +        }) {
 +            check(RelayProbe.run(address: relay.address, timeout: 5).kind == .oldProtocol, "a HELLO_ACK minor below 2 is an older protocol")
++            relay.stop()
++        }
++        // (c2) a relay without the features the game needs: the game refuses it, so the test does too
++        if let relay = FakeRelay({ fd in
++            guard let hello = readFrame(fd) else { return }
++            writeAll(fd, helloAck(requestID: hello.requestID, capabilities: 0x01))
++        }) {
++            check(RelayProbe.run(address: relay.address, timeout: 5).kind == .oldProtocol, "a HELLO_ACK without capabilities 0x1e is refused, as the game does")
 +            relay.stop()
 +        }
 +        // (d) not a relay
@@ -2218,7 +2267,7 @@ index d0185bb..a2e05c5 100644
  | Variable | Meaning |
 diff --git a/docs/LDN-SETTINGS.md b/docs/LDN-SETTINGS.md
 new file mode 100644
-index 0000000..a0926e5
+index 0000000..225cc5f
 --- /dev/null
 +++ b/docs/LDN-SETTINGS.md
 @@ -0,0 +1,73 @@
@@ -2266,10 +2315,10 @@ index 0000000..a0926e5
 +   - green: "Connected · 38 ms · protocol 1.2 · <server name>"
 +   - "Not reachable: <reason>" (no route, refused, timed out, name not found)
 +   - "This is not an LDN relay server"
-+   - "The server speaks an older protocol" (ERROR VERSION_UNSUPPORTED, or a HELLO_ACK minor below 2)
-+   The test never runs by itself. It uses no game data and sends no password. A server name that needs a DNS lookup can take longer than the 5 second socket timeout, because the lookup itself has no time limit.
++   - "The server speaks an older protocol" (ERROR VERSION_UNSUPPORTED, a HELLO_ACK minor below 2, or a HELLO_ACK without the capabilities the game needs, 0x1e of the 0x1f it asks for)
++   The test never runs by itself. It uses no game data and sends no password. A server name that needs a DNS lookup can take longer than the 5 second socket timeout, because the lookup itself has no time limit. A server fixed by an env file is tested exactly as the host gets it, so a value the host would not read as written (an `ldnr://` prefix, a trailing `/`) is not tested or shared. On iPhone the first connection to a relay on the local network asks for the Local Network permission (`NSLocalNetworkUsageDescription` in `dm/ios/project.yml`).
 +4. **Player name** (玩家名称): a text field. Empty uses the device name (on iPhone the system name, often just "iPhone", so the placeholder suggests setting one). The counter shows the bytes left of the native 32-byte field. Longer names are cut at a character boundary, never inside a character.
-+5. **Room password** (房间密码), optional: a secure field. A room password keeps strangers on the same server out of your room. It is cut at a character boundary to the host's 64-byte passphrase field, and the counter shows the bytes left of 64. When it is set, a warning appears: "The relay connection is not encrypted. The password and the game traffic can be read on the network. Use a password only on a trusted network or a VPN, and never one you use elsewhere. The server must allow passwords without TLS." With it the toggle **Send the password unencrypted** (允许明文发送密码). Without that consent online play does not start: Play writes no `DM_LDNR*` variable, the log says that it waits for the password consent, and the section shows "Online play will not start until you allow the password" in red. Clearing the password clears the consent. A `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD` set by an env file counts as consent, and its value decides in place of the toggle. A password fixed by an env file is left to the file, so it never waits for the app's consent.
++5. **Room password** (房间密码), optional: a secure field. A room password keeps strangers on the same server out of your room. It is cut at a character boundary to the host's 64-byte passphrase field, and the counter shows the bytes left of 64. When it is set, a warning appears: "The relay connection is not encrypted. The password and the game traffic can be read on the network. Use a password only on a trusted network or a VPN, and never one you use elsewhere. The server must allow passwords without TLS." With it the toggle **Send the password unencrypted** (允许明文发送密码). Without that consent online play does not start: Play writes no `DM_LDNR*` variable, the log says that it waits for the password consent, and the section shows "Online play will not start until you allow the password" in red. Clearing the password clears the consent. A `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD` set by an env file counts as consent, and its value decides in place of the toggle. A password fixed by an env file is left to the file, so it never waits for the app's consent, and the toggle never allows it. Only the file's own `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD=1` does.
 +6. **Invite a friend** (邀请好友): **Copy invite** copies a short text with the server and, when one is set, the room password, and a link of the form `nx2apple-ldn://join?server=<address>&password=<password>&name=<server name>`. The invite carries the effective server and password, so a server or password fixed by an env file is the one friends get. **Paste invite** reads the clipboard, adds the server to the list when it is new, chooses it, fills in the password and asks again for the plaintext consent. When `DM_LDNR_SERVER` is fixed, a pasted invite for another server is refused and the section says so. Anything that is not an invite shows "The clipboard has no invite".
 +7. A footer under the section: "Status during play is in the game's log (lines starting with ldnr)."
 +
