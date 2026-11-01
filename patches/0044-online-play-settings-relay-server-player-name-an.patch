@@ -25,20 +25,21 @@ Issue: veildawn/NX2Apple (owner request, in-app online play settings for the LDN
 
 ---
  dm/ios/Sources/Launcher.swift            |  24 +-
- dm/ios/Sources/OnlinePlay.swift          | 630 +++++++++++++++++++++++
- dm/ios/Sources/OnlinePlayView.swift      | 460 +++++++++++++++++
+ dm/ios/Sources/OnlinePlay.swift          | 673 ++++++++++++++++++++++
+ dm/ios/Sources/OnlinePlayView.swift      | 474 ++++++++++++++++
  dm/ios/tests/launcher_layout_check.swift |   3 +-
- dm/ios/tests/online_play_check.swift     | 549 ++++++++++++++++++++
+ dm/ios/tests/online_play_check.swift     | 684 +++++++++++++++++++++++
  dm/ios/tests/test_launcher_storage.py    |   3 +-
  dm/ios/tests/test_online_play.py         |  48 ++
- dm/mac/Launcher.swift                    |  26 +-
+ dm/mac/Launcher.swift                    |  31 +-
+ dm/mac/launcher.c                        |   3 +-
  dm/mac/pack_app.py                       |   5 +-
  dm/tools/tests/test_nsp_mac_app.py       |  10 +-
  docs/LDN-RELAY.md                        |   2 +
- docs/LDN-SETTINGS.md                     |  71 +++
+ docs/LDN-SETTINGS.md                     |  73 +++
  docs/development.md                      |   2 +-
  docs/settings.md                         |   5 +
- 14 files changed, 1820 insertions(+), 18 deletions(-)
+ 15 files changed, 2020 insertions(+), 20 deletions(-)
  create mode 100644 dm/ios/Sources/OnlinePlay.swift
  create mode 100644 dm/ios/Sources/OnlinePlayView.swift
  create mode 100644 dm/ios/tests/online_play_check.swift
@@ -102,10 +103,10 @@ index f20e403..ffea257 100644
      let h = UIHostingController(rootView: view)
 diff --git a/dm/ios/Sources/OnlinePlay.swift b/dm/ios/Sources/OnlinePlay.swift
 new file mode 100644
-index 0000000..c1d5c92
+index 0000000..2dd7764
 --- /dev/null
 +++ b/dm/ios/Sources/OnlinePlay.swift
-@@ -0,0 +1,630 @@
+@@ -0,0 +1,673 @@
 +// Online play: the LDN relay settings the game launchers collect and write into the environment the host reads (docs/LDN-SETTINGS.md). Foundation only
 +// (POSIX sockets for the connection test come from Darwin or Glibc), so the same file builds for the iPhone app, for the Mac launcher and for the regression
 +// tests. The host still reads only the DM_LDNR* variables: nothing here changes the relay client.
@@ -220,26 +221,44 @@ index 0000000..c1d5c92
 +    }
 +}
 +
++/// The first `max` bytes of a string, cut at a character boundary and never inside one.
++private func cutToBytes(_ s: String, _ max: Int) -> String {
++    var out = ""
++    var used = 0
++    for c in s {
++        let n = String(c).utf8.count
++        if used + n > max { break }
++        out.append(c)
++        used += n
++    }
++    return out
++}
++
 +/// The player name: the host's 32-byte field, cut at a character boundary and never inside one.
 +enum PlayerName {
 +    static let maxBytes = 32
 +
-+    static func clamp(_ s: String) -> String {
-+        var out = ""
-+        var used = 0
-+        for c in s.trimmingCharacters(in: .whitespacesAndNewlines) {
-+            let n = String(c).utf8.count
-+            if used + n > maxBytes { break }
-+            out.append(c)
-+            used += n
-+        }
-+        return out
-+    }
++    /// What the field holds while it is typed: cut at the field's bytes, never trimmed, so a space stays where it was typed.
++    static func limit(_ s: String) -> String { cutToBytes(s, maxBytes) }
++
++    /// What is handed to the host: trimmed, then cut. An empty name falls back to the device name.
++    static func clamp(_ s: String) -> String { limit(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
 +
 +    /// What is left of the field for what was typed: 0 once the name no longer fits.
 +    static func bytesLeft(_ s: String) -> Int {
 +        max(0, maxBytes - s.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count)
 +    }
++}
++
++/// The room password: the host's passphrase field (LDNR_NATIVE_PASSPHRASE_MAX in dm/host/ldnr/ldnr_native.h), cut at a character boundary.
++/// Whitespace is part of a password, so it is never trimmed.
++enum RoomPassword {
++    static let maxBytes = 64
++
++    static func clamp(_ s: String) -> String { cutToBytes(s, maxBytes) }
++
++    /// What is left of the field for what was typed: 0 once the password no longer fits.
++    static func bytesLeft(_ s: String) -> Int { max(0, maxBytes - s.utf8.count) }
 +}
 +
 +/// An invite: the text one player sends another, and the `nx2apple-ldn://join` link inside it that carries the same fields.
@@ -336,19 +355,33 @@ index 0000000..c1d5c92
 +    }
 +
 +    /// The model a launcher uses: this game's preferences, and on the Mac the shared `com.nx2apple.online` suite the game apps read together.
++    /// The environment is the one the process started with (launchEnvironmentSnapshot), not the one Play writes.
 +    static func standard(defaultName: String) -> OnlinePlayModel {
 +        #if os(macOS)
 +        let shared = UserDefaults(suiteName: "com.nx2apple.online") ?? .standard
 +        #else
 +        let shared = UserDefaults.standard
 +        #endif
-+        return OnlinePlayModel(game: .standard, shared: shared, defaultName: defaultName)
++        return OnlinePlayModel(game: .standard, shared: shared, environment: launchEnvironmentSnapshot, defaultName: defaultName)
 +    }
++
++    /// The environment this process started with, read once the first time a launcher makes a model. A launcher shown again in the same process
++    /// (the game data was not there yet) must not take the DM_LDNR* values its own apply() wrote for an env file's.
++    static let launchEnvironmentSnapshot: [String: String] = ProcessInfo.processInfo.environment
 +
 +    /// The value an env file or the launch environment set for one of this section's variables, or nil when it is the player's to choose.
 +    func fixedValue(_ key: String) -> String? {
 +        fixedKeys.contains(key) ? launchEnvironment[key] ?? "" : nil
 +    }
++
++    /// The plaintext consent that counts: an env file's DM_LDNR_ALLOW_PLAINTEXT_PASSWORD decides, else the toggle.
++    var effectiveConsent: Bool {
++        if let fixed = fixedValue(Keys.allowPlaintext) { return fixed == "1" }
++        return plaintextConsent
++    }
++
++    /// The room password that counts: the env file's when it fixes one (which may be empty), else the field's.
++    var effectivePassword: String { fixedValue(Keys.roomPassword) ?? password }
 +
 +    // MARK: servers
 +
@@ -400,22 +433,29 @@ index 0000000..c1d5c92
 +
 +    // MARK: invite
 +
-+    /// Adds and chooses the invite's server, and fills in its room password. The consent for a plaintext password is asked again. Online play itself is left as it is.
-+    func applyInvite(_ invite: OnlineInvite) {
-+        guard RelayAddress.validate(invite.server) == nil else { return }
++    /// Adds and chooses the invite's server, and fills in its room password, which asks again for the plaintext consent. Online play itself is left as it is.
++    /// A rejected invite returns false and changes nothing: DM_LDNR is fixed by the environment, the invite is for another server than a fixed
++    /// DM_LDNR_SERVER, or it has no valid server at all. A fixed DM_LDNR_ROOM_PASSWORD is kept as it is, so only the server part of the invite is used.
++    @discardableResult
++    func applyInvite(_ invite: OnlineInvite) -> Bool {
++        guard !fixedKeys.contains(Keys.ldn) else { return false }
++        guard RelayAddress.validate(invite.server) == nil else { return false }
 +        let normalized = RelayAddress.normalize(invite.server)
++        if let fixed = fixedValue(Keys.server), RelayAddress.normalize(fixed) != normalized { return false }
 +        if servers.contains(where: { $0.address == normalized }) {
 +            selected = normalized   // a server already saved keeps the name its player gave it
 +        } else {
 +            addServer(name: invite.name, address: normalized)
 +        }
-+        password = invite.password
++        if fixedKeys.contains(Keys.roomPassword) { return true }   // the password stays the file's, and with it the consent
++        password = RoomPassword.clamp(invite.password)   // set after the server: a new password is not the one that was allowed
 +        plaintextConsent = false
++        return true
 +    }
 +
 +    func invite() -> OnlineInvite? {
 +        guard let server = selectedServer else { return nil }
-+        return OnlineInvite(server: server.address, password: password, name: server.name)
++        return OnlineInvite(server: server.address, password: effectivePassword, name: server.name)
 +    }
 +
 +    // MARK: what Play writes
@@ -425,12 +465,14 @@ index 0000000..c1d5c92
 +    var readiness: Readiness {
 +        if !enabled { return .off }
 +        guard selectedServer != nil else { return .noServer }
-+        if !password.isEmpty && !plaintextConsent { return .needsConsent }
++        // a password the environment fixes is the file's to allow: the toggle cannot consent for it
++        if fixedValue(Keys.roomPassword) == nil && !password.isEmpty && !effectiveConsent { return .needsConsent }
 +        return .ready
 +    }
 +
 +    /// The environment Play writes, as a value per variable (nil to unset it), so the rules can be tested without touching the process. A variable an env
-+    /// file set is left out: the environment wins. With DM_LDNR fixed the whole environment is the file's, and nothing is returned.
++    /// file set is left out: the environment wins. With DM_LDNR fixed the whole environment is the file's, and nothing is returned. When the password waits
++    /// for its consent every variable that is not fixed is unset: online play does not start, and the password is never written without the consent.
 +    func environment() -> [String: String?] {
 +        if fixedKeys.contains(Keys.ldn) { return [:] }
 +        var out: [String: String?] = [:]
@@ -439,7 +481,7 @@ index 0000000..c1d5c92
 +            guard !fixedKeys.contains(key) else { return }
 +            out.updateValue(value, forKey: key)
 +        }
-+        guard enabled, let server = selectedServer else {
++        guard readiness == .ready, let server = selectedServer else {
 +            for key in Keys.all { put(key, nil) }   // DM_LDNR unset is off, and the host then uses its defaults
 +            return out
 +        }
@@ -447,8 +489,9 @@ index 0000000..c1d5c92
 +        put(Keys.server, server.address)
 +        let name = PlayerName.clamp(playerName.isEmpty ? defaultName : playerName)
 +        put(Keys.ldnName, name.isEmpty ? nil : name)
++        let password = effectivePassword
 +        put(Keys.roomPassword, password.isEmpty ? nil : password)
-+        put(Keys.allowPlaintext, password.isEmpty || !plaintextConsent ? nil : "1")
++        put(Keys.allowPlaintext, password.isEmpty || !effectiveConsent ? nil : "1")
 +        return out
 +    }
 +
@@ -456,6 +499,7 @@ index 0000000..c1d5c92
 +    func apply() {
 +        if fixedKeys.contains(Keys.ldn) { fputs("launcher: online play kept from env.txt\n", stderr); return }
 +        if !enabled { fputs("launcher: online play off\n", stderr) }
++        if readiness == .needsConsent { fputs("launcher: online play waits for the password consent\n", stderr) }
 +        for (key, value) in environment().sorted(by: { $0.key < $1.key }) {
 +            if let value {
 +                setenv(key, value, 1)
@@ -738,10 +782,10 @@ index 0000000..c1d5c92
 +}
 diff --git a/dm/ios/Sources/OnlinePlayView.swift b/dm/ios/Sources/OnlinePlayView.swift
 new file mode 100644
-index 0000000..07eeb8b
+index 0000000..4ee6f7c
 --- /dev/null
 +++ b/dm/ios/Sources/OnlinePlayView.swift
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,474 @@
 +// The Online play section of the game launchers (docs/LDN-SETTINGS.md): the toggle, the server menu and its add/edit sheet, Test connection, the player name,
 +// the room password with its plaintext consent, and Copy/Paste invite. It is placed inside the iOS launcher's List and the Mac window's Form as Sections;
 +// the model (OnlinePlay.swift) does the rest. Values fixed by an env file or the launch environment are shown and locked.
@@ -827,13 +871,15 @@ index 0000000..07eeb8b
 +        resetProbe()
 +    }
 +
-+    func applyInvite(_ invite: OnlineInvite) {
-+        model.applyInvite(invite)
++    @discardableResult
++    func applyInvite(_ invite: OnlineInvite) -> Bool {
++        guard model.applyInvite(invite) else { return false }
 +        servers = model.servers
 +        selected = model.selected
 +        password = model.password
 +        consent = model.plaintextConsent
 +        resetProbe()
++        return true
 +    }
 +
 +    var invite: OnlineInvite? { model.invite() }
@@ -999,7 +1045,7 @@ index 0000000..07eeb8b
 +                        .monospacedDigit().font(.footnote).foregroundStyle(.secondary)
 +                }
 +                TextField(OnlinePlayState.deviceName, text: Binding(get: { state.playerName },
-+                                                                    set: { state.setPlayerName(PlayerName.clamp($0)) }))
++                                                                    set: { state.setPlayerName(PlayerName.limit($0)) }))
 +                    #if os(iOS)
 +                    .textInputAutocapitalization(.never)
 +                    #endif
@@ -1022,8 +1068,14 @@ index 0000000..07eeb8b
 +            }
 +        } else {
 +            VStack(alignment: .leading, spacing: 4) {
-+                Text(OnlineText.t("Room password", "房间密码"))
-+                SecureField(OnlineText.t("Optional", "可选"), text: Binding(get: { state.password }, set: state.setPassword))
++                HStack {
++                    Text(OnlineText.t("Room password", "房间密码"))
++                    Spacer()
++                    Text("\(RoomPassword.bytesLeft(state.password)) / \(RoomPassword.maxBytes)")
++                        .monospacedDigit().font(.footnote).foregroundStyle(.secondary)
++                }
++                SecureField(OnlineText.t("Optional", "可选"), text: Binding(get: { state.password },
++                                                                             set: { state.setPassword(RoomPassword.clamp($0)) }))
 +                    #if os(iOS)
 +                    .textInputAutocapitalization(.never)
 +                    #endif
@@ -1042,7 +1094,8 @@ index 0000000..07eeb8b
 +                    Toggle(OnlineText.t("Send the password unencrypted", "允许明文发送密码"),
 +                           isOn: Binding(get: { state.consent }, set: state.setConsent))
 +                }
-+                if !state.consent && state.model.readiness == .needsConsent {
++                // shown exactly when Play would go offline for the missing consent, whether the toggle or env.txt decides it
++                if state.model.readiness == .needsConsent {
 +                    Text(OnlineText.t("Online play will not start until you allow the password",
 +                                      "在你允许发送密码之前，联机不会开始"))
 +                        .font(.footnote).foregroundStyle(.red)
@@ -1076,7 +1129,12 @@ index 0000000..07eeb8b
 +            note = OnlineText.t("The clipboard has no invite", "剪贴板中没有邀请")
 +            return
 +        }
-+        state.applyInvite(invite)
++        if !state.applyInvite(invite) {
++            // nil means the environment keeps the server (or online play itself), so the invite cannot change it
++            note = OnlineText.t("This invite is for another server, set by env.txt",
++                                "此邀请属于另一个服务器（由 env.txt 设置）")
++            return
++        }
 +        note = OnlineText.t("Invite read.", "已读取邀请。")
 +    }
 +
@@ -1218,10 +1276,10 @@ index 3562502..4d87ac1 100644
          // loop until the report meets the step's expectation and has held for 0.2 s; after 5 s the check sees whatever was reported last
 diff --git a/dm/ios/tests/online_play_check.swift b/dm/ios/tests/online_play_check.swift
 new file mode 100644
-index 0000000..61f8390
+index 0000000..7864b93
 --- /dev/null
 +++ b/dm/ios/tests/online_play_check.swift
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,684 @@
 +// The online play model (OnlinePlay.swift), run by test_online_play.py: address validation and splitting, name truncation, the invite round trip,
 +// persistence through a private UserDefaults suite, the environment Play writes for every combination, and the connection test's frames and
 +// behaviour against a fake relay on loopback. Compiles with OnlinePlay.swift alone (-parse-as-library), on macOS or Linux.
@@ -1368,11 +1426,13 @@ index 0000000..61f8390
 +        OnlineText.chineseOverride = false
 +        addresses()
 +        names()
++        passwords()
 +        invites()
 +        persistence()
 +        serverList()
 +        environments()
 +        applyToProcess()
++        launchEnvironment()
 +        frames()
 +        probes()
 +        print("online play: \(failed) failed")
@@ -1428,6 +1488,30 @@ index 0000000..61f8390
 +        check(PlayerName.clamp(twelve + "x") == twelve, "the character that would overflow is dropped whole")
 +        check(PlayerName.clamp("  Bob  ") == "Bob", "the name is trimmed")
 +        check(PlayerName.bytesLeft("") == 32, "an empty name leaves the whole field")
++        // 5. what the field holds while it is typed: cut, never trimmed, so a space is not removed at once
++        check(PlayerName.limit("  Bob  ") == "  Bob  ", "limit keeps the spaces while typing")
++        check(PlayerName.limit("Bo b") == "Bo b", "a space inside the name survives typing")
++        check(PlayerName.limit(String(repeating: "汉", count: 11)) == String(repeating: "汉", count: 10),
++              "limit cuts at 32 bytes, never inside a character")
++        check(PlayerName.limit(String(repeating: " ", count: 40)) == String(repeating: " ", count: 32),
++              "limit counts the whitespace toward the field")
++        check(PlayerName.clamp(PlayerName.limit("  Bob  ")) == "Bob", "what is written is still trimmed and cut")
++    }
++
++    // MARK: the room password
++
++    static func passwords() {
++        check(RoomPassword.maxBytes == 64, "the room password field is 64 bytes")
++        check(RoomPassword.clamp(String(repeating: "a", count: 70)) == String(repeating: "a", count: 64),
++              "a long password is cut to 64 bytes")
++        check(RoomPassword.bytesLeft(String(repeating: "a", count: 60)) == 4, "bytes left of the 64-byte field")
++        check(RoomPassword.clamp(String(repeating: "汉", count: 22)) == String(repeating: "汉", count: 21),
++              "a Chinese password is cut at a character boundary")
++        check(RoomPassword.clamp("  two words  ") == "  two words  ", "spaces are part of a password and are kept")
++        let emoji = "👍🏽"   // 8 bytes, one Character
++        check(RoomPassword.clamp(String(repeating: emoji, count: 16)) == String(repeating: emoji, count: 8),
++              "a multi-scalar character is kept whole")
++        check(RoomPassword.bytesLeft("") == 64, "an empty password leaves the whole field")
 +    }
 +
 +    // MARK: invites
@@ -1559,6 +1643,34 @@ index 0000000..61f8390
 +        _ = mine.addServer(name: "", address: "shared.example.com")
 +        check(mine.invite() == OnlineInvite(server: "shared.example.com", password: "", name: ""), "the invite carries the chosen server")
 +        check(model().invite() == nil, "no chosen server, no invite")
++
++        // 3. an invite cannot move a fixed server or a fixed DM_LDNR, and it keeps a fixed password
++        let fixedServerInvite = model(["DM_LDNR_SERVER": "env.example.com:9"])
++        check(!fixedServerInvite.applyInvite(OnlineInvite(server: "friend.example.com", password: "pw", name: "")),
++              "an invite for another server is refused when env.txt fixes the server")
++        check(fixedServerInvite.servers.isEmpty && fixedServerInvite.selected.isEmpty && fixedServerInvite.password.isEmpty,
++              "a refused invite changes nothing")
++        check(fixedServerInvite.applyInvite(OnlineInvite(server: "ldnr://env.example.com:9/", password: "pw", name: "")),
++              "an invite for the fixed server itself is accepted")
++        check(fixedServerInvite.password == "pw" && fixedServerInvite.selected == "env.example.com:9",
++              "the fixed server's invite fills in the password")
++
++        let fixedLDNInvite = model(["DM_LDNR": "1"])
++        check(!fixedLDNInvite.applyInvite(OnlineInvite(server: "friend.example.com", password: "pw", name: "")),
++              "an invite changes nothing when env.txt fixes DM_LDNR")
++        check(fixedLDNInvite.servers.isEmpty && fixedLDNInvite.password.isEmpty, "the refused invite with a fixed DM_LDNR changes nothing")
++
++        let fixedPasswordInvite = model(["DM_LDNR_ROOM_PASSWORD": "filepw"])
++        check(fixedPasswordInvite.applyInvite(OnlineInvite(server: "friend.example.com", password: "invited", name: "")),
++              "an invite is accepted when only the password is fixed")
++        check(fixedPasswordInvite.selected == "friend.example.com" && fixedPasswordInvite.password.isEmpty,
++              "an invite does not change a fixed password")
++
++        let clampedInvite = model()
++        check(clampedInvite.applyInvite(OnlineInvite(server: "friend.example.com", password: String(repeating: "汉", count: 30), name: "")),
++              "an invite with a long password is accepted")
++        check(clampedInvite.password == String(repeating: "汉", count: 21),
++              "an invite's password is cut to 64 bytes at a character boundary")
 +    }
 +
 +    // MARK: the environment
@@ -1600,12 +1712,54 @@ index 0000000..61f8390
 +        withPassword.enabled = true
 +        _ = withPassword.addServer(name: "", address: "relay.example.com")
 +        withPassword.password = "pw"
-+        check(withPassword.environment()["DM_LDNR_ROOM_PASSWORD"]! == "pw", "a password is written")
-+        check(withPassword.environment()["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"]! == nil, "without consent the password is not allowed")
++        check(withPassword.environment()["DM_LDNR_ROOM_PASSWORD"]! == nil, "without consent the password is not written")
++        check(withPassword.environment()["DM_LDNR"]! == nil && withPassword.environment().count == 5,
++              "without consent every variable is unset, so online play does not start")
 +        check(withPassword.readiness == .needsConsent, "without consent the section says online play will not start")
 +        withPassword.plaintextConsent = true
++        check(withPassword.environment()["DM_LDNR_ROOM_PASSWORD"]! == "pw", "with consent the password is written")
 +        check(withPassword.environment()["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"]! == "1", "with consent the password is allowed")
 +        check(withPassword.readiness == .ready, "with consent and a password: ready")
++
++        // 1. the consent that counts: an env.txt value decides when the variable is fixed, else the toggle
++        let fileConsent = model(["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD": "1"])
++        fileConsent.enabled = true
++        _ = fileConsent.addServer(name: "", address: "relay.example.com")
++        fileConsent.password = "pw"
++        check(fileConsent.effectiveConsent && fileConsent.readiness == .ready,
++              "env.txt's DM_LDNR_ALLOW_PLAINTEXT_PASSWORD=1 counts as consent, without the toggle")
++        check(fileConsent.environment()["DM_LDNR_ROOM_PASSWORD"]! == "pw",
++              "with env.txt's consent the password is written")
++        check(!fileConsent.environment().keys.contains("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"),
++              "a consent fixed by env.txt is left to the file")
++
++        let fileRefusal = model(["DM_LDNR_ALLOW_PLAINTEXT_PASSWORD": "0"])
++        fileRefusal.enabled = true
++        _ = fileRefusal.addServer(name: "", address: "relay.example.com")
++        fileRefusal.password = "pw"
++        fileRefusal.plaintextConsent = true   // the toggle cannot consent for the file
++        check(!fileRefusal.effectiveConsent && fileRefusal.readiness == .needsConsent,
++              "env.txt's consent=0 waits for consent even with the toggle on")
++        let refusalEnv = fileRefusal.environment()
++        check(refusalEnv.values.allSatisfy { $0 == nil } && refusalEnv["DM_LDNR"]! == nil && refusalEnv["DM_LDNR_ROOM_PASSWORD"]! == nil,
++              "waiting for consent: every variable it may write is unset, so the password is not written")
++
++        // 1. and 2. a password fixed by env.txt is the one that counts, and it is never waiting for the toggle's consent
++        let fixedPassword = model(["DM_LDNR_ROOM_PASSWORD": "filepw"])
++        fixedPassword.enabled = true
++        _ = fixedPassword.addServer(name: "", address: "relay.example.com")
++        fixedPassword.password = "typed"
++        check(fixedPassword.effectivePassword == "filepw", "the password fixed by env.txt is the one that counts")
++        check(fixedPassword.readiness == .ready, "a fixed password is never waiting for the toggle's consent")
++        check(!fixedPassword.environment().keys.contains("DM_LDNR_ROOM_PASSWORD"), "a fixed password is left to the file")
++        check(fixedPassword.invite() == OnlineInvite(server: "relay.example.com", password: "filepw", name: ""),
++              "the invite carries the fixed password")
++
++        // 2. an invite carries the fixed server and the fixed password
++        let fixedBoth = model(["DM_LDNR_SERVER": "env.example.com:9", "DM_LDNR_ROOM_PASSWORD": "filepw"])
++        fixedBoth.password = "typed"
++        check(fixedBoth.invite() == OnlineInvite(server: "env.example.com:9", password: "filepw", name: ""),
++              "an invite carries the fixed server and the fixed password")
 +
 +        let fixedAll = model(["DM_LDNR": "0", "DM_LDNR_SERVER": "x.example.com", "DM_LDNR_NAME": "N",
 +                              "DM_LDNR_ROOM_PASSWORD": "p", "DM_LDNR_ALLOW_PLAINTEXT_PASSWORD": "1"])
@@ -1643,6 +1797,14 @@ index 0000000..61f8390
 +        check(getenvString("DM_LDNR") == "1" && getenvString("DM_LDNR_SERVER") == "relay.example.com:9", "apply sets DM_LDNR and the server")
 +        check(getenvString("DM_LDNR_NAME") == "Ana" && getenvString("DM_LDNR_ROOM_PASSWORD") == "topsecret", "apply sets the name and password")
 +        check(getenvString("DM_LDNR_ALLOW_PLAINTEXT_PASSWORD") == "1", "apply sets the plaintext consent")
++        // 1. without the consent apply writes nothing, and says why
++        m.plaintextConsent = false
++        m.apply()
++        check(getenvString("DM_LDNR") == nil && getenvString("DM_LDNR_ROOM_PASSWORD") == nil,
++              "apply unsets every variable when the password waits for consent")
++        check(stderrLog { m.apply() }.contains("launcher: online play waits for the password consent"),
++              "apply says that online play waits for the password consent")
++        m.plaintextConsent = true
 +        m.enabled = false
 +        m.apply()
 +        check(getenvString("DM_LDNR") == nil && getenvString("DM_LDNR_SERVER") == nil && getenvString("DM_LDNR_ROOM_PASSWORD") == nil,
@@ -1654,6 +1816,24 @@ index 0000000..61f8390
 +        fixed.apply()
 +        check(getenvString("DM_LDNR") == "0" && getenvString("DM_LDNR_SERVER") != nil, "a fixed DM_LDNR is not touched, and nothing else is either")
 +        unsetenv("DM_LDNR")
++    }
++
++    // MARK: the launch environment
++
++    /// 6. A launcher shown again in the same process (Play pressed before the game data exists) must not take the DM_LDNR* values its own apply()
++    /// wrote for an env file's. standard() reads a snapshot taken once, before any apply().
++    static func launchEnvironment() {
++        for key in ["DM_LDNR", "DM_LDNR_SERVER", "DM_LDNR_NAME", "DM_LDNR_ROOM_PASSWORD", "DM_LDNR_ALLOW_PLAINTEXT_PASSWORD"] {
++            unsetenv(key)
++        }
++        let snapshot = OnlinePlayModel.launchEnvironmentSnapshot   // taken now: nothing called standard() before this point
++        setenv("DM_LDNR", "1", 1)
++        setenv("DM_LDNR_SERVER", "probe.example.com:9", 1)
++        defer { unsetenv("DM_LDNR"); unsetenv("DM_LDNR_SERVER") }
++        let standard = OnlinePlayModel.standard(defaultName: "iPhone")
++        check(standard.fixedValue("DM_LDNR") == nil && standard.fixedValue("DM_LDNR_SERVER") == nil,
++              "a model from standard() does not take the launcher's own DM_LDNR for env.txt's")
++        check(OnlinePlayModel.launchEnvironmentSnapshot == snapshot, "the launch environment is read once")
 +    }
 +
 +    // MARK: the frames
@@ -1771,6 +1951,19 @@ index 0000000..61f8390
 +func getenvString(_ key: String) -> String? {
 +    getenv(key).map { String(cString: $0) }
 +}
++
++/// What a block writes to stderr (the launcher log), captured through a temporary file and put back afterwards.
++func stderrLog(_ body: () -> Void) -> String {
++    let path = NSTemporaryDirectory() + "online-play-stderr-\(UUID().uuidString)"
++    let saved = dup(2)
++    freopen(path, "w", stderr)
++    body()
++    fflush(stderr)
++    if saved >= 0 { dup2(saved, 2); close(saved) }
++    let log = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
++    try? FileManager.default.removeItem(atPath: path)
++    return log
++}
 diff --git a/dm/ios/tests/test_launcher_storage.py b/dm/ios/tests/test_launcher_storage.py
 index cf6a94e..2b1481f 100644
 --- a/dm/ios/tests/test_launcher_storage.py
@@ -1840,7 +2033,7 @@ index 0000000..29b7b4c
 +if __name__ == '__main__':
 +    unittest.main()
 diff --git a/dm/mac/Launcher.swift b/dm/mac/Launcher.swift
-index 07247a0..7bf0a75 100644
+index 07247a0..b43330f 100644
 --- a/dm/mac/Launcher.swift
 +++ b/dm/mac/Launcher.swift
 @@ -1,6 +1,7 @@
@@ -1890,24 +2083,25 @@ index 07247a0..7bf0a75 100644
          host.sizingOptions = []   // the Form's measured scroll content owns the height, including after collapse
          w.contentView = host
          host.layoutSubtreeIfNeeded()
-@@ -177,14 +181,23 @@ enum LauncherWindowLayout {
- // 1: Play (the window's settings are in the environment), 0: the player quit, 2: no window (no launcher.json, or "Show this window at launch" off): launcher.c applies the saved choices
+@@ -174,17 +178,23 @@ enum LauncherWindowLayout {
+     }
+ }
+ 
+-// 1: Play (the window's settings are in the environment), 0: the player quit, 2: no window (no launcher.json, or "Show this window at launch" off): launcher.c applies the saved choices
++// 1: Play (the window's settings are in the environment), 0: the player quit, 2: no window (no launcher.json, or "Show this window at launch" off): launcher.c applies the saved choices and calls dm_mac_online_apply
  @_cdecl("dm_mac_launcher")
  public func dmMacLauncher() -> Int32 {
 -    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else { return 2 }
 -    guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return 2 }
 +    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else {
-+        OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName).apply()   // the online settings apply on every path to the game
 +        return 2
 +    }
 +    guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else {
 +        fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr)
-+        OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName).apply()
 +        return 2
 +    }
      if (UserDefaults.standard.object(forKey: "window.show") as? Bool) == false && !NSEvent.modifierFlags.contains(.option) {
          fputs("launcher: settings window off (hold Option at launch to show it)\n", stderr)
-+        OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName).apply()   // the saved online settings apply without the window, as the settings do
          return 2
      }
      let model = LauncherModel(file.settings)
@@ -1917,13 +2111,40 @@ index 07247a0..7bf0a75 100644
      app.setActivationPolicy(.regular)
      app.delegate = launcher
      fputs("launcher: \(file.settings.count) settings shown\n", stderr)
-@@ -192,5 +205,6 @@ public func dmMacLauncher() -> Int32 {
+@@ -192,5 +202,12 @@ public func dmMacLauncher() -> Int32 {
      app.setActivationPolicy(.prohibited)   // the host is the game's app from here on
      guard launcher.play else { fputs("launcher: quit without starting the game\n", stderr); return 0 }
      model.apply()
 +    online.model.apply()
      return 1
  }
++
++// The saved Online play settings for the paths without a window (DM_LAUNCHER=0, --no-launcher): launcher.c calls this in its shown == 2 branch, next to saved_choices
++@_cdecl("dm_mac_online_apply")
++public func dmMacOnlineApply() {
++    OnlinePlayModel.standard(defaultName: OnlinePlayState.deviceName).apply()
++}
+diff --git a/dm/mac/launcher.c b/dm/mac/launcher.c
+index aafb831..fc282b5 100644
+--- a/dm/mac/launcher.c
++++ b/dm/mac/launcher.c
+@@ -30,6 +30,7 @@
+ 
+ extern char **environ;
+ int dm_mac_launcher(void);   // Launcher.swift: 1 = Play (the settings are in the environment), 0 = the player quit, 2 = no window (apply the saved choices here)
++void dm_mac_online_apply(void);   // Launcher.swift: the saved Online play settings into the environment, for the no-window path (dm_mac_launcher does it for Play)
+ static pid_t g_child;
+ static char *g_file_keys, *g_launch_keys;   // the variables the env files set, and the settings the launch environment set (DM_ENV_FILE_KEYS, DM_ENV_LAUNCH_KEYS)
+ 
+@@ -278,7 +279,7 @@ int main(int argc, char **argv) {
+     if (!window) fprintf(stderr, "launcher: no settings window (DM_LAUNCHER=0 or --no-launcher)\n");
+     int shown = window ? dm_mac_launcher() : 2;
+     if (!shown) return 0;   // Quit: no game
+-    if (shown == 2) saved_choices();
++    if (shown == 2) { saved_choices(); dm_mac_online_apply(); }   // no window: the shared settings here, Online play from the same saved preferences
+     cloud_saves_folder();
+     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
+     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);
 diff --git a/dm/mac/pack_app.py b/dm/mac/pack_app.py
 index 48f2ac9..1109a26 100755
 --- a/dm/mac/pack_app.py
@@ -1997,10 +2218,10 @@ index d0185bb..a2e05c5 100644
  | Variable | Meaning |
 diff --git a/docs/LDN-SETTINGS.md b/docs/LDN-SETTINGS.md
 new file mode 100644
-index 0000000..958d14e
+index 0000000..a0926e5
 --- /dev/null
 +++ b/docs/LDN-SETTINGS.md
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,73 @@
 +# Online play settings (LDN relay)
 +
 +This page designs the in-app settings for [LDN relay multiplayer](LDN-RELAY.md). Players on iPhone and Mac turn online play on, pick a relay server, set a player name and an optional room password, test the connection and share an invite with friends. Nobody has to set an environment variable.
@@ -2031,6 +2252,8 @@ index 0000000..958d14e
 +
 +On iPhone every game is its own app and cannot read another app's settings without an App Group entitlement, which a sideloaded build may not have. The invite closes that gap: paste the same invite into each game. On Mac the game apps are not sandboxed, so the connection details are set once for all games, and each game only decides whether it plays online.
 +
++The room password is stored in the app's preferences (UserDefaults), not the Keychain. A room password is meant to be shared in an invite, and Copy invite has to read it back, so it is not kept as a secret of the device.
++
 +Keys: `online.enabled` (Bool, per game), `online.servers` (JSON array of `{"name", "address"}`), `online.server` (the chosen address), `online.name`, `online.password`, `online.plaintextConsent` (Bool).
 +
 +## The Online play section
@@ -2044,10 +2267,10 @@ index 0000000..958d14e
 +   - "Not reachable: <reason>" (no route, refused, timed out, name not found)
 +   - "This is not an LDN relay server"
 +   - "The server speaks an older protocol" (ERROR VERSION_UNSUPPORTED, or a HELLO_ACK minor below 2)
-+   The test never runs by itself. It uses no game data and sends no password.
++   The test never runs by itself. It uses no game data and sends no password. A server name that needs a DNS lookup can take longer than the 5 second socket timeout, because the lookup itself has no time limit.
 +4. **Player name** (玩家名称): a text field. Empty uses the device name (on iPhone the system name, often just "iPhone", so the placeholder suggests setting one). The counter shows the bytes left of the native 32-byte field. Longer names are cut at a character boundary, never inside a character.
-+5. **Room password** (房间密码), optional: a secure field. A room password keeps strangers on the same server out of your room. When it is set, a warning appears: "The relay connection is not encrypted. The password and the game traffic can be read on the network. Use a password only on a trusted network or a VPN, and never one you use elsewhere. The server must allow passwords without TLS." With it the toggle **Send the password unencrypted** (允许明文发送密码). Without that consent online play still starts, and the client refuses the password room with a clear error (the fail-closed behaviour of LDN-RELAY.md). The section shows "Online play will not start until you allow the password" in red. Clearing the password clears the consent.
-+6. **Invite a friend** (邀请好友): **Copy invite** copies a short text with the server and, when one is set, the room password, and a link of the form `nx2apple-ldn://join?server=<address>&password=<password>&name=<server name>`. **Paste invite** reads the clipboard, adds the server to the list when it is new, chooses it, fills in the password and asks again for the plaintext consent. Anything that is not an invite shows "The clipboard has no invite".
++5. **Room password** (房间密码), optional: a secure field. A room password keeps strangers on the same server out of your room. It is cut at a character boundary to the host's 64-byte passphrase field, and the counter shows the bytes left of 64. When it is set, a warning appears: "The relay connection is not encrypted. The password and the game traffic can be read on the network. Use a password only on a trusted network or a VPN, and never one you use elsewhere. The server must allow passwords without TLS." With it the toggle **Send the password unencrypted** (允许明文发送密码). Without that consent online play does not start: Play writes no `DM_LDNR*` variable, the log says that it waits for the password consent, and the section shows "Online play will not start until you allow the password" in red. Clearing the password clears the consent. A `DM_LDNR_ALLOW_PLAINTEXT_PASSWORD` set by an env file counts as consent, and its value decides in place of the toggle. A password fixed by an env file is left to the file, so it never waits for the app's consent.
++6. **Invite a friend** (邀请好友): **Copy invite** copies a short text with the server and, when one is set, the room password, and a link of the form `nx2apple-ldn://join?server=<address>&password=<password>&name=<server name>`. The invite carries the effective server and password, so a server or password fixed by an env file is the one friends get. **Paste invite** reads the clipboard, adds the server to the list when it is new, chooses it, fills in the password and asks again for the plaintext consent. When `DM_LDNR_SERVER` is fixed, a pasted invite for another server is refused and the section says so. Anything that is not an invite shows "The clipboard has no invite".
 +7. A footer under the section: "Status during play is in the game's log (lines starting with ldnr)."
 +
 +When online play is on but no valid server is chosen, Play still starts the game offline and the section says "Choose a server to play online".
